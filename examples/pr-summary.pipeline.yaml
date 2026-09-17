@@ -1,0 +1,10 @@
+name: smoke
+defaults: { model: MiniMax-M3 }
+stages:
+  - id: summarize
+    prompt: |
+      Summarize the PR diff in 3 bullet points.
+      Diff: ${DIFF:-<no diff provided>}
+    input:
+      title: "${PR_TITLE:-<no title>}"
+    output_format: text

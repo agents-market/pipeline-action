@@ -1,0 +1,52 @@
+name: agentsmarket pipeline action
+description: Run an agentsmarket pipeline.yaml inside a step. Streams each stage as a GH log group, sets action outputs with stage results, total cost, wall-clock.
+author: agentsmarket.world
+
+inputs:
+  api_key:
+    description: 'LLM provider API key (falls back to MINIMAX_API_KEY env var).'
+    required: false
+  pipeline_file:
+    description: 'Path to pipeline.yaml (relative to $GITHUB_WORKSPACE or absolute). Mutually exclusive with pipeline_yaml.'
+    required: false
+  pipeline_yaml:
+    description: 'Inline pipeline YAML string. Mutually exclusive with pipeline_file.'
+    required: false
+  model:
+    description: 'Default model identifier.'
+    required: false
+    default: 'MiniMax-M3'
+  inputs_json:
+    description: 'JSON object of pipeline inputs (passed to spec.inputs).'
+    required: false
+    default: '{}'
+  fail_fast:
+    description: 'Stop on first stage error.'
+    required: false
+    default: 'true'
+  mock:
+    description: 'Use a deterministic mock provider (no real LLM API). Useful for dry-runs + tests.'
+    required: false
+    default: 'false'
+
+outputs:
+  result_json:
+    description: 'JSON-stringified record of stage_id -> output text. Empty string for skipped stages.'
+  total_ms:
+    description: 'Wall-clock pipeline duration in milliseconds.'
+  total_cost_usdc:
+    description: 'Estimated cost in USDC with 6 decimals (e.g. "0.001234").'
+  stage_count:
+    description: 'Number of stages declared in the pipeline.'
+  stage_<id>_ms:
+    description: 'Per-stage wall-clock duration (set per stage).'
+  stage_<id>_output:
+    description: 'Per-stage output text (set per stage).'
+
+runs:
+  using: node20
+  main: dist/index.js
+
+branding:
+  icon: 'play'
+  color: 'blue'
