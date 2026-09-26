@@ -733,10 +733,16 @@ exports.pbkdf2 = pbkdf2;
 /**
  * Build a StageExecutorDeps for runPipelineV2 from action params.
  *
- * Provider selection:
- *   - mock=true  -> MockProvider (no real API)
- *   - model hints Claude/GPT/Mistral/Llama -> OpenRouterProvider
- *   - else       -> MiniMaxProvider (default)
+ * Provider selection (v0.2.0): the `provider` action input is the source of
+ * truth — no more model-name sniffing.
+ *   - mock=true         -> MockProvider (no real API)
+ *   - provider=minimax  -> MiniMaxProvider (default)
+ *   - provider=openai   -> OpenAIChatProvider
+ *   - provider=anthropic -> AnthropicProvider
+ *   - provider=openrouter -> OpenRouterProvider (multi-model gateway)
+ *
+ * Every failure path names the provider + model + expected env var so a red
+ * CI step is debuggable without opening the source.
  *
  * fetchSkill returns null: marketplace-fetched skills ship in R12.2-R12.4.
  * Pipelines that depend on `uses:` stages will surface "skill not found" errors
@@ -745,6 +751,7 @@ exports.pbkdf2 = pbkdf2;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.buildExecutorDeps = buildExecutorDeps;
 const pipeline_runtime_1 = __nccwpck_require__(676);
+const inputs_js_1 = __nccwpck_require__(601);
 class MockProvider {
     name = 'mock';
     models = ['mock'];
@@ -777,21 +784,72 @@ const zeroPricing = {
         return 0;
     },
 };
-function pickProvider(modelName, apiKey) {
+function configuredProviderKeys() {
+    const names = Object.keys(inputs_js_1.PROVIDER_ENV_VARS);
+    return names.filter((name) => {
+        const value = process.env[inputs_js_1.PROVIDER_ENV_VARS[name]];
+        return value !== undefined && value.length > 0;
+    });
+}
+function missingKeyError(provider, model) {
+    const envVar = inputs_js_1.PROVIDER_ENV_VARS[provider];
+    const configured = configuredProviderKeys();
+    const hint = configured.length > 0
+        ? ` Note: API keys are currently set for: ${configured
+            .map((name) => `${name} (${inputs_js_1.PROVIDER_ENV_VARS[name]})`)
+            .join(', ')} — none for '${provider}' (${envVar}). ` +
+            `Either switch 'provider' to one of those or add the ${envVar} secret.`
+        : ` No provider API keys found in env at all.`;
+    return new Error(`Provider '${provider}' (model '${model}') requires an API key: ` +
+        `set the 'api_key' action input or the ${envVar} env var (GitHub secret).${hint}`);
+}
+function suggestProviderForModel(model) {
+    const m = model.toLowerCase();
+    if (m.includes('gpt') || m.startsWith('o1'))
+        return 'openai (or openrouter for gateway routing)';
+    if (m.includes('claude'))
+        return 'anthropic (or openrouter for gateway routing)';
+    if (m.includes('minimax'))
+        return 'minimax';
+    if (m.includes('mistral') || m.includes('llama'))
+        return 'openrouter';
+    if (m.startsWith('openai/') || m.startsWith('anthropic/'))
+        return 'openrouter';
+    return null;
+}
+function pickProvider(providerName, modelName, apiKey) {
     if (!apiKey) {
-        throw new Error(`Model '${modelName}' requires api_key input (or MINIMAX_API_KEY env var).`);
+        throw missingKeyError(providerName, modelName);
     }
-    const m = modelName.toLowerCase();
-    if (m.includes('claude') || m.includes('gpt') || m.includes('mistral') || m.includes('llama')) {
-        return new pipeline_runtime_1.OpenRouterProvider({ apiKey });
+    let provider;
+    switch (providerName) {
+        case 'minimax':
+            provider = new pipeline_runtime_1.MiniMaxProvider({ apiKey });
+            break;
+        case 'openai':
+            provider = new pipeline_runtime_1.OpenAIChatProvider({ apiKey });
+            break;
+        case 'anthropic':
+            provider = new pipeline_runtime_1.AnthropicProvider({ apiKey });
+            break;
+        case 'openrouter':
+            provider = new pipeline_runtime_1.OpenRouterProvider({ apiKey });
+            break;
     }
-    return new pipeline_runtime_1.MiniMaxProvider({ apiKey });
+    if (!provider.supports(modelName)) {
+        const available = provider.models.join(', ');
+        const suggestion = suggestProviderForModel(modelName);
+        throw new Error(`Provider '${providerName}' does not support model '${modelName}'. ` +
+            `Supported models for ${providerName}: ${available}.` +
+            (suggestion ? ` Hint: model '${modelName}' looks like it belongs to ${suggestion}.` : ''));
+    }
+    return provider;
 }
 async function buildExecutorDeps(params) {
     const apiKey = params.inputs.api_key;
     const provider = params.inputs.mock
         ? new MockProvider()
-        : pickProvider(params.inputs.model, apiKey);
+        : pickProvider(params.inputs.provider, params.inputs.model, apiKey);
     const registry = new pipeline_runtime_1.LLMProviderRegistry([provider]);
     const resolvers = apiKey
         ? [
@@ -827,10 +885,31 @@ async function buildExecutorDeps(params) {
  * GitHub Actions injects each declared input as `INPUT_<UPPER_SNAKE>` env var,
  * always a string. Boolean toggles arrive as "true" or "false". Object inputs
  * come as JSON strings.
+ *
+ * Provider selection (v0.2.0): the `provider` input picks the LLM backend.
+ * The API key resolves from the explicit `api_key` input first, then from
+ * the provider-specific env var (MINIMAX_API_KEY / OPENAI_API_KEY /
+ * ANTHROPIC_API_KEY / OPENROUTER_API_KEY).
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.PROVIDER_ENV_VARS = exports.DEFAULT_PROVIDER = exports.SUPPORTED_PROVIDERS = void 0;
+exports.normalizeProvider = normalizeProvider;
+exports.resolveApiKeyForProvider = resolveApiKeyForProvider;
 exports.readInputs = readInputs;
 exports.parseInputJson = parseInputJson;
+exports.SUPPORTED_PROVIDERS = [
+    'minimax',
+    'openai',
+    'anthropic',
+    'openrouter',
+];
+exports.DEFAULT_PROVIDER = 'minimax';
+exports.PROVIDER_ENV_VARS = {
+    minimax: 'MINIMAX_API_KEY',
+    openai: 'OPENAI_API_KEY',
+    anthropic: 'ANTHROPIC_API_KEY',
+    openrouter: 'OPENROUTER_API_KEY',
+};
 const DEFAULT_MODEL = 'MiniMax-M3';
 function readEnvBool(name, fallback) {
     const raw = process.env[name];
@@ -844,12 +923,30 @@ function readEnvString(name, fallback) {
         return fallback;
     return raw;
 }
+function normalizeProvider(raw, model) {
+    const normalized = raw.trim().toLowerCase();
+    if (exports.SUPPORTED_PROVIDERS.includes(normalized)) {
+        return normalized;
+    }
+    throw new Error(`Unsupported provider '${raw}' (model '${model}'). ` +
+        `Supported providers: ${exports.SUPPORTED_PROVIDERS.join(', ')}. ` +
+        `Set 'provider' to one of these or drop the input (default '${exports.DEFAULT_PROVIDER}').`);
+}
+function resolveApiKeyForProvider(explicitKey, provider, env = process.env) {
+    if (explicitKey && explicitKey.length > 0)
+        return explicitKey;
+    const fromEnv = env[exports.PROVIDER_ENV_VARS[provider]];
+    return fromEnv && fromEnv.length > 0 ? fromEnv : null;
+}
 function readInputs() {
+    const model = readEnvString('INPUT_MODEL', DEFAULT_MODEL) ?? DEFAULT_MODEL;
+    const provider = normalizeProvider(readEnvString('INPUT_PROVIDER', exports.DEFAULT_PROVIDER) ?? exports.DEFAULT_PROVIDER, model);
     return {
-        api_key: readEnvString('INPUT_API_KEY', null) ?? process.env.MINIMAX_API_KEY ?? null,
+        api_key: resolveApiKeyForProvider(readEnvString('INPUT_API_KEY', null), provider),
+        provider,
         pipeline_file: readEnvString('INPUT_PIPELINE_FILE', null),
         pipeline_yaml: readEnvString('INPUT_PIPELINE_YAML', null),
-        model: readEnvString('INPUT_MODEL', DEFAULT_MODEL) ?? DEFAULT_MODEL,
+        model,
         inputs_json: readEnvString('INPUT_INPUTS_JSON', null),
         fail_fast: readEnvBool('INPUT_FAIL_FAST', true),
         mock: readEnvBool('INPUT_MOCK', false),
@@ -994,9 +1091,12 @@ function parseInlineInputs(raw) {
  *   1 — pipeline validation/runtime error
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ACTION_VERSION = void 0;
 exports.run = run;
 const pipeline_runtime_1 = __nccwpck_require__(676);
 const streaming_js_1 = __nccwpck_require__(834);
+const inputs_js_1 = __nccwpck_require__(601);
+exports.ACTION_VERSION = '0.2.0';
 async function run(args) {
     const { params, deps } = args;
     const inputs = params.inputs;
@@ -1022,7 +1122,9 @@ async function run(args) {
         return 1;
     }
     const stageCount = spec.stages.length;
-    (0, streaming_js_1.notice)(`▶ pipeline-action v0.1.0 — ${spec.name ?? 'unnamed'} (${stageCount} stage${stageCount === 1 ? '' : 's'})`);
+    const pipelineName = spec.name ?? 'unnamed';
+    const providerTag = `[provider=${inputs.provider} model=${inputs.model}]`;
+    (0, streaming_js_1.notice)(`▶ pipeline-action v${exports.ACTION_VERSION} — ${pipelineName} (${stageCount} stage${stageCount === 1 ? '' : 's'}) ${providerTag}`);
     const stagesForRuntime = spec.stages.map((s) => ({
         id: s.id,
         model: s.model,
@@ -1059,22 +1161,20 @@ async function run(args) {
         });
     }
     catch (e) {
-        (0, streaming_js_1.error)(`✗ pipeline failed: ${e.message}`);
+        (0, streaming_js_1.error)(`✗ pipeline failed ${providerTag}: ${e.message}`);
         return 1;
     }
     const totalMs = Date.now() - startedAt;
     const totalCostUsdc = result.totalCostMicroUsdc / 1_000_000;
-    const summaryLines = [
-        '## agentsmarket pipeline-action',
-        '',
-        `Stages: ${stageCount}`,
-        '',
-        `Wall-clock: ${totalMs}ms · ~$${totalCostUsdc.toFixed(6)} USDC`,
-    ];
-    for (const [id, val] of Object.entries(result.outputs)) {
-        summaryLines.push('', `### ${id}`, '', val.length > 0 ? val : '_skipped_');
-    }
-    (0, streaming_js_1.appendSummary)(summaryLines.join('\n'));
+    (0, streaming_js_1.writeActionSummary)({
+        pipelineName,
+        provider: inputs.provider,
+        model: inputs.model,
+        stageCount,
+        totalMs,
+        totalCostUsdc,
+        outputs: result.outputs,
+    });
     (0, streaming_js_1.writeOutput)('result_json', JSON.stringify(result.outputs));
     (0, streaming_js_1.writeOutput)('total_ms', String(totalMs));
     (0, streaming_js_1.writeOutput)('total_cost_usdc', totalCostUsdc.toFixed(6));
@@ -1085,7 +1185,8 @@ async function run(args) {
 function buildPipelineEnv(inputs) {
     const env = { ...process.env };
     if (inputs.api_key)
-        env.MINIMAX_API_KEY = inputs.api_key;
+        env[inputs_js_1.PROVIDER_ENV_VARS[inputs.provider]] = inputs.api_key;
+    env.AGENTSMARKET_PROVIDER = inputs.provider;
     env.AGENTSMARKET_DEFAULT_MODEL = inputs.model;
     if (inputs.mock)
         env.AGENTSMARKET_MOCK = 'true';
@@ -1121,6 +1222,7 @@ exports.warning = warning;
 exports.error = error;
 exports.writeOutput = writeOutput;
 exports.appendSummary = appendSummary;
+exports.writeActionSummary = writeActionSummary;
 function group(title, fn) {
     console.log(`::group::${escape(title)}`);
     try {
@@ -1157,6 +1259,29 @@ function appendSummary(markdown) {
     if (!filePath)
         return;
     (__nccwpck_require__(24).appendFileSync)(filePath, markdown.endsWith('\n') ? markdown : `${markdown}\n`, 'utf8');
+}
+/**
+ * Rich $GITHUB_STEP_SUMMARY for a finished pipeline: header table with
+ * pipeline name, provider, model, cost, duration and stage count, followed
+ * by one collapsible-friendly section per stage. Markdown is appended raw
+ * (no workflow-command escaping — summaries render as Markdown).
+ */
+function writeActionSummary(summary) {
+    const lines = [
+        `## agentsmarket pipeline-action — ${summary.pipelineName}`,
+        '',
+        '| Field | Value |',
+        '| --- | --- |',
+        `| Provider | \`${summary.provider}\` |`,
+        `| Model | \`${summary.model}\` |`,
+        `| Stages | ${summary.stageCount} |`,
+        `| Wall-clock | ${summary.totalMs}ms |`,
+        `| Est. cost | ~$${summary.totalCostUsdc.toFixed(6)} USDC |`,
+    ];
+    for (const [id, val] of Object.entries(summary.outputs)) {
+        lines.push('', `### ${id}`, '', val.length > 0 ? val : '_skipped_');
+    }
+    appendSummary(lines.join('\n'));
 }
 function escape(text) {
     return String(text ?? '').replace(/%/g, '%25').replace(/\r?\n/g, '%0A');
@@ -17333,6 +17458,8 @@ __nccwpck_require__.r(__webpack_exports__);
 
 // EXPORTS
 __nccwpck_require__.d(__webpack_exports__, {
+  ABSOLUTE_MAX_ITERATIONS: () => (/* reexport */ ABSOLUTE_MAX_ITERATIONS),
+  AnthropicProvider: () => (/* reexport */ AnthropicProvider),
   CHECKPOINT_SCHEMA_VERSION: () => (/* reexport */ CHECKPOINT_SCHEMA_VERSION),
   COMPOSITION_USES_PREFIX: () => (/* reexport */ COMPOSITION_USES_PREFIX),
   CallbackEventSink: () => (/* reexport */ CallbackEventSink),
@@ -17342,73 +17469,168 @@ __nccwpck_require__.d(__webpack_exports__, {
   CompositePricingResolver: () => (/* reexport */ CompositePricingResolver),
   CompositionDepthError: () => (/* reexport */ CompositionDepthError),
   CyclicDependencyError: () => (/* reexport */ CyclicDependencyError),
+  DEFAULT_MAX_ITERATIONS: () => (/* reexport */ DEFAULT_MAX_ITERATIONS),
   DEFAULT_MODEL: () => (/* reexport */ DEFAULT_MODEL),
+  DEFAULT_OUTPUT_DELIVERY: () => (/* reexport */ DEFAULT_OUTPUT_DELIVERY),
+  DEFAULT_OUTPUT_EXPIRES_IN: () => (/* reexport */ DEFAULT_OUTPUT_EXPIRES_IN),
+  DEFAULT_OUTPUT_FORMAT: () => (/* reexport */ DEFAULT_OUTPUT_FORMAT),
   DEFAULT_RETRY: () => (/* reexport */ DEFAULT_RETRY),
   DEFAULT_RETRYABLE_STATUSES: () => (/* reexport */ DEFAULT_RETRYABLE_STATUSES),
   FallbackProvider: () => (/* reexport */ FallbackProvider),
   InMemoryCheckpointStorage: () => (/* reexport */ InMemoryCheckpointStorage),
+  InMemoryMemoryStore: () => (/* reexport */ InMemoryMemoryStore),
   LLMProviderRegistry: () => (/* reexport */ LLMProviderRegistry),
+  LOOP_SCHEMA_VERSION: () => (/* reexport */ LOOP_SCHEMA_VERSION),
+  LoopConfigError: () => (/* reexport */ LoopConfigError),
+  LoopMaxIterationsExceededError: () => (/* reexport */ LoopMaxIterationsExceededError),
   MAX_COMPOSITION_DEPTH: () => (/* reexport */ MAX_COMPOSITION_DEPTH),
+  MAX_FILES: () => (/* reexport */ MAX_FILES),
+  MAX_FILE_BYTES: () => (/* reexport */ MAX_FILE_BYTES),
+  MAX_MEMORY_VALUE_BYTES: () => (/* reexport */ MAX_MEMORY_VALUE_BYTES),
+  MAX_OUTPUT_EXPIRES_IN: () => (/* reexport */ MAX_OUTPUT_EXPIRES_IN),
+  MAX_TOTAL_BYTES: () => (/* reexport */ MAX_TOTAL_BYTES),
+  MAX_VALIDATION_DEPTH: () => (/* reexport */ MAX_VALIDATION_DEPTH),
+  MEMORY_SCHEMA_VERSION: () => (/* reexport */ MEMORY_SCHEMA_VERSION),
+  MIN_OUTPUT_EXPIRES_IN: () => (/* reexport */ MIN_OUTPUT_EXPIRES_IN),
   MiniMaxPricingResolver: () => (/* reexport */ MiniMaxPricingResolver),
   MiniMaxProvider: () => (/* reexport */ MiniMaxProvider),
   MissingEnvVarError: () => (/* reexport */ MissingEnvVarError),
+  MultimodalModelUnsupportedError: () => (/* reexport */ MultimodalModelUnsupportedError),
+  NodeShellExecutor: () => (/* reexport */ NodeShellExecutor),
   NoopEventSink: () => (/* reexport */ NoopEventSink),
+  OUTPUT_VALIDATION_RETRY_ATTEMPTS: () => (/* reexport */ OUTPUT_VALIDATION_RETRY_ATTEMPTS),
+  OpenAIChatProvider: () => (/* reexport */ OpenAIChatProvider),
   OpenRouterPricingResolver: () => (/* reexport */ OpenRouterPricingResolver),
   OpenRouterProvider: () => (/* reexport */ OpenRouterProvider),
+  OutputValidationError: () => (/* reexport */ OutputValidationError),
+  PROVIDER_REGISTRY: () => (/* reexport */ PROVIDER_REGISTRY),
   PipelineFetchError: () => (/* reexport */ PipelineFetchError),
   ProviderMismatchError: () => (/* reexport */ ProviderMismatchError),
+  ProviderModelMismatchError: () => (/* reexport */ ProviderModelMismatchError),
+  ProviderSpecNotFoundError: () => (/* reexport */ ProviderSpecNotFoundError),
   R2CheckpointStorage: () => (/* reexport */ R2CheckpointStorage),
+  R2MemoryStore: () => (/* reexport */ R2MemoryStore),
   RetryAttemptError: () => (/* reexport */ RetryAttemptError),
   RetryExhaustedError: () => (/* reexport */ RetryExhaustedError),
+  SHELL_DEFAULT_TIMEOUT_MS: () => (/* reexport */ SHELL_DEFAULT_TIMEOUT_MS),
+  SHELL_MAX_OUTPUT_BYTES: () => (/* reexport */ SHELL_MAX_OUTPUT_BYTES),
+  SHELL_MAX_TIMEOUT_MS: () => (/* reexport */ SHELL_MAX_TIMEOUT_MS),
+  SUPPORTED_AUDIO_MIME: () => (/* reexport */ SUPPORTED_AUDIO_MIME),
+  SUPPORTED_IMAGE_MIME: () => (/* reexport */ SUPPORTED_IMAGE_MIME),
+  SUPPORTED_VIDEO_MIME: () => (/* reexport */ SUPPORTED_VIDEO_MIME),
+  ShellStageExecError: () => (/* reexport */ ShellStageExecError),
+  ShellStageTimeoutError: () => (/* reexport */ ShellStageTimeoutError),
+  ShellStageUnsupportedError: () => (/* reexport */ ShellStageUnsupportedError),
   StageBadConfigError: () => (/* reexport */ StageBadConfigError),
   StageForbiddenError: () => (/* reexport */ StageForbiddenError),
   StageMCPConfigError: () => (/* reexport */ StageMCPConfigError),
   StageNotFoundError: () => (/* reexport */ StageNotFoundError),
+  StageNotFoundInSpecError: () => (/* reexport */ StageNotFoundInSpecError),
   StageOutputFormatError: () => (/* reexport */ StageOutputFormatError),
   StageSkillVersionMismatchError: () => (/* reexport */ StageSkillVersionMismatchError),
   StaticPricingResolver: () => (/* reexport */ StaticPricingResolver),
+  TestSpecParseError: () => (/* reexport */ TestSpecParseError),
+  ThrowingShellExecutor: () => (/* reexport */ ThrowingShellExecutor),
   UnknownProviderError: () => (/* reexport */ UnknownProviderError),
   UnresolvedStageOutputRefError: () => (/* reexport */ UnresolvedStageOutputRefError),
   WhenParseError: () => (/* reexport */ WhenParseError),
+  analyzeCapabilities: () => (/* reexport */ analyzeCapabilities),
+  assertMultimodalSupported: () => (/* reexport */ assertMultimodalSupported),
   buildCheckpoint: () => (/* reexport */ buildCheckpoint),
+  buildMockProvider: () => (/* reexport */ buildMockProvider),
   collectRuntimeWarnings: () => (/* reexport */ collectRuntimeWarnings),
   computeBackoffMs: () => (/* reexport */ computeBackoffMs),
+  computeCoverage: () => (/* reexport */ computeCoverage),
   computeSkillContentHash: () => (/* reexport */ computeSkillContentHash),
   createDefaultPricingResolver: () => (/* reexport */ createDefaultPricingResolver),
   createDefaultSink: () => (/* reexport */ createDefaultSink),
   createFallbackProvider: () => (/* reexport */ createFallbackProvider),
+  createMemoryStore: () => (/* reexport */ createMemoryStore),
   createModelResolver: () => (/* reexport */ createModelResolver),
   defaultRuntimeConstraints: () => (/* reexport */ defaultRuntimeConstraints),
+  detectMime: () => (/* reexport */ detectMime),
+  discoverTestFiles: () => (/* reexport */ discoverTestFiles),
   evaluateComparison: () => (/* reexport */ evaluateComparison),
+  evaluateExitExpression: () => (/* reexport */ evaluateExitExpression),
   evaluateWhen: () => (/* reexport */ evaluateWhen),
+  executeLoop: () => (/* reexport */ executeLoop),
   executeStage: () => (/* reexport */ executeStage),
   expandComposition: () => (/* reexport */ expandComposition),
   expandPipelineText: () => (/* reexport */ expandPipelineText),
   extractDepIds: () => (/* reexport */ extractDepIds),
+  extractProducedFiles: () => (/* reexport */ extractProducedFiles),
+  extractStage: () => (/* reexport */ extractStage),
+  formatInputErrors: () => (/* reexport */ formatInputErrors),
+  getPath: () => (/* reexport */ assertions_getPath),
+  getProvider: () => (/* reexport */ getProvider),
+  globToRegex: () => (/* reexport */ globToRegex),
   groupIndependentStages: () => (/* reexport */ groupIndependentStages),
   injectNestedStages: () => (/* reexport */ injectNestedStages),
+  invokeToolSkill: () => (/* reexport */ invokeToolSkill),
+  isAudioMime: () => (/* reexport */ isAudioMime),
+  isImageMime: () => (/* reexport */ isImageMime),
+  isOutputValidationMode: () => (/* reexport */ isOutputValidationMode),
   isRetryableStatus: () => (/* reexport */ isRetryableStatus),
+  isToolSkill: () => (/* reexport */ isToolSkill),
+  isVideoMime: () => (/* reexport */ isVideoMime),
+  isVisionCapable: () => (/* reexport */ isVisionCapable),
+  listProviders: () => (/* reexport */ listProviders),
+  listSupportedModels: () => (/* reexport */ listSupportedModels),
+  listVisionCapableModels: () => (/* reexport */ listVisionCapableModels),
+  loadCoverageForPipeline: () => (/* reexport */ loadCoverageForPipeline),
   loadPipelineYaml: () => (/* reexport */ loadPipelineYaml),
+  loadTestSpecFile: () => (/* reexport */ loadTestSpecFile),
+  makeStageRetriedEvent: () => (/* reexport */ makeStageRetriedEvent),
   makeWhenResolve: () => (/* reexport */ makeWhenResolve),
   mergeRuntimeConstraints: () => (/* reexport */ mergeRuntimeConstraints),
+  migrateProviderField: () => (/* reexport */ migrateProviderField),
+  mockValueForField: () => (/* reexport */ mockValueForField),
+  normalizeShellStage: () => (/* reexport */ normalizeShellStage),
   parseComparison: () => (/* reexport */ parseComparison),
+  parseExitExpression: () => (/* reexport */ parseExitExpression),
+  parseMediaUrl: () => (/* reexport */ parseMediaUrl),
+  parseTestSpec: () => (/* reexport */ parseTestSpec),
   parseUsesEntry: () => (/* reexport */ parseUsesEntry),
   parseUsesList: () => (/* reexport */ parseUsesList),
+  parseVariableSpec: () => (/* reexport */ parseVariableSpec),
   parseWhenLiteral: () => (/* reexport */ parseWhenLiteral),
+  renderCoverageText: () => (/* reexport */ renderCoverageText),
+  renderJson: () => (/* reexport */ renderJson),
+  renderJunit: () => (/* reexport */ renderJunit),
+  renderText: () => (/* reexport */ renderText),
+  resolveEnvVars: () => (/* reexport */ resolveEnvVars),
+  resolveEnvVarsInObject: () => (/* reexport */ resolveEnvVarsInObject),
+  resolveInputRefs: () => (/* reexport */ resolveInputRefs),
   resolveModelSync: () => (/* reexport */ resolveModelSync),
   resolvePipelineRef: () => (/* reexport */ resolvePipelineRef),
   resolveProvider: () => (/* reexport */ resolveProvider),
+  resolveSpecialKeys: () => (/* reexport */ resolveSpecialKeys),
   resolveStageOutputRefs: () => (/* reexport */ resolveStageOutputRefs),
   restoreFromCheckpoint: () => (/* reexport */ restoreFromCheckpoint),
+  runAssertion: () => (/* reexport */ runAssertion),
+  runConformanceDir: () => (/* reexport */ runConformanceDir),
   runPipeline: () => (/* binding */ runPipeline),
   runPipelineV2: () => (/* reexport */ runPipelineV2),
+  runSingleTest: () => (/* reexport */ runSingleTest),
   runStage: () => (/* binding */ runStage),
+  runTestSuite: () => (/* reexport */ runTestSuite),
   sha256Hex: () => (/* reexport */ sha256Hex),
   shouldSkipStage: () => (/* reexport */ shouldSkipStage),
+  supportsModel: () => (/* reexport */ supportsModel),
+  toAnthropicContent: () => (/* reexport */ toAnthropicContent),
   topologicalSort: () => (/* reexport */ topologicalSort),
   tryParsePipelineUses: () => (/* reexport */ tryParsePipelineUses),
   tryParseStageOutputRef: () => (/* reexport */ tryParseStageOutputRef),
+  validateAgainstSchema: () => (/* reexport */ validateAgainstSchema),
+  validateInputs: () => (/* reexport */ validateInputs),
+  validateJsonSchema: () => (/* reexport */ validateJsonSchema),
+  validateMultimodalInput: () => (/* reexport */ validateMultimodalInput),
+  validateOutput: () => (/* reexport */ validateOutput),
   validateOutputFormat: () => (/* reexport */ validateOutputFormat),
+  validateOutputSpec: () => (/* reexport */ validateOutputSpec),
+  validateProviderModel: () => (/* reexport */ validateProviderModel),
+  validateProviderName: () => (/* reexport */ validateProviderName),
+  validateR6Spec: () => (/* reexport */ validateR6Spec),
   validateRuntimeConstraints: () => (/* reexport */ validateRuntimeConstraints),
   validateWhenShape: () => (/* reexport */ validateWhenShape)
 });
@@ -17487,8 +17709,140 @@ function resolveProvider(registry, model) {
     return first;
 }
 
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/multimodal.js
+/**
+ * Multimodal content types — M1 NEW (image / audio / video LLM inputs).
+ *
+ * Shape mirrors the OpenAI chat.completions messages format so OpenRouter
+ * passes messages through unchanged; MiniMax (Anthropic-compatible) has a
+ * dedicated converter in adapters/multimodal-convert.ts.
+ */
+class MultimodalModelUnsupportedError extends Error {
+    providerName;
+    modelName;
+    visionCapableModels;
+    constructor(providerName, modelName, visionCapableModels) {
+        const avail = visionCapableModels.length > 0
+            ? visionCapableModels.join(', ')
+            : '(none registered for this provider)';
+        super(`Model '${modelName}' on provider '${providerName}' does not support multimodal ` +
+            `inputs (image/audio/video). Vision-capable models for ${providerName}: ${avail}`);
+        this.name = 'MULTIMODAL_MODEL_UNSUPPORTED';
+        this.providerName = providerName;
+        this.modelName = modelName;
+        this.visionCapableModels = visionCapableModels;
+    }
+}
+
 // EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/index.mjs + 102 modules
 var sdk = __nccwpck_require__(39);
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/adapters/multimodal-convert.js
+/**
+ * Multimodal content conversion — maps our standard MultimodalMessage /
+ * MultimodalPart shapes to provider-native request bodies.
+ *
+ * Anthropic's content-block schema is structurally different from OpenAI's
+ * chat.completions messages (image uses `{type:'image', source:{...}}` not
+ * `{type:'image_url', image_url:{...}}`; audio/video arrive as document
+ * blocks with explicit `media_type`).
+ *
+ * OpenAI-shaped providers (OpenRouter, anything OpenAI-compatible) do NOT
+ * call this module — they pass messages through unchanged.
+ */
+const DATA_URI_RE = /^data:([^;,]+)(?:;base64)?,(.*)$/s;
+const SUPPORTED_IMAGE_MIME = new Set([
+    'image/png',
+    'image/jpeg',
+    'image/jpg',
+    'image/gif',
+    'image/webp',
+]);
+const SUPPORTED_AUDIO_MIME = new Set([
+    'audio/mp3',
+    'audio/mpeg',
+    'audio/wav',
+    'audio/x-wav',
+    'audio/ogg',
+    'audio/webm',
+]);
+const SUPPORTED_VIDEO_MIME = new Set([
+    'video/mp4',
+    'video/webm',
+    'video/quicktime',
+]);
+function parseMediaUrl(url) {
+    if (typeof url !== 'string' || url.length === 0) {
+        throw new Error('Multimodal part url is empty');
+    }
+    if (url.startsWith('data:')) {
+        const match = DATA_URI_RE.exec(url);
+        if (!match) {
+            throw new Error(`Invalid data URI: ${url.slice(0, 40)}...`);
+        }
+        const mediaType = match[1] ?? '';
+        const body = match[2] ?? '';
+        return { kind: 'data', mediaType, base64: body };
+    }
+    if (url.startsWith('https://') || url.startsWith('http://')) {
+        return { kind: 'url', url };
+    }
+    throw new Error(`Unsupported multimodal URL scheme: ${url.slice(0, 24)}`);
+}
+function detectMime(url) {
+    if (url.startsWith('data:')) {
+        const match = DATA_URI_RE.exec(url);
+        return match ? (match[1] ?? null) : null;
+    }
+    const ext = url.split('?')[0]?.split('.').pop()?.toLowerCase() ?? '';
+    switch (ext) {
+        case 'png': return 'image/png';
+        case 'jpg':
+        case 'jpeg': return 'image/jpeg';
+        case 'gif': return 'image/gif';
+        case 'webp': return 'image/webp';
+        case 'mp3': return 'audio/mpeg';
+        case 'wav': return 'audio/wav';
+        case 'ogg': return 'audio/ogg';
+        case 'mp4': return 'video/mp4';
+        case 'webm': return 'video/webm';
+        case 'mov': return 'video/quicktime';
+        default: return null;
+    }
+}
+function isImageMime(mime) {
+    return SUPPORTED_IMAGE_MIME.has(mime);
+}
+function isAudioMime(mime) {
+    return SUPPORTED_AUDIO_MIME.has(mime);
+}
+function isVideoMime(mime) {
+    return SUPPORTED_VIDEO_MIME.has(mime);
+}
+function toAnthropicContent(content) {
+    if (typeof content === 'string') {
+        return [{ type: 'text', text: content }];
+    }
+    return content.map(toAnthropicBlock);
+}
+function toAnthropicBlock(part) {
+    if (part.type === 'text') {
+        return { type: 'text', text: part.text };
+    }
+    const url = part.type === 'image_url'
+        ? part.image_url.url
+        : part.type === 'audio_url'
+            ? part.audio_url.url
+            : part.video_url.url;
+    const parsed = parseMediaUrl(url);
+    const source = parsed.kind === 'data'
+        ? { type: 'base64', media_type: parsed.mediaType, data: parsed.base64 }
+        : { type: 'url', url: parsed.url };
+    if (part.type === 'image_url') {
+        return { type: 'image', source };
+    }
+    return { type: 'document', source };
+}
+
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/adapters/minimax.js
 /**
  * MiniMax provider — wraps MiniMax API which exposes an Anthropic-compatible endpoint.
@@ -17502,8 +17856,16 @@ var sdk = __nccwpck_require__(39);
  * Models:
  *   - MiniMax-M2.7          (fast, simple tasks)
  *   - MiniMax-M2.7-highspeed (fastest, simplest)
- *   - MiniMax-M3            (slower, more capable, complex tasks)
+ *   - MiniMax-M3            (slower, more capable, complex tasks — vision-capable)
+ *
+ * M1 — multimodal (image/audio/video) supported via `opts.messages`. Each
+ * MultimodalMessage is converted to Anthropic SDK content blocks
+ * (image for `image_url`, document for `audio_url`/`video_url`). The
+ * vision-capable check is the executor's responsibility (see
+ * `assertMultimodalSupported` in provider-registry.ts); this adapter only
+ * shapes the request body.
  */
+
 
 // SDK appends '/v1/messages' → baseURL must NOT end with /v1
 const DEFAULT_BASE_URL = 'https://api.minimax.io/anthropic';
@@ -17517,7 +17879,6 @@ class MiniMaxProvider {
         return this.models.includes(model);
     }
     constructor(opts = {}) {
-        // Workers runtime doesn't have `process` — guard access
         const procEnv = typeof process !== 'undefined' ? process.env : undefined;
         const apiKey = opts.apiKey || procEnv?.MINIMAX_API_KEY;
         if (!apiKey) {
@@ -17529,14 +17890,17 @@ class MiniMaxProvider {
         });
     }
     async generateText(prompt, opts = {}) {
-        const model = opts.complexity === 'complex' ? this.complexModel : this.simpleModel;
+        const model = opts.model ?? (opts.complexity === 'complex' ? this.complexModel : this.simpleModel);
+        const { messages, systemParts } = buildAnthropicMessages(opts.messages, prompt);
+        const system = joinSystem(opts.system, systemParts);
         const response = await this.client.messages.create({
             model,
             max_tokens: opts.maxTokens ?? 2048,
             temperature: opts.temperature ?? 0.7,
-            system: opts.system,
-            stop_sequences: opts.stopSequences,
-            messages: [{ role: 'user', content: prompt }],
+            ...(opts.topP !== undefined ? { top_p: opts.topP } : {}),
+            ...(system !== undefined ? { system } : {}),
+            ...(opts.stopSequences ? { stop_sequences: opts.stopSequences } : {}),
+            messages: messages,
         });
         const text = response.content
             .filter((block) => block.type === 'text')
@@ -17549,7 +17913,7 @@ class MiniMaxProvider {
         return { text, usage };
     }
     async generateJson(prompt, schema, opts = {}) {
-        const jsonPrompt = `${prompt}\\n\\nRespond ONLY with valid JSON. No markdown, no prose, no code fences.`;
+        const jsonPrompt = `${prompt}\n\nRespond ONLY with valid JSON. No markdown, no prose, no code fences.`;
         const { text } = await this.generateText(jsonPrompt, {
             ...opts,
             system: opts.system ?? 'You are a JSON generator. Output only valid JSON, nothing else.',
@@ -17558,6 +17922,52 @@ class MiniMaxProvider {
         const parsed = JSON.parse(cleaned);
         return schema.parse(parsed);
     }
+}
+/**
+ * Build the `messages` payload for `client.messages.create`. When multimodal
+ * messages are supplied we convert each to Anthropic content blocks; otherwise
+ * we fall back to wrapping the legacy string `prompt` as a single user turn.
+ *
+ * Anthropic API does NOT accept `role:'system'` on messages — system prompts
+ * are a top-level parameter. We extract any system-role messages and return
+ * them as `systemParts` for the caller to merge into the `system` field.
+ */
+function buildAnthropicMessages(messages, fallbackPrompt) {
+    if (!messages || messages.length === 0) {
+        return { messages: [{ role: 'user', content: fallbackPrompt }], systemParts: [] };
+    }
+    const systemParts = [];
+    const out = [];
+    for (const msg of messages) {
+        if (msg.role === 'system') {
+            systemParts.push(typeof msg.content === 'string' ? msg.content : textFromParts(msg.content));
+            continue;
+        }
+        const role = msg.role === 'assistant' ? 'assistant' : 'user';
+        if (typeof msg.content === 'string') {
+            out.push({ role, content: msg.content });
+        }
+        else {
+            out.push({ role, content: toAnthropicContent(msg.content) });
+        }
+    }
+    if (out.length === 0) {
+        out.push({ role: 'user', content: '' });
+    }
+    return { messages: out, systemParts };
+}
+function textFromParts(parts) {
+    return parts
+        .filter((p) => p.type === 'text' && typeof p.text === 'string')
+        .map((p) => p.text)
+        .join('\n');
+}
+function joinSystem(existing, parts) {
+    const filtered = parts.filter((s) => s.length > 0);
+    if (filtered.length === 0)
+        return existing;
+    const joined = filtered.join('\n\n');
+    return existing && existing.length > 0 ? `${existing}\n\n${joined}` : joined;
 }
 
 ;// CONCATENATED MODULE: ../../node_modules/openai/internal/tslib.mjs
@@ -39360,6 +39770,11 @@ bedrock_a = brand_privateBedrockClient;
  *
  * Model routing — pass model name in pipeline stage (e.g. "anthropic/claude-3.5-sonnet").
  * Marketplace executes each stage with the named model; OpenRouter routes to provider.
+ *
+ * M1 — multimodal (image/audio/video) supported via `opts.messages`. The
+ * OpenRouter/OpenAI-compatible chat.completions API accepts our
+ * MultimodalMessage shape verbatim (image_url / audio_url / video_url),
+ * so we pass messages through unchanged.
  */
 
 const openrouter_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
@@ -39392,15 +39807,20 @@ class OpenRouterProvider {
     }
     async generateText(prompt, opts = {}) {
         const model = opts.model || (opts.complexity === 'complex' ? this.complexModel : this.simpleModel);
+        const messages = buildOpenAIMessages(opts.messages, prompt, opts.system);
         const response = await this.client.chat.completions.create({
             model,
             max_tokens: opts.maxTokens ?? 2048,
             temperature: opts.temperature ?? 0.7,
-            messages: [
-                ...(opts.system ? [{ role: 'system', content: opts.system }] : []),
-                { role: 'user', content: prompt },
-            ],
-            stop: opts.stopSequences,
+            ...(opts.topP !== undefined ? { top_p: opts.topP } : {}),
+            ...(opts.seed !== undefined ? { seed: opts.seed } : {}),
+            ...(opts.reasoningEffort !== undefined ? { reasoning_effort: opts.reasoningEffort } : {}),
+            ...(opts.responseFormat !== undefined
+                ? { response_format: { type: opts.responseFormat } }
+                : {}),
+            messages: messages,
+            ...(opts.stopSequences ? { stop: opts.stopSequences } : {}),
+            ...(opts.providerParams ?? {}),
         });
         const text = response.choices[0]?.message?.content ?? '';
         const usage = {
@@ -39419,6 +39839,278 @@ class OpenRouterProvider {
         const parsed = JSON.parse(cleaned);
         return schema.parse(parsed);
     }
+}
+function buildOpenAIMessages(messages, fallbackPrompt, system) {
+    if (!messages || messages.length === 0) {
+        const out = [];
+        if (system)
+            out.push({ role: 'system', content: system });
+        out.push({ role: 'user', content: fallbackPrompt });
+        return out;
+    }
+    const out = [];
+    if (system)
+        out.push({ role: 'system', content: system });
+    for (const msg of messages) {
+        if (msg.role === 'system') {
+            const sysContent = typeof msg.content === 'string' ? msg.content : openrouter_textFromParts(msg.content);
+            out.push({ role: 'system', content: sysContent });
+            continue;
+        }
+        const role = msg.role === 'assistant' ? 'assistant' : 'user';
+        if (typeof msg.content === 'string') {
+            out.push({ role, content: msg.content });
+        }
+        else {
+            out.push({ role, content: msg.content.map(toOpenAIPart) });
+        }
+    }
+    return out;
+}
+function toOpenAIPart(part) {
+    if (part.type === 'text')
+        return { type: 'text', text: part.text };
+    if (part.type === 'image_url') {
+        return { type: 'image_url', image_url: part.image_url };
+    }
+    if (part.type === 'audio_url') {
+        return { type: 'audio_url', audio_url: part.audio_url };
+    }
+    return { type: 'video_url', video_url: part.video_url };
+}
+function openrouter_textFromParts(parts) {
+    return parts
+        .filter((p) => p.type === 'text')
+        .map((p) => (p.type === 'text' ? p.text : ''))
+        .join('\n');
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/providers/openai-chat.js
+/**
+ * OpenAI chat completions provider — gpt-4 / gpt-4-turbo / gpt-3.5-turbo.
+ *
+ * Endpoint: https://api.openai.com/v1/chat/completions (via openai SDK)
+ * Auth:     OPENAI_API_KEY env var (or apiKey in constructor opts)
+ *
+ * Follows the OpenRouterProvider pattern (adapters/openrouter.ts):
+ * OpenAI-compatible chat.completions API, messages passed through verbatim.
+ * Multimodal messages (image/audio/video parts) are forwarded unchanged —
+ * the OpenAI API accepts image_url parts natively.
+ */
+
+const openai_chat_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
+class OpenAIChatProvider {
+    name = 'openai';
+    models = ['gpt-4', 'gpt-4-turbo', 'gpt-3.5-turbo'];
+    simpleModel = 'gpt-4';
+    complexModel = 'gpt-4-turbo';
+    client;
+    supports(model) {
+        return this.models.includes(model);
+    }
+    constructor(opts = {}) {
+        const procEnv = typeof process !== 'undefined' ? process.env : undefined;
+        const apiKey = opts.apiKey || procEnv?.OPENAI_API_KEY;
+        if (!apiKey) {
+            throw new Error('OpenAIChatProvider: apiKey missing. Pass via opts.apiKey or set OPENAI_API_KEY env var.');
+        }
+        this.client = new OpenAI({
+            apiKey,
+            baseURL: opts.baseURL || procEnv?.OPENAI_BASE_URL || openai_chat_DEFAULT_BASE_URL,
+        });
+    }
+    async generateText(prompt, opts = {}) {
+        const model = opts.model ?? (opts.complexity === 'complex' ? this.complexModel : this.simpleModel);
+        const messages = openai_chat_buildOpenAIMessages(opts.messages, prompt, opts.system);
+        const response = await this.client.chat.completions.create({
+            model,
+            max_tokens: opts.maxTokens ?? 2048,
+            temperature: opts.temperature ?? 0.7,
+            ...(opts.topP !== undefined ? { top_p: opts.topP } : {}),
+            messages: messages,
+            ...(opts.stopSequences ? { stop: opts.stopSequences } : {}),
+        });
+        const text = response.choices[0]?.message?.content ?? '';
+        const usage = {
+            inputTokens: response.usage?.prompt_tokens ?? 0,
+            outputTokens: response.usage?.completion_tokens ?? 0,
+        };
+        return { text, usage };
+    }
+    async generateJson(prompt, schema, opts = {}) {
+        const jsonPrompt = `${prompt}\n\nRespond ONLY with valid JSON. No markdown, no prose, no code fences.`;
+        const { text } = await this.generateText(jsonPrompt, {
+            ...opts,
+            system: opts.system ?? 'You are a JSON generator. Output only valid JSON, nothing else.',
+        });
+        const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+        const parsed = JSON.parse(cleaned);
+        return schema.parse(parsed);
+    }
+}
+function openai_chat_buildOpenAIMessages(messages, fallbackPrompt, system) {
+    if (!messages || messages.length === 0) {
+        const out = [];
+        if (system)
+            out.push({ role: 'system', content: system });
+        out.push({ role: 'user', content: fallbackPrompt });
+        return out;
+    }
+    const out = [];
+    if (system)
+        out.push({ role: 'system', content: system });
+    for (const msg of messages) {
+        if (msg.role === 'system') {
+            const sysContent = typeof msg.content === 'string' ? msg.content : openai_chat_textFromParts(msg.content);
+            out.push({ role: 'system', content: sysContent });
+            continue;
+        }
+        const role = msg.role === 'assistant' ? 'assistant' : 'user';
+        if (typeof msg.content === 'string') {
+            out.push({ role, content: msg.content });
+        }
+        else {
+            out.push({ role, content: msg.content.map(openai_chat_toOpenAIPart) });
+        }
+    }
+    return out;
+}
+function openai_chat_toOpenAIPart(part) {
+    if (part.type === 'text')
+        return { type: 'text', text: part.text };
+    if (part.type === 'image_url') {
+        return { type: 'image_url', image_url: part.image_url };
+    }
+    if (part.type === 'audio_url') {
+        return { type: 'audio_url', audio_url: part.audio_url };
+    }
+    return { type: 'video_url', video_url: part.video_url };
+}
+function openai_chat_textFromParts(parts) {
+    return parts
+        .filter((p) => p.type === 'text')
+        .map((p) => (p.type === 'text' ? p.text : ''))
+        .join('\n');
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/providers/anthropic.js
+/**
+ * Anthropic Claude 3 provider — claude-3-opus / sonnet / haiku.
+ *
+ * Endpoint: https://api.anthropic.com/v1/messages (via @anthropic-ai/sdk)
+ * Auth:     ANTHROPIC_API_KEY env var (or apiKey in constructor opts)
+ *
+ * Follows the MiniMaxProvider pattern (adapters/minimax.ts): MiniMax wraps
+ * an Anthropic-compatible endpoint, so the SDK usage, system-prompt
+ * handling (top-level `system`, never role:system in messages), and
+ * multimodal conversion (toAnthropicContent) are shared.
+ */
+
+
+const anthropic_DEFAULT_BASE_URL = 'https://api.anthropic.com';
+class AnthropicProvider {
+    name = 'anthropic';
+    models = [
+        'claude-3-opus-20240229',
+        'claude-3-sonnet-20240229',
+        'claude-3-haiku-20240307',
+    ];
+    simpleModel = 'claude-3-sonnet-20240229';
+    complexModel = 'claude-3-opus-20240229';
+    client;
+    supports(model) {
+        return this.models.includes(model);
+    }
+    constructor(opts = {}) {
+        const procEnv = typeof process !== 'undefined' ? process.env : undefined;
+        const apiKey = opts.apiKey || procEnv?.ANTHROPIC_API_KEY;
+        if (!apiKey) {
+            throw new Error('AnthropicProvider: apiKey missing. Pass via opts.apiKey or set ANTHROPIC_API_KEY env var.');
+        }
+        this.client = new sdk/* default */.Ay({
+            apiKey,
+            baseURL: opts.baseURL || procEnv?.ANTHROPIC_BASE_URL || anthropic_DEFAULT_BASE_URL,
+        });
+    }
+    async generateText(prompt, opts = {}) {
+        const model = opts.model ?? (opts.complexity === 'complex' ? this.complexModel : this.simpleModel);
+        const { messages, systemParts } = anthropic_buildAnthropicMessages(opts.messages, prompt);
+        const system = anthropic_joinSystem(opts.system, systemParts);
+        const response = await this.client.messages.create({
+            model,
+            max_tokens: opts.maxTokens ?? 2048,
+            temperature: opts.temperature ?? 0.7,
+            ...(opts.topP !== undefined ? { top_p: opts.topP } : {}),
+            ...(system !== undefined ? { system } : {}),
+            ...(opts.stopSequences ? { stop_sequences: opts.stopSequences } : {}),
+            messages: messages,
+        });
+        const text = response.content
+            .filter((block) => block.type === 'text')
+            .map((block) => block.text)
+            .join('');
+        const usage = {
+            inputTokens: response.usage.input_tokens,
+            outputTokens: response.usage.output_tokens,
+        };
+        return { text, usage };
+    }
+    async generateJson(prompt, schema, opts = {}) {
+        const jsonPrompt = `${prompt}\n\nRespond ONLY with valid JSON. No markdown, no prose, no code fences.`;
+        const { text } = await this.generateText(jsonPrompt, {
+            ...opts,
+            system: opts.system ?? 'You are a JSON generator. Output only valid JSON, nothing else.',
+        });
+        const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+        const parsed = JSON.parse(cleaned);
+        return schema.parse(parsed);
+    }
+}
+/**
+ * Build the `messages` payload for `client.messages.create`. When multimodal
+ * messages are supplied we convert each to Anthropic content blocks; otherwise
+ * we fall back to wrapping the legacy string `prompt` as a single user turn.
+ *
+ * Anthropic API does NOT accept `role:'system'` on messages — system prompts
+ * are a top-level parameter. We extract any system-role messages and return
+ * them as `systemParts` for the caller to merge into the `system` field.
+ */
+function anthropic_buildAnthropicMessages(messages, fallbackPrompt) {
+    if (!messages || messages.length === 0) {
+        return { messages: [{ role: 'user', content: fallbackPrompt }], systemParts: [] };
+    }
+    const systemParts = [];
+    const out = [];
+    for (const msg of messages) {
+        if (msg.role === 'system') {
+            systemParts.push(typeof msg.content === 'string' ? msg.content : anthropic_textFromParts(msg.content));
+            continue;
+        }
+        const role = msg.role === 'assistant' ? 'assistant' : 'user';
+        if (typeof msg.content === 'string') {
+            out.push({ role, content: msg.content });
+        }
+        else {
+            out.push({ role, content: toAnthropicContent(msg.content) });
+        }
+    }
+    if (out.length === 0) {
+        out.push({ role: 'user', content: '' });
+    }
+    return { messages: out, systemParts };
+}
+function anthropic_textFromParts(parts) {
+    return parts
+        .filter((p) => p.type === 'text' && typeof p.text === 'string')
+        .map((p) => p.text)
+        .join('\n');
+}
+function anthropic_joinSystem(existing, parts) {
+    const filtered = parts.filter((s) => s.length > 0);
+    if (filtered.length === 0)
+        return existing;
+    const joined = filtered.join('\n\n');
+    return existing && existing.length > 0 ? `${existing}\n\n${joined}` : joined;
 }
 
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/fallback.js
@@ -39501,19 +40193,331 @@ function createFallbackProvider(providers) {
 
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/provider-registry.js
 /**
- * LLMProviderRegistry — explicit provider lookup per stage.
+ * Provider registry — static metadata + runtime class.
  *
- * v0.3 NEW (R6.3). Replaces model-name auto-dispatch (pickProvider)
- * with a name → instance map. Each stage declares `provider:` (R6.2);
- * the executor calls `registry.resolveWithSupports(name, model)`
- * which fails fast on unknown provider or unsupported model.
+ * R6 (Pipeline v0.3) — Provider ≠ Model separation.
  *
- * Pure module — no I/O, no env access. Constructed once per
- * pipeline-run with the set of providers the executor can pick from.
+ *   Every pipeline stage MUST declare both `provider:` and `model:`.
+ *   Auto-dispatch by model name (v0.2 `pickProvider`) was removed in
+ *   R6. The `PROVIDER_REGISTRY` constant below is the single source
+ *   of truth for *which models each provider supports*.
  *
- * Wiring: optional `registry` field in StageExecutorDeps; uses the
- * legacy single `provider` field when not present (backward-compat).
+ * Two-layer design:
+ *
+ *   1. Static `PROVIDER_REGISTRY` (this file) — pure data: name,
+ *      display name, supportedModels allowlist, baseUrl, env var.
+ *      Use for: schema validation, CLI help text, `validate()`
+ *      command. Pure module, no I/O.
+ *
+ *   2. Runtime `LLMProviderRegistry` class (this file) — wraps the
+ *      set of *instantiated* `LLMProvider` objects available to the
+ *      executor (depends on env keys present). Use for: actual
+ *      request execution. Constructed once per pipeline-run.
+ *
+ * The static registry declares 5 providers (openai, anthropic,
+ * minimax, openrouter, replicate). The runtime class currently
+ * instantiates only those with env keys configured (minimax +
+ * openrouter). openai/anthropic/replicate land when their SDK
+ * adapters ship (post-R6).
+ *
+ * TODO production: replace the static allowlists with dynamic
+ * /models fetches against each provider's API; cache with TTL.
  */
+const PROVIDER_REGISTRY = {
+    openai: {
+        name: 'openai',
+        displayName: 'OpenAI',
+        supportedModels: [
+            'gpt-4',
+            'gpt-4-turbo',
+            'gpt-4o',
+            'gpt-4o-mini',
+            'o1-preview',
+            'o1-mini',
+            'gpt-3.5-turbo',
+        ],
+        visionCapableModels: ['gpt-4-turbo', 'gpt-4o', 'gpt-4o-mini'],
+        baseUrl: 'https://api.openai.com/v1',
+        apiKeyEnvVar: 'OPENAI_API_KEY',
+    },
+    anthropic: {
+        name: 'anthropic',
+        displayName: 'Anthropic',
+        supportedModels: [
+            'claude-3-5-sonnet-20241022',
+            'claude-3-5-haiku-20241022',
+            'claude-3-opus-20240229',
+            'claude-3-sonnet-20240229',
+            'claude-3-haiku-20240307',
+        ],
+        visionCapableModels: [
+            'claude-3-5-sonnet-20241022',
+            'claude-3-5-haiku-20241022',
+            'claude-3-opus-20240229',
+            'claude-3-sonnet-20240229',
+            'claude-3-haiku-20240307',
+        ],
+        baseUrl: 'https://api.anthropic.com/v1',
+        apiKeyEnvVar: 'ANTHROPIC_API_KEY',
+    },
+    minimax: {
+        name: 'minimax',
+        displayName: 'MiniMax',
+        supportedModels: [
+            'MiniMax-M3',
+            'MiniMax-M2.7',
+            'MiniMax-M1',
+        ],
+        visionCapableModels: ['MiniMax-M3'],
+        baseUrl: 'https://api.minimax.io/anthropic/v1',
+        apiKeyEnvVar: 'MINIMAX_API_KEY',
+    },
+    openrouter: {
+        name: 'openrouter',
+        displayName: 'OpenRouter',
+        // OpenRouter is a multi-model gateway — it routes anything.
+        supportedModels: ['*'],
+        // Conservative explicit list — adding new vision models is a code change.
+        visionCapableModels: [
+            'openai/gpt-4o',
+            'openai/gpt-4-turbo',
+            'anthropic/claude-3.5-sonnet',
+            'anthropic/claude-3-opus',
+        ],
+        baseUrl: 'https://openrouter.ai/api/v1',
+        apiKeyEnvVar: 'OPENROUTER_API_KEY',
+    },
+    replicate: {
+        name: 'replicate',
+        displayName: 'Replicate',
+        supportedModels: [
+            'black-forest-labs/flux-pro',
+            'black-forest-labs/flux-schnell',
+            'stability-ai/sdxl',
+        ],
+        baseUrl: 'https://api.replicate.com/v1',
+        apiKeyEnvVar: 'REPLICATE_API_TOKEN',
+    },
+};
+/**
+ * Look up a provider by name. Returns null for unknown names —
+ * use {@link validateProviderName} when an exception is desired.
+ */
+function getProvider(name) {
+    if (typeof name !== 'string' || name.length === 0)
+        return null;
+    const spec = PROVIDER_REGISTRY[name];
+    return spec ?? null;
+}
+/**
+ * Like {@link getProvider} but throws `ProviderSpecNotFoundError`
+ * on unknown names. Use at trust boundaries (CLI validate, server
+ * publish) where a misspelled provider must fail-fast with a clear
+ * message instead of silently returning null.
+ */
+function validateProviderName(name) {
+    const spec = getProvider(name);
+    if (spec === null) {
+        throw new ProviderSpecNotFoundError(name, listProviders().map((p) => p.name));
+    }
+    return spec.name;
+}
+/**
+ * Does the provider support this model?
+ *
+ *   - exact match against `supportedModels` → true
+ *   - provider has `'*'` in supportedModels → true (openrouter)
+ *   - otherwise → false
+ *
+ * Pure function; safe to call from validators and tests.
+ */
+function supportsModel(providerName, modelName) {
+    const spec = PROVIDER_REGISTRY[providerName];
+    if (!spec)
+        return false;
+    if (spec.supportedModels.includes('*'))
+        return true;
+    return spec.supportedModels.includes(modelName);
+}
+/**
+ * Combined check: validate provider name AND model membership.
+ * Returns the normalized `{ provider, model }` tuple.
+ *
+ * Throws `ProviderSpecNotFoundError` (unknown provider) or
+ * `ProviderModelMismatchError` (provider exists but model is not
+ * in its allowlist) with messages that include the full supported
+ * model list for fast debugging.
+ */
+function validateProviderModel(providerName, modelName) {
+    const provider = validateProviderName(providerName);
+    if (!supportsModel(provider, modelName)) {
+        const available = PROVIDER_REGISTRY[provider].supportedModels;
+        throw new ProviderModelMismatchError(provider, modelName, available);
+    }
+    return { provider, model: modelName };
+}
+/** All provider specs, in registry-insertion order. */
+function listProviders() {
+    return Object.values(PROVIDER_REGISTRY);
+}
+/**
+ * M1 NEW — Is this (provider, model) combination capable of accepting
+ * multimodal input? Pure check; throws nothing. Unknown provider or
+ * provider without visionCapableModels → false.
+ */
+function isVisionCapable(providerName, modelName) {
+    const spec = PROVIDER_REGISTRY[providerName];
+    if (!spec)
+        return false;
+    const vision = spec.visionCapableModels ?? [];
+    return vision.includes(modelName);
+}
+/**
+ * M1 NEW — Throw {@link MultimodalModelUnsupportedError} when (provider,
+ * model) does not accept multimodal input. Returns silently when the
+ * model is vision-capable. Use at trust boundaries (stage executor) to
+ * fail fast with a clear message.
+ */
+function assertMultimodalSupported(providerName, modelName) {
+    if (isVisionCapable(providerName, modelName))
+        return;
+    const spec = PROVIDER_REGISTRY[providerName];
+    const vision = spec?.visionCapableModels ?? [];
+    throw new MultimodalModelUnsupportedError(providerName, modelName, vision);
+}
+/**
+ * M1 NEW — Return the vision-capable models for a provider (empty array
+ * if the provider is text-only or unknown). Used by error messages and
+ * CLI discovery.
+ */
+function listVisionCapableModels(providerName) {
+    const spec = PROVIDER_REGISTRY[providerName];
+    return spec?.visionCapableModels ?? [];
+}
+/**
+ * Models the provider supports (or `['*']` for gateways).
+ * Returns the same readonly tuple as `spec.supportedModels` —
+ * consumers should treat it as read-only.
+ */
+function listSupportedModels(providerName) {
+    const spec = PROVIDER_REGISTRY[providerName];
+    if (!spec) {
+        throw new ProviderSpecNotFoundError(providerName, listProviders().map((p) => p.name));
+    }
+    return spec.supportedModels;
+}
+/**
+ * Pure validator for the R6 (Provider ≠ Model) schema rules. Used
+ * by both CLI (`agentsmarket validate`, `agentsmarket run` preflight)
+ * and server (`POST /v1/pipelines` publish gate). No env access,
+ * no I/O — safe to call from tests and CLI completion.
+ *
+ * Rules enforced:
+ *   1. Every LLM stage (model OR prompt-only) MUST declare `provider:`.
+ *      Auto-dispatch by model name was removed in R6.
+ *   2. The (provider, model) pair MUST be in `PROVIDER_REGISTRY`.
+ *      `provider.supports(model)` is the source of truth.
+ *   3. The stage's effective model = `stage.model ?? spec.defaults?.model ?? 'MiniMax-M3'`.
+ *      Stages using `uses:` (skill invocation) skip the gate entirely.
+ */
+function validateR6Spec(spec) {
+    const errors = [];
+    const stages = spec.stages ?? [];
+    for (const stage of stages) {
+        const isUsesStage = stage.uses !== undefined && stage.uses !== null;
+        const hasModel = typeof stage.model === 'string' && stage.model.length > 0;
+        const hasStringPrompt = typeof stage.prompt === 'string' && stage.prompt.length > 0;
+        const hasMultimodalPrompt = Array.isArray(stage.prompt) && stage.prompt.length > 0;
+        const hasPrompt = hasStringPrompt || hasMultimodalPrompt;
+        const isLlmStage = hasModel || (hasPrompt && !isUsesStage);
+        if (!isLlmStage)
+            continue;
+        const stageLabel = `Stage '${stage.id ?? '<no-id>'}'`;
+        if (typeof stage.provider !== 'string' || stage.provider.length === 0) {
+            errors.push(`${stageLabel}: R6 requires explicit 'provider:' field ` +
+                `(auto-dispatch by model name removed). Add 'provider: minimax' ` +
+                `(or openrouter/openai/anthropic/replicate).`);
+            continue;
+        }
+        const effectiveModel = hasModel
+            ? stage.model
+            : (spec.defaults?.model ?? 'MiniMax-M3');
+        try {
+            validateProviderModel(stage.provider, effectiveModel);
+        }
+        catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            errors.push(`${stageLabel}: ${msg}`);
+        }
+    }
+    return { errors };
+}
+/**
+ * One-shot migration: adds `provider: minimax` to every LLM stage
+ * that lacks a provider field. Legacy v0.2 pipelines relied on
+ * auto-dispatch; R6 requires explicit declaration. Idempotent —
+ * re-running on an already-migrated spec is a no-op.
+ *
+ * Returns a NEW spec object (input not mutated). Stages that already
+ * declare any provider (openai, anthropic, openrouter, replicate, …)
+ * are passed through unchanged.
+ */
+function migrateProviderField(spec, defaultProvider = 'minimax') {
+    const stages = spec.stages ?? [];
+    const newStages = stages.map((stage) => {
+        const hasProvider = typeof stage['provider'] === 'string' && stage['provider'].length > 0;
+        if (hasProvider)
+            return stage;
+        const uses = stage['uses'];
+        const hasUses = uses !== undefined && uses !== null;
+        const hasModel = typeof stage['model'] === 'string' && stage['model'].length > 0;
+        const promptVal = stage['prompt'];
+        const hasStringPrompt = typeof promptVal === 'string' && promptVal.length > 0;
+        const hasMultimodalPrompt = Array.isArray(promptVal) && promptVal.length > 0;
+        const hasPrompt = hasStringPrompt || hasMultimodalPrompt;
+        const isLlmStage = hasModel || (hasPrompt && !hasUses);
+        if (!isLlmStage)
+            return stage;
+        return { ...stage, provider: defaultProvider };
+    });
+    return { ...spec, stages: newStages };
+}
+// ─────────────────────────────────────────────────────────────────────────────
+// Errors (static layer)
+// ─────────────────────────────────────────────────────────────────────────────
+/** Thrown when a string doesn't match any registered provider. */
+class ProviderSpecNotFoundError extends Error {
+    providerName;
+    availableProviders;
+    constructor(providerName, availableProviders) {
+        const avail = availableProviders.length > 0
+            ? availableProviders.join(', ')
+            : '(none registered)';
+        super(`Provider '${providerName}' is not registered. ` +
+            `Available providers: ${avail}`);
+        this.name = 'PROVIDER_SPEC_NOT_FOUND';
+        this.providerName = providerName;
+        this.availableProviders = availableProviders;
+    }
+}
+/** Thrown when a (provider, model) pair is invalid for the provider. */
+class ProviderModelMismatchError extends Error {
+    providerName;
+    model;
+    availableModels;
+    constructor(providerName, model, availableModels) {
+        const avail = availableModels.length > 0
+            ? availableModels.join(', ')
+            : '(none registered)';
+        super(`Provider '${providerName}' does not support model '${model}'. ` +
+            `Supported models for ${providerName}: ${avail}`);
+        this.name = 'PROVIDER_MODEL_MISMATCH';
+        this.providerName = providerName;
+        this.model = model;
+        this.availableModels = availableModels;
+    }
+}
+
 /**
  * Thrown when a stage declares `provider: X` but X is not in the
  * registry passed to the executor.
@@ -42654,45 +43658,202 @@ const {
 /**
  * Pipeline text ${VAR} resolution + YAML parse.
  *
- * v0.3 NEW (R7.1). Two-stage: pure shell-style ${VAR} / ${VAR:-default}
- * substitution from process.env, then yaml.load(). Keeps existing
- * yaml.load consumers unchanged — they see the substituted string.
+ * v0.3 NEW (R7.1 → R7.7). Two-stage: pure shell-style ${VAR} / ${VAR:-default}
+ * substitution from a caller-provided env (defaults to process.env), then
+ * yaml.load(). Keeps existing yaml.load consumers unchanged — they see the
+ * substituted string.
  *
  * 12-factor env-var convention (same as bash/zsh). No credential
  * storage in v0.3 — values come from shell / CI secrets / Docker -e.
+ *
+ * TODO production: integrate with CF Workers Secrets API for runtime secret
+ * resolution; the current impl reads from process.env at parse time.
  */
 
+/** Maximum recursion depth for nested ${${VAR}} patterns. */
+const MAX_RECURSION_DEPTH = 10;
 /**
  * Thrown when ${VAR} appears without a default and env has no value.
- * Carries the variable name for structured logging / UI display.
+ * Carries the variable name (and optional file/line context) for
+ * structured logging / UI display.
  */
 class MissingEnvVarError extends Error {
     varName;
-    constructor(varName) {
-        super(`Environment variable "${varName}" is required (no default specified)`);
+    filePath;
+    lineNumber;
+    constructor(varName, opts = {}) {
+        const where = opts.filePath
+            ? (opts.lineNumber !== undefined
+                ? ` (in ${opts.filePath}:${opts.lineNumber})`
+                : ` (in ${opts.filePath})`)
+            : '';
+        super(`Environment variable "${varName}" is required (no default specified)${where}. Pipeline references \${${varName}}; set it via export ${varName}=... or use the syntax \${${varName}:-default_value}.`);
         this.name = 'MISSING_ENV_VAR';
         this.varName = varName;
+        this.filePath = opts.filePath;
+        this.lineNumber = opts.lineNumber;
     }
 }
-const VAR_PATTERN = /\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}/g;
+/**
+ * Parse one variable spec like `${VAR}` or `${VAR:-default}` into its
+ * components. Returns `null` for spec strings that are not valid
+ * variable references (used internally by the resolver; exported for
+ * testability and tool-building).
+ *
+ *   parseVariableSpec('${OPENAI_API_KEY}')    → { name: 'OPENAI_API_KEY' }
+ *   parseVariableSpec('${MODEL:-gpt-4o}')      → { name: 'MODEL', default: 'gpt-4o' }
+ *   parseVariableSpec('${NAME:- hello world }')→ { name: 'NAME', default: 'hello world' }
+ *   parseVariableSpec('${EMPTY_VAR:-}')        → { name: 'EMPTY_VAR', default: '' }
+ *   parseVariableSpec('${lowercase}')          → null  (uppercase+underscore only)
+ *   parseVariableSpec('not a spec')            → null
+ */
+function parseVariableSpec(spec) {
+    if (typeof spec !== 'string')
+        return null;
+    // Match exactly one "${NAME}" or "${NAME:-default}" (whitespace tolerant inside braces).
+    const re = /^\$\{\s*([A-Z_][A-Z0-9_]*)\s*(?::-\s*([^}]*?)\s*)?\}$/;
+    const m = re.exec(spec);
+    if (!m)
+        return null;
+    const out = { name: m[1] };
+    // Capturing group 2 is undefined when no ":-" was present; explicit else branch
+    // distinguishes "no default" from "empty default".
+    if (m[2] !== undefined)
+        out.default = m[2];
+    return out;
+}
 /**
  * Substitute ${VAR} and ${VAR:-default} occurrences in raw pipeline text.
+ *
  * Pure — no I/O, no side effects. Defaults to process.env when env omitted.
+ *
+ * Edge cases:
+ *   - `$$` (escape) → literal `$`
+ *   - `${VAR:- default with spaces }` → default trimmed
+ *   - `${VAR:-}` (empty default) → empty string when VAR unset
+ *   - Nested `${${VAR}}` recurses up to 10 levels deep (DoS guard)
+ *   - Lowercase first char (`${var}`) → not matched, left literal
  */
-function expandPipelineText(raw, env = process.env) {
-    return raw.replace(VAR_PATTERN, (_match, name, fallback) => {
+function expandPipelineText(raw, env = process.env, opts = {}) {
+    if (typeof raw !== 'string' || raw.length === 0)
+        return raw;
+    return substituteOnce(raw, env, 0, opts);
+}
+/**
+ * Public alias for `expandPipelineText`. Same semantics; the alias lives
+ * in the public API per the R7 spec.
+ */
+function resolveEnvVars(text, env, opts = {}) {
+    return expandPipelineText(text, env, opts);
+}
+/**
+ * Recursively substitute ${VAR} / ${VAR:-default} in every string leaf of an
+ * already-parsed object tree (post-yaml.load). Non-string leaves are passed
+ * through unchanged.
+ *
+ *   resolveEnvVarsInObject({ a: '${X}', b: 1, c: ['${Y:-fallback}'] }, { X: 'hi' })
+ *     → { a: 'hi', b: 1, c: ['fallback'] }
+ *
+ * Useful when env vars land in values that come from sources other than raw
+ * YAML text (e.g., a JSON config loaded at runtime, or CLI inputs).
+ */
+function resolveEnvVarsInObject(obj, env) {
+    return walkReplace(obj, env ?? process.env, 0, {});
+}
+function walkReplace(value, env, depth, opts) {
+    if (depth > MAX_RECURSION_DEPTH) {
+        throw new Error(`resolveEnvVarsInObject: object nesting exceeds MAX_RECURSION_DEPTH=${MAX_RECURSION_DEPTH}`);
+    }
+    if (value === null || value === undefined)
+        return value;
+    if (typeof value === 'string') {
+        return expandPipelineText(value, env, opts);
+    }
+    if (Array.isArray(value)) {
+        return value.map((v) => walkReplace(v, env, depth + 1, opts));
+    }
+    if (typeof value === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            out[k] = walkReplace(v, env, depth + 1, opts);
+        }
+        return out;
+    }
+    // numbers / booleans / bigints / symbols — pass through
+    return value;
+}
+/**
+ * Internal: one pass of substitution. Tracks recursion depth.
+ *
+ * Implementation notes:
+ *   - `$$` is processed via a sentinel placeholder (a private-use-area
+ *     Unicode code point that won't appear in normal pipeline text). The
+ *     sentinel blocks the `${...}` regex from matching the literal
+ *     content that should remain after `$$` escape. After the regex
+ *     pass completes, the sentinel is replaced with `$`. This way
+ *     `$${amount}` yields literal `${amount}` (the `{amount}` was never
+ *     matched by the var regex) and `$$${VAR}` yields `$value` (the `$$`
+ *     became a sentinel, the `${VAR}` legitimately substituted).
+ *   - The regex tolerates whitespace inside the braces (`${ VAR }`) and
+ *     accepts an optional `:-default` suffix whose default value is trimmed.
+ *   - Lowercase / mixed-case names do NOT match — only [A-Z_][A-Z0-9_]* —
+ *     so `${var}` and `$lowercase_var` are treated as literal text.
+ */
+/** Sentinel used to mask $$ → $ escape so the var regex doesn't see it. */
+const DOLLAR_ESCAPE_SENTINEL = '\uE000\uE001';
+function substituteOnce(raw, env, depth, opts) {
+    if (depth > MAX_RECURSION_DEPTH) {
+        throw new Error(`expandPipelineText: substitution recursion exceeds MAX_RECURSION_DEPTH=${MAX_RECURSION_DEPTH}`);
+    }
+    // Phase 1: mask $$ → sentinel so the var regex won't see the leading $
+    // of a would-be `${...}` pattern produced by the escape.
+    let s = raw;
+    if (s.includes('$$')) {
+        s = s.split('$$').join(DOLLAR_ESCAPE_SENTINEL);
+    }
+    // Match a single ${...} reference. Multiline / global handled by looping.
+    const VAR_RE = /\$\{\s*([A-Z_][A-Z0-9_]*)\s*(?::-\s*([^}]*?)\s*)?\}/g;
+    let out = '';
+    let lastIndex = 0;
+    let match;
+    while ((match = VAR_RE.exec(s)) !== null) {
+        out += s.slice(lastIndex, match.index);
+        const name = match[1];
+        const fallbackRaw = match[2];
+        let resolved;
         if (Object.prototype.hasOwnProperty.call(env, name) && env[name] !== undefined) {
-            return env[name];
+            resolved = env[name];
         }
-        if (fallback !== undefined) {
-            return fallback;
+        else if (fallbackRaw !== undefined) {
+            // fallback is trimmed by the regex (via \s* anchors); explicit empty string
+            // is preserved (matches shell `:-` semantics: an empty default is intentional).
+            resolved = fallbackRaw;
         }
-        throw new MissingEnvVarError(name);
-    });
+        else {
+            throw new MissingEnvVarError(name, { filePath: opts.filePath });
+        }
+        // When the resolved value itself contains a ${...}-like sequence
+        // (chain of vars where one references another), recurse with depth+1.
+        if (resolved.indexOf('${') !== -1) {
+            resolved = substituteOnce(resolved, env, depth + 1, opts);
+        }
+        out += resolved;
+        lastIndex = match.index + match[0].length;
+    }
+    out += s.slice(lastIndex);
+    // Phase 2: restore sentinel → $
+    if (out.includes(DOLLAR_ESCAPE_SENTINEL)) {
+        out = out.split(DOLLAR_ESCAPE_SENTINEL).join('$');
+    }
+    return out;
 }
 /**
  * Convenience: expand ${VAR} then yaml.load the substituted text.
  * Returns unknown — caller casts to PipelineFileSpec / similar.
+ *
+ * Existing v0.2 / v0.3 callers (CLI run / validate, server publish) use
+ * this entry point; it adds the env-var preprocessing before handing the
+ * text off to js-yaml.
  */
 function loadPipelineYaml(raw, env) {
     return yaml.load(expandPipelineText(raw, env));
@@ -43049,6 +44210,18 @@ function makeStageSkippedEvent(stageId) {
 function makeStageFailedEvent(args) {
     return { type: 'stage.failed', at: nowIso(), stageId: args.stageId, error: args.error, reason: 'error' };
 }
+function makeStageRetriedEvent(args) {
+    return {
+        type: 'stage.retry',
+        stageId: args.stageId,
+        attempt: args.attempt,
+        maxAttempts: args.maxAttempts,
+        errorMessage: args.errorMessage,
+        ...(args.errorStatus !== undefined ? { errorStatus: args.errorStatus } : {}),
+        nextBackoffMs: args.nextBackoffMs,
+        at: nowIso(),
+    };
+}
 
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/runtime-constraints.js
 /**
@@ -43241,10 +44414,12 @@ function injectNestedStages(parentStages, nested, prefix) {
 }
 class CompositionDepthError extends Error {
     depth;
-    constructor(depth) {
-        super(`Pipeline composition exceeded max depth (${MAX_COMPOSITION_DEPTH}); abort to prevent infinite recursion`);
+    maxDepth;
+    constructor(depth, maxDepth = MAX_COMPOSITION_DEPTH) {
+        super(`Pipeline composition exceeded max depth (${maxDepth}); abort to prevent infinite recursion`);
         this.name = 'COMPOSITION_DEPTH_EXCEEDED';
         this.depth = depth;
+        this.maxDepth = maxDepth;
     }
 }
 class PipelineFetchError extends Error {
@@ -43265,9 +44440,26 @@ function prefixChildStages(stages, prefix) {
         depends_on: s.depends_on?.map((d) => (d.includes('.') ? d : `${prefix}.${d}`)),
     }));
 }
-async function expandComposition(stages, fetcher, depth = 0) {
-    if (depth >= MAX_COMPOSITION_DEPTH) {
-        throw new CompositionDepthError(depth);
+/**
+ * Expand a stage list by inlining any stage whose `uses:` references another
+ * pipeline via the `pipeline:NAME@VERSION` prefix. Each recursive call adds
+ * one to `depth`; the function refuses to descend past `maxDepth` (default
+ * `MAX_COMPOSITION_DEPTH = 4`) to prevent infinite loops from cyclic refs.
+ *
+ * When `options.maxDepth` is supplied (e.g. via `composition.max_depth` in
+ * the pipeline YAML), it overrides the global default for that pipeline.
+ * The override is validated as a positive integer — passing 0, a negative
+ * number, or a non-integer throws `CompositionDepthError` immediately so
+ * the executor surfaces the spec error at validation time rather than
+ * silently falling back to the default.
+ */
+async function expandComposition(stages, fetcher, depth = 0, options = {}) {
+    const maxDepth = options.maxDepth ?? MAX_COMPOSITION_DEPTH;
+    if (!Number.isInteger(maxDepth) || maxDepth < 1) {
+        throw new CompositionDepthError(depth, maxDepth);
+    }
+    if (depth >= maxDepth) {
+        throw new CompositionDepthError(depth, maxDepth);
     }
     const expanded = [];
     for (const stage of stages) {
@@ -43277,7 +44469,7 @@ async function expandComposition(stages, fetcher, depth = 0) {
                 const child = await fetcher(ref.id, ref.version);
                 if (!child)
                     throw new PipelineFetchError(ref.id, ref.version);
-                const childStages = await expandComposition(child.stages.map((s) => ({ ...s })), fetcher, depth + 1);
+                const childStages = await expandComposition(child.stages.map((s) => ({ ...s })), fetcher, depth + 1, { maxDepth });
                 const renamed = prefixChildStages(childStages, stage.id);
                 expanded.push(...renamed);
                 continue;
@@ -43736,9 +44928,14 @@ function restoreFromCheckpoint(checkpoint) {
  *   1. stage.model              — explicit per-stage override
  *   2. pipeline.defaults.model  — pipeline-level default
  *   3. skill.preferred_model    — skill's recommendation (if stage uses a skill)
- *   4. agentConfig.default_model — from CLI config (~/.config/agentsmarket/config.json)
- *   5. envDefault                — AGENTSMARKET_DEFAULT_MODEL env var
- *   6. "MiniMax-M3"              — hardcoded fallback
+ *   4. pipeline.preferred_model — pipeline author's hint (v0.5 NEW; DB column
+ *                                  on server, top-level YAML field on CLI).
+ *                                  Weaker than `defaults.model` — author can
+ *                                  override per-stage; weaker than skill's own
+ *                                  hint because skill knows its own shape best.
+ *   5. agentConfig.default_model — from CLI config (~/.config/agentsmarket/config.json)
+ *   6. envDefault                — AGENTSMARKET_DEFAULT_MODEL env var
+ *   7. "MiniMax-M3"              — hardcoded fallback
  *
  * Cost of a stage is always based on the resolved model, regardless of who declared it.
  */
@@ -43749,6 +44946,7 @@ function createModelResolver(opts = {}) {
         return stage.model
             ?? pipeline?.defaults?.model
             ?? skill?.preferred_model
+            ?? pipeline?.preferred_model
             ?? opts.agentDefault
             ?? opts.envDefault
             ?? hardcoded;
@@ -43785,6 +44983,1764 @@ async function computeSkillContentHash(skill) {
     return sha256Hex(`${body}\n---\nversion:${version}\nauthor:${author}`);
 }
 
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/pipeline-refs.js
+/**
+ * Resolve pipeline-level template references in skill chain input blocks.
+ *
+ * Supports two reference flavors (both with and without braces):
+ *   - `$input.X`     / `${input.X}`      → ctx.inputs[X]
+ *   - `$stages.X.output` / `${stages.X.output}` → ctx.previousOutputs[X]
+ *
+ * Scope (F26-min): only the skill-chain `input:` block is resolved.
+ * Prompts keep their existing behavior (LLM interprets literal refs
+ * as context markers — works because LLMs are smart).
+ *
+ * Native types are PRESERVED. When `$input.urls` resolves and `urls`
+ * is an array, the substituted value is the array, NOT a JSON string.
+ * Tool skills (web_fetch, etc.) need native arrays/objects to work.
+ * If a prompt needs the array stringified, the prompt author can do
+ * it inside the template (e.g. wrap in explicit JSON.stringify call
+ * is not available in YAML — but a downstream LLM can handle arrays
+ * shown as `[object Array]` if needed).
+ *
+ * Why "leave literal if missing" instead of throwing:
+ *   The skill may receive partial input and choose to return an
+ *   error JSON (which downstream stages can handle). Throwing
+ *   would short-circuit that and bury the real cause one layer
+ *   deeper. The pipeline author can still catch missing inputs at
+ *   spec-validation time by adding `required: true` to spec.inputs.
+ *
+ * Recursion: objects and arrays are walked; primitives pass through.
+ * Strings get the regex substitution. Numbers, booleans, null return
+ * unchanged.
+ */
+const INPUT_REF_PATTERN = /\$\{\s*input\.([A-Za-z_][A-Za-z0-9_]*)\s*\}|\$input\.([A-Za-z_][A-Za-z0-9_]*)/g;
+const STAGE_OUTPUT_REF_PATTERN = /\$\{\s*stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output\s*\}|\$stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output/g;
+const SPECIAL_KEYS = {
+    today: () => new Date().toISOString().slice(0, 10),
+    now: () => new Date().toISOString(),
+    year: () => String(new Date().getFullYear()),
+    month: () => new Date().toISOString().slice(0, 7),
+    weekday: () => new Date().toLocaleDateString('en-US', { weekday: 'long' }),
+};
+function resolveInputRefs(value, ctx) {
+    if (typeof value === 'string') {
+        return resolveStringRefs(value, ctx);
+    }
+    if (Array.isArray(value)) {
+        return value.map((v) => resolveInputRefs(v, ctx));
+    }
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            out[k] = resolveInputRefs(v, ctx);
+        }
+        return out;
+    }
+    return value;
+}
+const SPECIAL_KEY_PATTERN = /\$(today|now|year|month|weekday)\b|\$\{\s*(today|now|year|month|weekday)\s*\}/g;
+function resolveStringRefs(text, ctx) {
+    const trimmed = text.trim();
+    const inputMatches = [...trimmed.matchAll(/\$input\.([A-Za-z_][A-Za-z0-9_]*)|\$\{\s*input\.([A-Za-z_][A-Za-z0-9_]*)\s*\}/g)];
+    const stageMatches = [...trimmed.matchAll(/\$stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output|\$\{\s*stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output\s*\}/g)];
+    const specialMatches = [...trimmed.matchAll(SPECIAL_KEY_PATTERN)];
+    const allMatches = inputMatches.length + stageMatches.length + specialMatches.length;
+    if (inputMatches.length === 1 && allMatches === 1 && inputMatches[0][0] === trimmed) {
+        const m = inputMatches[0];
+        const key = m[1] ?? m[2];
+        if (key !== undefined && Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
+            return ctx.inputs[key];
+        }
+        return text;
+    }
+    if (stageMatches.length === 1 && allMatches === 1 && stageMatches[0][0] === trimmed) {
+        const m = stageMatches[0];
+        const stageId = m[1] ?? m[2];
+        if (stageId !== undefined && Object.prototype.hasOwnProperty.call(ctx.previousOutputs, stageId)) {
+            return ctx.previousOutputs[stageId] ?? '';
+        }
+        return text;
+    }
+    if (specialMatches.length === 1 && allMatches === 1 && specialMatches[0][0] === trimmed) {
+        const m = specialMatches[0];
+        const key = m[1] ?? m[2];
+        if (key !== undefined) {
+            if (Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
+                return ctx.inputs[key];
+            }
+            if (Object.prototype.hasOwnProperty.call(SPECIAL_KEYS, key)) {
+                return SPECIAL_KEYS[key]();
+            }
+        }
+        return text;
+    }
+    let out = text;
+    out = out.replace(INPUT_REF_PATTERN, (match, key1, key2) => {
+        const key = key1 ?? key2;
+        if (key !== undefined && Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
+            const v = ctx.inputs[key];
+            return stringifyValue(v);
+        }
+        return match;
+    });
+    out = out.replace(STAGE_OUTPUT_REF_PATTERN, (match, sid1, sid2) => {
+        const stageId = sid1 ?? sid2;
+        if (stageId !== undefined && Object.prototype.hasOwnProperty.call(ctx.previousOutputs, stageId)) {
+            return ctx.previousOutputs[stageId] ?? '';
+        }
+        return match;
+    });
+    out = out.replace(SPECIAL_KEY_PATTERN, (match, k1, k2) => {
+        const key = k1 ?? k2;
+        if (key !== undefined) {
+            if (Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
+                return stringifyValue(ctx.inputs[key]);
+            }
+            if (Object.prototype.hasOwnProperty.call(SPECIAL_KEYS, key)) {
+                return SPECIAL_KEYS[key]();
+            }
+        }
+        return match;
+    });
+    return out;
+}
+function stringifyValue(v) {
+    if (typeof v === 'string')
+        return v;
+    if (v === null || v === undefined)
+        return '';
+    return JSON.stringify(v);
+}
+/**
+ * Substitute built-in special keys (\$today, \$now, \$year, \$month, \$weekday)
+ * anywhere they appear in text. Used for LLM prompts / system messages where
+ * \$input.X / \$stages.X.output are NOT resolved (they would inflate prompts
+ * with raw arrays or huge prior outputs). Special keys are small strings —
+ * safe to substitute everywhere.
+ *
+ * Bare and braced forms both work:
+ *   \$today / \${today}     → '2026-09-22'
+ *   \$now / \${now}         → '2026-09-22T00:00:00Z'
+ *   \$year / \${year}       → '2026'
+ *   \$month / \${month}     → '2026-09'
+ *   \$weekday / \${weekday} → 'Monday'
+ *
+ * Unknown \$keys are left literal (no false-matching — only the 5 known
+ * keys trigger substitution).
+ */
+function resolveSpecialKeys(text) {
+    return text.replace(SPECIAL_KEY_PATTERN, (match, k1, k2) => {
+        const key = k1 ?? k2;
+        if (key !== undefined && Object.prototype.hasOwnProperty.call(SPECIAL_KEYS, key)) {
+            return SPECIAL_KEYS[key]();
+        }
+        return match;
+    });
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/providers/types.js
+class ProviderError extends Error {
+    provider;
+    statusCode;
+    cause;
+    constructor(message, provider, statusCode, cause) {
+        super(message);
+        this.provider = provider;
+        this.statusCode = statusCode;
+        this.cause = cause;
+        this.name = 'ProviderError';
+    }
+}
+function requireEnv(name) {
+    const v = process.env[name];
+    if (!v) {
+        throw new ProviderError(`${name} not set`, 'env');
+    }
+    return v;
+}
+async function safeJsonParse(res, provider) {
+    const text = await res.text();
+    if (!res.ok) {
+        throw new ProviderError(`${provider} error ${res.status}: ${text.slice(0, 500)}`, provider, res.status);
+    }
+    try {
+        return JSON.parse(text);
+    }
+    catch (e) {
+        throw new ProviderError(`${provider} returned non-JSON: ${text.slice(0, 200)}`, provider, res.status, e);
+    }
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/providers/openai-vision.js
+/**
+ * OpenAI Vision provider — gpt-4o-mini multimodal.
+ * Used by image_describe tool skill.
+ *
+ * Env: OPENAI_API_KEY
+ * Cost: ~$0.00015/image + $0.0006/1k output tokens
+ */
+
+async function openaiVisionDescribe(input) {
+    const apiKey = requireEnv('OPENAI_API_KEY');
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            model: 'gpt-4o-mini',
+            messages: [
+                {
+                    role: 'user',
+                    content: [
+                        { type: 'text', text: input.prompt || 'Describe this image in detail.' },
+                        {
+                            type: 'image_url',
+                            image_url: { url: input.image_url, detail: input.detail ?? 'auto' },
+                        },
+                    ],
+                },
+            ],
+            max_tokens: input.max_tokens ?? 500,
+        }),
+    });
+    const data = await safeJsonParse(res, 'openai-vision');
+    const content = data.choices[0]?.message.content ?? '';
+    if (!content)
+        throw new ProviderError('openai-vision returned empty content', 'openai-vision', 200);
+    return {
+        text: JSON.stringify({ description: content, ok: true }),
+        usage: { inputTokens: data.usage.prompt_tokens, outputTokens: data.usage.completion_tokens },
+        meta: { provider: 'openai', model: 'gpt-4o-mini' },
+    };
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/tools/image-describe.js
+
+async function imageDescribeHandler(input, ctx) {
+    const parsed = parseInput(input);
+    const enabled = globalThis
+        .process?.env?.TOOL_SKILL_IMAGE_DESCRIBE_ENABLED === 'true';
+    if (!enabled) {
+        return mockResult(parsed);
+    }
+    return realProviderCall(parsed, ctx);
+}
+function parseInput(input) {
+    if (typeof input !== 'object' || input === null) {
+        throw new Error('image_describe requires object input with image_url');
+    }
+    const obj = input;
+    const url = obj.image_url ?? obj.url;
+    if (typeof url !== 'string' || url.length === 0) {
+        throw new Error('image_describe: image_url is required');
+    }
+    if (!url.startsWith('https://') && !url.startsWith('data:')) {
+        throw new Error(`image_describe: only HTTPS or data: URLs supported (got ${url.slice(0, 24)})`);
+    }
+    return {
+        image_url: url,
+        prompt: typeof obj.prompt === 'string' ? obj.prompt : 'Describe this image.',
+        max_words: typeof obj.max_words === 'number' && obj.max_words > 0 ? obj.max_words : 200,
+    };
+}
+function mockResult(parsed) {
+    return {
+        text: JSON.stringify({
+            ok: true,
+            mock: true,
+            description: `[mock image description for ${parsed.image_url.slice(0, 60)}]`,
+            prompt: parsed.prompt,
+        }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { tool: 'image_describe', mode: 'mock' },
+    };
+}
+async function realProviderCall(parsed, _ctx) {
+    return openaiVisionDescribe({
+        image_url: parsed.image_url,
+        prompt: parsed.prompt ?? 'Describe this image.',
+        max_tokens: (parsed.max_words ?? 200) * 2,
+    });
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/providers/openai-whisper.js
+/**
+ * OpenAI Whisper provider — speech-to-text.
+ * Used by audio_transcribe tool skill.
+ *
+ * Env: OPENAI_API_KEY
+ * Cost: $0.006 / minute of audio
+ * Limit: 25 MB max upload
+ */
+
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+async function openaiWhisperTranscribe(input) {
+    const apiKey = requireEnv('OPENAI_API_KEY');
+    const audioRes = await fetch(input.audio_url);
+    if (!audioRes.ok) {
+        throw new ProviderError(`failed to fetch audio: ${audioRes.status}`, 'openai-whisper', audioRes.status);
+    }
+    const blob = await audioRes.blob();
+    if (blob.size > MAX_AUDIO_BYTES) {
+        throw new ProviderError(`audio too large: ${blob.size} bytes (max ${MAX_AUDIO_BYTES})`, 'openai-whisper', 413);
+    }
+    const form = new FormData();
+    const ext = input.audio_url.split('.').pop()?.toLowerCase() ?? 'mp3';
+    form.append('file', blob, `audio.${ext}`);
+    form.append('model', 'whisper-1');
+    if (input.language)
+        form.append('language', input.language);
+    form.append('response_format', input.response_format ?? 'verbose_json');
+    const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: form,
+    });
+    if (!res.ok) {
+        const errText = await res.text();
+        throw new ProviderError(`openai-whisper error ${res.status}: ${errText.slice(0, 500)}`, 'openai-whisper', res.status);
+    }
+    const data = (await res.json());
+    return {
+        text: JSON.stringify({ transcript: data.text, language: data.language, duration: data.duration, ok: true }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { provider: 'openai', model: 'whisper-1', duration_seconds: data.duration },
+    };
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/tools/audio-transcribe.js
+
+const audio_transcribe_MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+async function audioTranscribeHandler(input, ctx) {
+    const parsed = audio_transcribe_parseInput(input);
+    const enabled = globalThis
+        .process?.env?.TOOL_SKILL_AUDIO_TRANSCRIBE_ENABLED === 'true';
+    if (!enabled) {
+        return audio_transcribe_mockResult(parsed);
+    }
+    return audio_transcribe_realProviderCall(parsed, ctx);
+}
+function audio_transcribe_parseInput(input) {
+    if (typeof input !== 'object' || input === null) {
+        throw new Error('audio_transcribe requires object input with audio_url');
+    }
+    const obj = input;
+    const url = obj.audio_url ?? obj.url;
+    if (typeof url !== 'string' || url.length === 0) {
+        throw new Error('audio_transcribe: audio_url is required');
+    }
+    if (!url.startsWith('https://') && !url.startsWith('data:')) {
+        throw new Error(`audio_transcribe: only HTTPS or data: URLs supported (got ${url.slice(0, 24)})`);
+    }
+    const language = typeof obj.language === 'string' ? obj.language : undefined;
+    return { audio_url: url, language };
+}
+function audio_transcribe_mockResult(parsed) {
+    return {
+        text: JSON.stringify({
+            ok: true,
+            mock: true,
+            transcript: '[mock transcript of audio content]',
+            language: parsed.language ?? 'auto',
+            duration_seconds: 30,
+        }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { tool: 'audio_transcribe', mode: 'mock', max_bytes: audio_transcribe_MAX_AUDIO_BYTES },
+    };
+}
+async function audio_transcribe_realProviderCall(parsed, _ctx) {
+    return openaiWhisperTranscribe({
+        audio_url: parsed.audio_url,
+        language: parsed.language,
+    });
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/providers/openai-tts.js
+/**
+ * OpenAI TTS provider — text-to-speech.
+ * Used by tts_synthesize tool skill.
+ *
+ * Env: OPENAI_API_KEY
+ * Cost: $15 / 1M characters ($0.000015/char)
+ * Limit: 4096 chars per request (we use 5000 for safety)
+ */
+
+const MAX_CHARS = 5000;
+async function openaiTtsSynthesize(input) {
+    const apiKey = requireEnv('OPENAI_API_KEY');
+    if (input.text.length > MAX_CHARS) {
+        throw new ProviderError(`text too long: ${input.text.length} chars (max ${MAX_CHARS})`, 'openai-tts', 413);
+    }
+    const res = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            model: 'tts-1',
+            input: input.text,
+            voice: input.voice ?? 'alloy',
+            response_format: input.format ?? 'mp3',
+            speed: input.speed ?? 1.0,
+        }),
+    });
+    if (!res.ok) {
+        const errText = await res.text();
+        throw new ProviderError(`openai-tts error ${res.status}: ${errText.slice(0, 500)}`, 'openai-tts', res.status);
+    }
+    const arrayBuffer = await res.arrayBuffer();
+    const bytes = arrayBuffer.byteLength;
+    return {
+        text: JSON.stringify({ audio_size_bytes: bytes, format: input.format ?? 'mp3', ok: true }),
+        usage: { inputTokens: input.text.length, outputTokens: 0 },
+        meta: {
+            provider: 'openai',
+            model: 'tts-1',
+            voice: input.voice ?? 'alloy',
+            audio_size_bytes: bytes,
+        },
+    };
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/tools/tts-synthesize.js
+
+const tts_synthesize_MAX_CHARS = 5000;
+async function ttsSynthesizeHandler(input, ctx) {
+    const parsed = tts_synthesize_parseInput(input);
+    const enabled = globalThis
+        .process?.env?.TOOL_SKILL_TTS_SYNTHESIZE_ENABLED === 'true';
+    if (!enabled) {
+        return tts_synthesize_mockResult(parsed);
+    }
+    return tts_synthesize_realProviderCall(parsed, ctx);
+}
+function tts_synthesize_parseInput(input) {
+    if (typeof input !== 'object' || input === null) {
+        throw new Error('tts_synthesize requires object input with text');
+    }
+    const obj = input;
+    const text = obj.text;
+    if (typeof text !== 'string' || text.length === 0) {
+        throw new Error('tts_synthesize: text is required and non-empty');
+    }
+    if (text.length > tts_synthesize_MAX_CHARS) {
+        throw new Error(`tts_synthesize: text exceeds max ${tts_synthesize_MAX_CHARS} chars (got ${text.length})`);
+    }
+    return {
+        text,
+        voice: typeof obj.voice === 'string' ? obj.voice : 'alloy',
+        format: obj.format === 'wav' || obj.format === 'opus' ? obj.format : 'mp3',
+    };
+}
+function tts_synthesize_mockResult(parsed) {
+    return {
+        text: JSON.stringify({
+            ok: true,
+            mock: true,
+            audio_url: 'mock://tts/' + Math.random().toString(36).slice(2, 10),
+            format: parsed.format,
+            voice: parsed.voice,
+            duration_seconds: Math.ceil(parsed.text.length / 15),
+        }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { tool: 'tts_synthesize', mode: 'mock' },
+    };
+}
+async function tts_synthesize_realProviderCall(parsed, _ctx) {
+    return openaiTtsSynthesize({
+        text: parsed.text,
+        voice: (parsed.voice ?? 'alloy'),
+        format: (parsed.format ?? 'mp3'),
+    });
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/providers/openai-dalle.js
+/**
+ * OpenAI DALL-E 3 provider — text-to-image.
+ * Used by image_generate tool skill.
+ *
+ * Env: OPENAI_API_KEY
+ * Cost: $0.040/image (1024x1024 standard), $0.080 (hd)
+ * Sizes: 1024x1024, 1024x1792, 1792x1024
+ */
+
+const MAX_N = 4;
+async function openaiDallEGenerate(input) {
+    const apiKey = requireEnv('OPENAI_API_KEY');
+    const n = Math.min(input.n ?? 1, MAX_N);
+    if (n < 1)
+        throw new ProviderError('n must be >= 1', 'openai-dalle', 400);
+    const res = await fetch('https://api.openai.com/v1/images/generations', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            model: 'dall-e-3',
+            prompt: input.prompt,
+            size: input.size ?? '1024x1024',
+            quality: input.quality ?? 'standard',
+            n,
+        }),
+    });
+    if (!res.ok) {
+        const errText = await res.text();
+        throw new ProviderError(`openai-dalle error ${res.status}: ${errText.slice(0, 500)}`, 'openai-dalle', res.status);
+    }
+    const data = (await res.json());
+    const images = data.data.map((img) => ({ url: img.url, revised_prompt: img.revised_prompt }));
+    return {
+        text: JSON.stringify({ images, ok: true }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { provider: 'openai', model: 'dall-e-3', size: input.size ?? '1024x1024', count: images.length },
+    };
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/tools/image-generate.js
+
+async function imageGenerateHandler(input, ctx) {
+    const parsed = image_generate_parseInput(input);
+    const enabled = globalThis
+        .process?.env?.TOOL_SKILL_IMAGE_GENERATE_ENABLED === 'true';
+    if (!enabled) {
+        return image_generate_mockResult(parsed);
+    }
+    return image_generate_realProviderCall(parsed, ctx);
+}
+function image_generate_parseInput(input) {
+    if (typeof input !== 'object' || input === null) {
+        throw new Error('image_generate requires object input with prompt');
+    }
+    const obj = input;
+    const prompt = obj.prompt;
+    if (typeof prompt !== 'string' || prompt.length === 0) {
+        throw new Error('image_generate: prompt is required and non-empty');
+    }
+    const size = obj.size;
+    const validSize = size === '1024x1024' || size === '1792x1024' || size === '1024x1792'
+        ? size
+        : '1024x1024';
+    const n = typeof obj.n === 'number' && obj.n > 0 && obj.n <= 4 ? obj.n : 1;
+    return { prompt, size: validSize, n };
+}
+function image_generate_mockResult(parsed) {
+    return {
+        text: JSON.stringify({
+            ok: true,
+            mock: true,
+            images: Array.from({ length: parsed.n ?? 1 }, (_, i) => ({
+                url: `mock://image-gen/${Date.now()}-${i}.png`,
+                size: parsed.size,
+            })),
+        }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { tool: 'image_generate', mode: 'mock' },
+    };
+}
+async function image_generate_realProviderCall(parsed, _ctx) {
+    return openaiDallEGenerate({
+        prompt: parsed.prompt,
+        size: parsed.size,
+        n: parsed.n,
+    });
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/providers/replicate.js
+/**
+ * Replicate provider — generic async polling for video/image models.
+ * Used by video_generate tool skill (Runway Gen-3 / Pika / Stable Video).
+ *
+ * Env: REPLICATE_API_KEY
+ * Flow: POST /v1/predictions → poll until status=succeeded → return output URLs
+ * Cost varies by model (~$0.10/sec for Runway Gen-3)
+ */
+
+const REPLICATE_BASE = 'https://api.replicate.com/v1';
+const POLL_INTERVAL_MS = 2000;
+const DEFAULT_MAX_WAIT_MS = 5 * 60 * 1000;
+const MAX_DURATION_SECONDS = 30;
+async function replicateGenerateVideo(input) {
+    const apiKey = requireEnv('REPLICATE_API_KEY');
+    const duration = Math.min(input.duration_seconds ?? 10, MAX_DURATION_SECONDS);
+    const model = input.model ?? 'stability-ai/stable-video-diffusion';
+    const createRes = await fetch(`${REPLICATE_BASE}/predictions`, {
+        method: 'POST',
+        headers: {
+            Authorization: `Token ${apiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            version: model,
+            input: {
+                prompt: input.prompt,
+                duration,
+                resolution: input.resolution ?? '720p',
+            },
+        }),
+    });
+    if (!createRes.ok) {
+        const errText = await createRes.text();
+        throw new ProviderError(`replicate error ${createRes.status}: ${errText.slice(0, 500)}`, 'replicate', createRes.status);
+    }
+    let prediction = (await createRes.json());
+    const deadline = Date.now() + (input.max_wait_ms ?? DEFAULT_MAX_WAIT_MS);
+    while (prediction.status !== 'succeeded' && prediction.status !== 'failed' && prediction.status !== 'canceled') {
+        if (Date.now() > deadline) {
+            throw new ProviderError(`replicate timed out after ${input.max_wait_ms}ms`, 'replicate', 504);
+        }
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        const pollRes = await fetch(`${REPLICATE_BASE}/predictions/${prediction.id}`, {
+            headers: { Authorization: `Token ${apiKey}` },
+        });
+        if (!pollRes.ok) {
+            throw new ProviderError(`replicate poll error ${pollRes.status}`, 'replicate', pollRes.status);
+        }
+        prediction = (await pollRes.json());
+    }
+    if (prediction.status === 'failed' || prediction.status === 'canceled') {
+        throw new ProviderError(`replicate prediction ${prediction.status}: ${prediction.error ?? 'unknown'}`, 'replicate');
+    }
+    const output = Array.isArray(prediction.output) ? prediction.output : prediction.output ? [prediction.output] : [];
+    return {
+        text: JSON.stringify({ videos: output, duration_seconds: duration, ok: true }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { provider: 'replicate', model, status: prediction.status, video_count: output.length },
+    };
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/tools/video-generate.js
+
+const MAX_DURATION = 30;
+async function videoGenerateHandler(input, ctx) {
+    const parsed = video_generate_parseInput(input);
+    const enabled = globalThis
+        .process?.env?.TOOL_SKILL_VIDEO_GENERATE_ENABLED === 'true';
+    if (!enabled) {
+        return video_generate_mockResult(parsed);
+    }
+    return video_generate_realProviderCall(parsed, ctx);
+}
+function video_generate_parseInput(input) {
+    if (typeof input !== 'object' || input === null) {
+        throw new Error('video_generate requires object input with prompt');
+    }
+    const obj = input;
+    const prompt = obj.prompt;
+    if (typeof prompt !== 'string' || prompt.length === 0) {
+        throw new Error('video_generate: prompt is required and non-empty');
+    }
+    const duration = typeof obj.duration_seconds === 'number' && obj.duration_seconds > 0
+        ? Math.min(obj.duration_seconds, MAX_DURATION)
+        : 4;
+    const resolution = obj.resolution === '1080p' ? '1080p' : '720p';
+    return { prompt, duration_seconds: duration, resolution };
+}
+function video_generate_mockResult(parsed) {
+    return {
+        text: JSON.stringify({
+            ok: true,
+            mock: true,
+            video_url: `mock://video-gen/${Date.now()}.mp4`,
+            duration_seconds: parsed.duration_seconds,
+            resolution: parsed.resolution,
+            status: 'completed',
+        }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { tool: 'video_generate', mode: 'mock' },
+    };
+}
+async function video_generate_realProviderCall(parsed, _ctx) {
+    return replicateGenerateVideo({
+        prompt: parsed.prompt,
+        duration_seconds: parsed.duration_seconds,
+        resolution: parsed.resolution === '1080p' ? '1080p' : '720p',
+    });
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/memory.js
+/**
+ * Pipeline memory — M6.1 (2026-09-25).
+ *
+ * Persistent key-value state for pipelines, backed by R2 (production) or
+ * in-memory map (dev/test). Lets pipelines accumulate context across stages
+ * (e.g., multi-turn research, iterative refinement) without re-fetching.
+ *
+ * Storage is pluggable: production uses the existing CHECKPOINTS R2 binding
+ * with `memory/` key prefix (avoids new wrangler.toml binding), tests use
+ * InMemoryMemoryStore. Pass `createMemoryStore('mock')` to disable persistence.
+ *
+ * Key format: `memory/<pipeline_id>/<partition>/<key>` (R2) or in-memory Map.
+ * Values are JSON-serialized. TTL stored as R2 custom metadata; lazy expiry
+ * on read (no background GC needed for short TTL).
+ */
+const MEMORY_SCHEMA_VERSION = 1;
+const MAX_MEMORY_VALUE_BYTES = 1_048_576;
+class InMemoryMemoryStore {
+    map = new Map();
+    makeKey(partition, key) {
+        return `${partition.pipeline_id}::${partition.partition}::${key}`;
+    }
+    isExpired(expires_at) {
+        return expires_at !== null && expires_at < Date.now();
+    }
+    async get(partition, key) {
+        const k = this.makeKey(partition, key);
+        const entry = this.map.get(k);
+        if (!entry)
+            return null;
+        if (this.isExpired(entry.expires_at)) {
+            this.map.delete(k);
+            return null;
+        }
+        return entry.value;
+    }
+    async set(partition, key, value, ttl_seconds) {
+        if (JSON.stringify(value).length > MAX_MEMORY_VALUE_BYTES) {
+            throw new Error(`memory value too large (max ${MAX_MEMORY_VALUE_BYTES} bytes)`);
+        }
+        const k = this.makeKey(partition, key);
+        const expires_at = ttl_seconds ?? partition.ttl_seconds ?? null;
+        const expires_ms = expires_at !== null && expires_at !== undefined ? Date.now() + expires_at * 1000 : null;
+        this.map.set(k, { value, expires_at: expires_ms });
+    }
+    async delete(partition, key) {
+        this.map.delete(this.makeKey(partition, key));
+    }
+    async list(partition, prefix) {
+        const fullPrefix = this.makeKey(partition, prefix ?? '');
+        const keys = [];
+        for (const k of this.map.keys()) {
+            if (k.startsWith(fullPrefix)) {
+                keys.push(k.split('::').slice(2).join('::'));
+            }
+        }
+        return keys;
+    }
+}
+function createMemoryStore(backend, r2) {
+    if (backend === 'mock' || !r2) {
+        return new InMemoryMemoryStore();
+    }
+    return new R2MemoryStore(r2);
+}
+class R2MemoryStore {
+    r2;
+    constructor(r2) {
+        this.r2 = r2;
+    }
+    makeKey(partition, key) {
+        return `memory/${partition.pipeline_id}/${partition.partition}/${key}`;
+    }
+    isExpired(expires_at) {
+        if (!expires_at)
+            return false;
+        return Date.parse(expires_at) < Date.now();
+    }
+    async get(partition, key) {
+        const r2key = this.makeKey(partition, key);
+        const obj = await this.r2.get(r2key);
+        if (!obj || !obj.body)
+            return null;
+        const meta = obj.customMetadata ?? {};
+        if (this.isExpired(meta['expires_at'])) {
+            await this.r2.delete(r2key);
+            return null;
+        }
+        const text = await new Response(obj.body).text();
+        return JSON.parse(text);
+    }
+    async set(partition, key, value, ttl_seconds) {
+        const serialized = JSON.stringify(value);
+        if (serialized.length > MAX_MEMORY_VALUE_BYTES) {
+            throw new Error(`memory value too large (max ${MAX_MEMORY_VALUE_BYTES} bytes)`);
+        }
+        const ttl = ttl_seconds ?? partition.ttl_seconds ?? null;
+        const expires_at = ttl !== null && ttl !== undefined
+            ? new Date(Date.now() + ttl * 1000).toISOString()
+            : null;
+        const r2key = this.makeKey(partition, key);
+        await this.r2.put(r2key, serialized, {
+            customMetadata: {
+                schema_version: String(MEMORY_SCHEMA_VERSION),
+                stored_at: new Date().toISOString(),
+                expires_at: expires_at ?? '',
+                scope: partition.scope,
+            },
+        });
+    }
+    async delete(partition, key) {
+        await this.r2.delete(this.makeKey(partition, key));
+    }
+    async list(partition, prefix) {
+        const fullPrefix = this.makeKey(partition, prefix ?? '');
+        const listed = await this.r2.list({ prefix: fullPrefix });
+        return listed.objects.map((o) => o.key.split('/').slice(3).join('/'));
+    }
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/tools/memory-shared.js
+
+const globalStoreCache = new Map();
+function getStoreForAgent(ctx) {
+    if (!globalStoreCache.has(ctx.agentId)) {
+        globalStoreCache.set(ctx.agentId, new InMemoryMemoryStore());
+    }
+    return globalStoreCache.get(ctx.agentId);
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/tools/memory-recall.js
+
+function getStore(ctx) {
+    return getStoreForAgent(ctx);
+}
+async function memoryRecallHandler(input, ctx) {
+    const parsed = memory_recall_parseInput(input);
+    const enabled = globalThis
+        .process?.env?.MEMORY_ENABLED === 'true';
+    if (!enabled) {
+        return memory_recall_mockResult(parsed);
+    }
+    return realStoreCall(parsed, getStore(ctx));
+}
+function memory_recall_parseInput(input) {
+    if (typeof input !== 'object' || input === null) {
+        throw new Error('memory_recall requires object input with pipeline_id + partition');
+    }
+    const obj = input;
+    const pipeline_id = obj.pipeline_id;
+    const partition = obj.partition;
+    if (typeof pipeline_id !== 'string' || pipeline_id.length === 0) {
+        throw new Error('memory_recall: pipeline_id is required');
+    }
+    if (typeof partition !== 'string' || partition.length === 0) {
+        throw new Error('memory_recall: partition is required');
+    }
+    return {
+        pipeline_id,
+        partition,
+        key: typeof obj.key === 'string' ? obj.key : undefined,
+        prefix: typeof obj.prefix === 'string' ? obj.prefix : undefined,
+    };
+}
+function makePartition(parsed) {
+    return { pipeline_id: parsed.pipeline_id, partition: parsed.partition, scope: 'pipeline' };
+}
+function memory_recall_mockResult(parsed) {
+    const text = parsed.key !== undefined
+        ? JSON.stringify({ ok: true, mock: true, key: parsed.key, value: null, reason: 'memory_recall mock-mode' })
+        : JSON.stringify({ ok: true, mock: true, keys: [], reason: 'memory_recall mock-mode' });
+    return {
+        text,
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { tool: 'memory_recall', mode: 'mock' },
+    };
+}
+async function realStoreCall(parsed, store) {
+    const partition = makePartition(parsed);
+    if (parsed.key !== undefined) {
+        const value = await store.get(partition, parsed.key);
+        return {
+            text: JSON.stringify({ ok: true, key: parsed.key, value }),
+            usage: { inputTokens: 0, outputTokens: 0 },
+            meta: { tool: 'memory_recall' },
+        };
+    }
+    const keys = await store.list(partition, parsed.prefix);
+    return {
+        text: JSON.stringify({ ok: true, keys, prefix: parsed.prefix ?? '' }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { tool: 'memory_recall' },
+    };
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/tools/memory-store.js
+
+function memory_store_getStore(ctx) {
+    return getStoreForAgent(ctx);
+}
+async function memoryStoreHandler(input, ctx) {
+    const parsed = memory_store_parseInput(input);
+    const enabled = globalThis
+        .process?.env?.MEMORY_ENABLED === 'true';
+    if (!enabled) {
+        return memory_store_mockResult(parsed);
+    }
+    return memory_store_realStoreCall(parsed, memory_store_getStore(ctx));
+}
+function memory_store_parseInput(input) {
+    if (typeof input !== 'object' || input === null) {
+        throw new Error('memory_store requires object input with pipeline_id + partition + key + value');
+    }
+    const obj = input;
+    const pipeline_id = obj.pipeline_id;
+    const partition = obj.partition;
+    const key = obj.key;
+    if (typeof pipeline_id !== 'string' || pipeline_id.length === 0) {
+        throw new Error('memory_store: pipeline_id is required');
+    }
+    if (typeof partition !== 'string' || partition.length === 0) {
+        throw new Error('memory_store: partition is required');
+    }
+    if (typeof key !== 'string' || key.length === 0) {
+        throw new Error('memory_store: key is required and non-empty');
+    }
+    if (!('value' in obj)) {
+        throw new Error('memory_store: value is required (any JSON-serializable)');
+    }
+    return {
+        pipeline_id,
+        partition,
+        key,
+        value: obj.value,
+        ttl_seconds: typeof obj.ttl_seconds === 'number' && obj.ttl_seconds > 0 ? obj.ttl_seconds : undefined,
+    };
+}
+function memory_store_mockResult(parsed) {
+    return {
+        text: JSON.stringify({
+            ok: true,
+            mock: true,
+            key: parsed.key,
+            stored_at: new Date().toISOString(),
+            reason: 'memory_store mock-mode',
+        }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { tool: 'memory_store', mode: 'mock' },
+    };
+}
+async function memory_store_realStoreCall(parsed, store) {
+    const partition = { pipeline_id: parsed.pipeline_id, partition: parsed.partition, scope: 'pipeline' };
+    await store.set(partition, parsed.key, parsed.value, parsed.ttl_seconds);
+    return {
+        text: JSON.stringify({
+            ok: true,
+            key: parsed.key,
+            stored_at: new Date().toISOString(),
+            ttl_seconds: parsed.ttl_seconds ?? null,
+        }),
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { tool: 'memory_store' },
+    };
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/tools/tool-skills.js
+/**
+ * Built-in tool skills — execute natively in the runtime instead of going
+ * through LLM-as-skill composition.
+ *
+ * Why: F27. Skill execution in v0.2 was LLM-only (compose skill.full_md +
+ * Input JSON, send to LLM, treat response as skill output). That's fine for
+ * prompt-engineering tasks (summarize, translate, classify) but fails for
+ * side-effect tasks that need real I/O — web_fetch needs actual HTTP,
+ * not LLM roleplay.
+ *
+ * Architecture: tool skills are matched by `skill.id` (NOT by marketplace
+ * lookup). The pipeline can still declare `uses: web_fetch@1.0.0` so the
+ * skill appears in provenance + spec_hash, but the runtime intercepts
+ * the invocation and runs the native handler instead of going to the LLM.
+ *
+ * Add new tools here as the catalog grows.
+ */
+
+
+
+
+
+
+
+const TOOL_SKILLS = {
+    web_fetch: webFetchHandler,
+    image_describe: imageDescribeHandler,
+    audio_transcribe: audioTranscribeHandler,
+    tts_synthesize: ttsSynthesizeHandler,
+    image_generate: imageGenerateHandler,
+    video_generate: videoGenerateHandler,
+    memory_recall: memoryRecallHandler,
+    memory_store: memoryStoreHandler,
+};
+function isToolSkill(skillId) {
+    return skillId in TOOL_SKILLS;
+}
+async function invokeToolSkill(skillId, input, ctx) {
+    const handler = TOOL_SKILLS[skillId];
+    if (!handler) {
+        throw new Error(`Tool skill '${skillId}' is registered but has no handler`);
+    }
+    return handler(input, ctx);
+}
+async function webFetchHandler(input, ctx) {
+    const { urls, max_chars, max_per_article_chars } = parseFetchInput(input);
+    const cap = typeof max_chars === 'number' && max_chars > 0
+        ? max_chars
+        : (typeof max_per_article_chars === 'number' && max_per_article_chars > 0
+            ? max_per_article_chars
+            : 4000);
+    const articles = [];
+    for (const url of urls) {
+        try {
+            const res = await fetch(url, { signal: ctx.signal });
+            const raw = await res.text();
+            const content = stripHtmlToText(raw).slice(0, cap);
+            articles.push({ url, content, status: res.status });
+        }
+        catch (e) {
+            articles.push({
+                url,
+                content: '',
+                status: 0,
+                error: e instanceof Error ? e.message : String(e),
+            });
+        }
+    }
+    const text = articles.map((a) => {
+        if (a.error) {
+            return `URL: ${a.url}\nSTATUS: error\nERROR: ${a.error}\nCONTENT:\n`;
+        }
+        return `URL: ${a.url}\nSTATUS: ${a.status}\nCONTENT:\n${a.content}\n`;
+    }).join('\n---\n\n');
+    return {
+        text,
+        usage: { inputTokens: 0, outputTokens: 0 },
+        meta: { articles, urls_requested: urls.length, cap_chars: cap },
+    };
+}
+function parseFetchInput(input) {
+    if (!input || typeof input !== 'object') {
+        throw new Error('web_fetch requires input object');
+    }
+    const obj = input;
+    const urlsRaw = obj.urls;
+    if (!Array.isArray(urlsRaw)) {
+        throw new Error('web_fetch requires `urls: string[]`');
+    }
+    const urls = urlsRaw.filter((u) => typeof u === 'string');
+    if (urls.length === 0) {
+        throw new Error('web_fetch requires non-empty `urls: string[]`');
+    }
+    const maxChars = typeof obj.max_chars === 'number' ? obj.max_chars : undefined;
+    const maxPerArticleChars = typeof obj.max_per_article_chars === 'number' ? obj.max_per_article_chars : undefined;
+    return { urls, max_chars: maxChars, max_per_article_chars: maxPerArticleChars };
+}
+function stripHtmlToText(html) {
+    return html
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/output-schema.js
+/**
+ * M5 — Stage output schema types and meta-validation.
+ *
+ * Per-stage `output_schema` block constrains the executor's string output.
+ * Companion field `output_retry` (none|single|loop) decides what happens
+ * when validation fails. The runtime validator lives in
+ * `./output-schema-validate.ts`; this file owns the type definitions and
+ * the meta-validation step (catches `$ref`/etc. on parse).
+ *
+ * Supported keywords (subset):
+ *   type            — string | number | integer | boolean | array | object | null
+ *   properties      — Record<string, JsonSchema> for object validation
+ *   required        — string[] of required keys
+ *   additionalProperties — boolean | JsonSchema (default true)
+ *   enum            — exact value match
+ *   items           — JsonSchema for array element validation
+ *   minItems / maxItems — array length bounds
+ *   minLength / maxLength — string length bounds
+ *   pattern         — regex string (matches whole value)
+ *   format          — informational only; not validated
+ *
+ * NOT supported (fail-fast on schema parse):
+ *   $ref, definitions, $defs, allOf, anyOf, oneOf, not, dependencies, propertyNames
+ */
+/** Max recursion depth for nested object/array schemas. */
+const MAX_VALIDATION_DEPTH = 32;
+const UNSUPPORTED_KEYWORDS = new Set([
+    '$ref', 'definitions', '$defs', 'allOf', 'anyOf', 'oneOf',
+    'not', 'dependencies', 'propertyNames',
+]);
+/**
+ * Validate the schema definition itself (meta-validation). Returns a
+ * non-empty violations list when the schema declares unsupported
+ * keywords (e.g. `$ref`) or is malformed. Schema is allowed to be
+ * `undefined`/`null` → returns `{ok: true}` so callers can use it as a
+ * permissive pre-check before wiring it into runtime validation.
+ */
+function validateJsonSchema(raw) {
+    const violations = [];
+    walkSchemaCheck(raw, '$', violations);
+    return { ok: violations.length === 0, violations };
+}
+function walkSchemaCheck(schema, schemaPath, violations) {
+    if (schema === undefined || schema === null)
+        return;
+    if (typeof schema !== 'object' || Array.isArray(schema)) {
+        violations.push({
+            path: '$',
+            message: `schema at ${schemaPath} must be an object`,
+            schema_path: schemaPath,
+        });
+        return;
+    }
+    const obj = schema;
+    for (const k of Object.keys(obj)) {
+        if (UNSUPPORTED_KEYWORDS.has(k)) {
+            violations.push({
+                path: '$',
+                message: `keyword '${k}' is not supported in the M5 subset validator`,
+                schema_path: `${schemaPath}.${k}`,
+            });
+        }
+    }
+    if (obj['properties'] !== undefined) {
+        const props = obj['properties'];
+        if (typeof props !== 'object' || props === null || Array.isArray(props)) {
+            violations.push({
+                path: '$',
+                message: 'properties must be an object',
+                schema_path: `${schemaPath}.properties`,
+            });
+        }
+        else {
+            for (const [key, child] of Object.entries(props)) {
+                walkSchemaCheck(child, `${schemaPath}.properties.${key}`, violations);
+            }
+        }
+    }
+    if (obj['items'] !== undefined) {
+        walkSchemaCheck(obj['items'], `${schemaPath}.items`, violations);
+    }
+    if (obj['additionalProperties'] !== undefined && typeof obj['additionalProperties'] === 'object') {
+        walkSchemaCheck(obj['additionalProperties'], `${schemaPath}.additionalProperties`, violations);
+    }
+}
+/** Shared helpers used by output-schema-validate.ts. */
+function jsonTypeOf(value) {
+    if (value === null)
+        return 'null';
+    if (Array.isArray(value))
+        return 'array';
+    if (typeof value === 'number') {
+        return Number.isInteger(value) ? 'integer' : 'number';
+    }
+    if (typeof value === 'string')
+        return 'string';
+    if (typeof value === 'boolean')
+        return 'boolean';
+    if (typeof value === 'object')
+        return 'object';
+    return 'null';
+}
+function typeMatches(expected, actual, _value) {
+    if (expected === 'integer' && actual === 'integer')
+        return true;
+    if (expected === 'number' && (actual === 'number' || actual === 'integer'))
+        return true;
+    return expected === actual;
+}
+function deepEqual(a, b) {
+    if (a === b)
+        return true;
+    if (typeof a !== typeof b)
+        return false;
+    if (a === null || b === null)
+        return a === b;
+    if (Array.isArray(a) && Array.isArray(b)) {
+        if (a.length !== b.length)
+            return false;
+        for (let i = 0; i < a.length; i++) {
+            if (!deepEqual(a[i], b[i]))
+                return false;
+        }
+        return true;
+    }
+    if (typeof a === 'object' && typeof b === 'object') {
+        const ak = Object.keys(a);
+        const bk = Object.keys(b);
+        if (ak.length !== bk.length)
+            return false;
+        for (const k of ak) {
+            if (!deepEqual(a[k], b[k]))
+                return false;
+        }
+        return true;
+    }
+    return false;
+}
+function isPlainObject(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/output-schema-validate.js
+/**
+ * M5 — Runtime JSON Schema validator.
+ *
+ * Walks `value` against `schema` collecting `OutputValidationViolation`
+ * entries. Recursion is bounded by `MAX_VALIDATION_DEPTH` (32) defined
+ * in `./output-schema.ts`. Pure function — no side effects, safe to call
+ * from any environment (Workers, Node, browser).
+ */
+
+function validateAgainstSchema(value, schema, path = '$', schemaPath = '$', depth = 0) {
+    if (depth > MAX_VALIDATION_DEPTH) {
+        return [{
+                path,
+                message: `schema nesting exceeds MAX_VALIDATION_DEPTH (${MAX_VALIDATION_DEPTH})`,
+                schema_path: schemaPath,
+            }];
+    }
+    const violations = [];
+    if (schema.enum !== undefined) {
+        if (!schema.enum.some((v) => deepEqual(v, value))) {
+            violations.push({
+                path,
+                message: `value is not one of the allowed enum values`,
+                schema_path: `${schemaPath}.enum`,
+            });
+        }
+        return violations;
+    }
+    if (schema.type !== undefined) {
+        const expected = Array.isArray(schema.type) ? schema.type : [schema.type];
+        const actual = jsonTypeOf(value);
+        const isMatch = expected.some((t) => typeMatches(t, actual, value));
+        if (!isMatch) {
+            violations.push({
+                path,
+                message: `expected type ${expected.join(' | ')}, got ${actual}`,
+                schema_path: `${schemaPath}.type`,
+            });
+            return violations;
+        }
+    }
+    if (typeof value === 'string') {
+        checkStringConstraints(value, schema, path, schemaPath, violations);
+    }
+    if (Array.isArray(value)) {
+        checkArrayConstraints(value, schema, path, schemaPath, depth, violations);
+    }
+    if (isPlainObject(value)) {
+        checkObjectConstraints(value, schema, path, schemaPath, depth, violations);
+    }
+    return violations;
+}
+function checkStringConstraints(value, schema, path, schemaPath, violations) {
+    if (schema.minLength !== undefined && value.length < schema.minLength) {
+        violations.push({
+            path,
+            message: `string length ${value.length} is less than minLength ${schema.minLength}`,
+            schema_path: `${schemaPath}.minLength`,
+        });
+    }
+    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+        violations.push({
+            path,
+            message: `string length ${value.length} exceeds maxLength ${schema.maxLength}`,
+            schema_path: `${schemaPath}.maxLength`,
+        });
+    }
+    if (schema.pattern !== undefined) {
+        try {
+            const re = new RegExp(schema.pattern);
+            if (!re.test(value)) {
+                violations.push({
+                    path,
+                    message: `string does not match pattern /${schema.pattern}/`,
+                    schema_path: `${schemaPath}.pattern`,
+                });
+            }
+        }
+        catch {
+            violations.push({
+                path,
+                message: `pattern /${schema.pattern}/ is not a valid regular expression`,
+                schema_path: `${schemaPath}.pattern`,
+            });
+        }
+    }
+}
+function checkArrayConstraints(value, schema, path, schemaPath, depth, violations) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) {
+        violations.push({
+            path,
+            message: `array length ${value.length} is less than minItems ${schema.minItems}`,
+            schema_path: `${schemaPath}.minItems`,
+        });
+    }
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+        violations.push({
+            path,
+            message: `array length ${value.length} exceeds maxItems ${schema.maxItems}`,
+            schema_path: `${schemaPath}.maxItems`,
+        });
+    }
+    if (schema.items !== undefined) {
+        for (let i = 0; i < value.length; i++) {
+            violations.push(...validateAgainstSchema(value[i], schema.items, `${path}[${i}]`, `${schemaPath}.items`, depth + 1));
+        }
+    }
+}
+function checkObjectConstraints(value, schema, path, schemaPath, depth, violations) {
+    if (schema.required !== undefined) {
+        for (const key of schema.required) {
+            if (!(key in value)) {
+                violations.push({
+                    path,
+                    message: `missing required property '${key}'`,
+                    schema_path: `${schemaPath}.required`,
+                });
+            }
+        }
+    }
+    if (schema.properties !== undefined) {
+        for (const [key, childSchema] of Object.entries(schema.properties)) {
+            if (key in value) {
+                violations.push(...validateAgainstSchema(value[key], childSchema, `${path}.${key}`, `${schemaPath}.properties.${key}`, depth + 1));
+            }
+        }
+    }
+    if (schema.additionalProperties === false && schema.properties !== undefined) {
+        const allowed = new Set(Object.keys(schema.properties));
+        for (const key of Object.keys(value)) {
+            if (!allowed.has(key)) {
+                violations.push({
+                    path,
+                    message: `additional property '${key}' is not allowed`,
+                    schema_path: `${schemaPath}.additionalProperties`,
+                });
+            }
+        }
+    }
+    else if (typeof schema.additionalProperties === 'object' &&
+        schema.additionalProperties !== null) {
+        const allowed = new Set(Object.keys(schema.properties ?? {}));
+        for (const key of Object.keys(value)) {
+            if (!allowed.has(key)) {
+                violations.push(...validateAgainstSchema(value[key], schema.additionalProperties, `${path}.${key}`, `${schemaPath}.additionalProperties`, depth + 1));
+            }
+        }
+    }
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/validate-inputs.js
+/**
+ * Pre-flight input validation for pipeline execution.
+ *
+ * Catches the common UX trap: user runs `pipeline call daily-news-digest`
+ * without `--inputs urls=...`, pipeline silently starts, fetch stage fails
+ * 4.4s later with a confusing deep-stage error. This check fails fast
+ * with a clear "missing required input" message before any stage runs.
+ *
+ * Called from:
+ *   - CLI runCommand (packages/cli/src/commands/run.ts)
+ *   - Server /v1/pipelines/:slug/run endpoint (packages/server/src/routes/pipelines.ts)
+ *
+ * Behavior:
+ *   - Iterates spec.inputs (Record<string, InputDecl>)
+ *   - For each `required: true` input, asserts the value is present AND
+ *     matches the declared type (string|integer|number|boolean|array|object)
+ *   - For arrays with declared `items.type`, asserts every item matches
+ *   - Returns null if all checks pass, else a list of human-readable errors
+ *
+ * NOTE: This is intentionally permissive on unknown inputs (no error if
+ * spec.inputs is missing or input has extra keys). Permissiveness on the
+ * "extra" axis avoids breaking ad-hoc CLI invocations; strictness is only
+ * on the "missing required" axis.
+ *
+ * M5 — `validateOutput()` is the symmetric output validator (server-side
+ * stage output validation against JSON Schema). Returns structured
+ * violations the executor uses to drive retry modes (none|single|loop).
+ */
+
+
+
+function validateInputs(specInputs, provided) {
+    if (!specInputs)
+        return [];
+    const errors = [];
+    for (const [field, decl] of Object.entries(specInputs)) {
+        const value = provided[field];
+        const present = value !== undefined && value !== null;
+        if (decl.required && !present) {
+            errors.push({ field, reason: 'missing', expected: decl.type ?? 'any' });
+            continue;
+        }
+        if (!present)
+            continue;
+        const expectedType = decl.type;
+        if (expectedType) {
+            const actualType = jsTypeOf(value);
+            if (!validate_inputs_typeMatches(expectedType, actualType, value)) {
+                const gotMsg = expectedType === 'integer' && actualType === 'number'
+                    ? (Number.isInteger(value) ? 'number' : 'float')
+                    : actualType;
+                errors.push({
+                    field,
+                    reason: 'wrong_type',
+                    expected: expectedType,
+                    got: gotMsg,
+                });
+                continue;
+            }
+            if (expectedType === 'array' && Array.isArray(value)) {
+                if (value.length === 0 && decl.required) {
+                    errors.push({ field, reason: 'empty_array', expected: 'non-empty array' });
+                    continue;
+                }
+                if (decl.items?.type && value.length > 0) {
+                    for (let i = 0; i < value.length; i++) {
+                        const itemType = jsTypeOf(value[i]);
+                        if (!validate_inputs_typeMatches(decl.items.type, itemType, value[i])) {
+                            errors.push({
+                                field,
+                                reason: 'wrong_item_type',
+                                expected: `${decl.items.type}[]`,
+                                got: `${itemType}[${i}]`,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return errors;
+}
+function formatInputErrors(errors, inputs) {
+    if (errors.length === 0)
+        return '';
+    const lines = [];
+    for (const e of errors) {
+        const decl = inputs?.[e.field];
+        const desc = decl?.description;
+        const itemType = decl?.items?.type;
+        const typeHint = decl?.type
+            ? ` (${decl.type}${itemType ? `<${itemType}>` : ''})`
+            : '';
+        const descSuffix = desc ? ` — ${desc}` : '';
+        if (e.reason === 'missing') {
+            lines.push(`  - ${e.field}${typeHint}: required${descSuffix}`);
+        }
+        else if (e.reason === 'empty_array') {
+            lines.push(`  - ${e.field}${typeHint}: must not be empty${descSuffix}`);
+        }
+        else {
+            lines.push(`  - ${e.field}${typeHint}: expected ${e.expected}, got ${e.got}${descSuffix}`);
+        }
+    }
+    return lines.join('\n');
+}
+function jsTypeOf(value) {
+    if (Array.isArray(value))
+        return 'array';
+    if (value === null)
+        return 'null';
+    return typeof value;
+}
+function validate_inputs_typeMatches(expected, actual, value) {
+    if (expected === 'integer' && actual === 'number') {
+        return Number.isInteger(value);
+    }
+    if (expected === 'number' && actual === 'number')
+        return true;
+    return expected === actual;
+}
+function validateOutput(rawOutput, schema, opts = {}) {
+    const schemaError = validateJsonSchema(schema);
+    if (!schemaError.ok) {
+        return { ok: false, violations: [], schemaError };
+    }
+    const value = parseValue(rawOutput, schema, opts);
+    const violations = validateAgainstSchema(value, schema);
+    if (violations.length === 0)
+        return { ok: true, value };
+    return { ok: false, violations };
+}
+function parseValue(rawOutput, schema, opts) {
+    const parseJson = opts.parseJson !== false;
+    const isScalarType = typeof schema.type === 'string'
+        && (schema.type === 'string' || schema.type === 'number' || schema.type === 'integer'
+            || schema.type === 'boolean' || schema.type === 'null');
+    if (isScalarType)
+        return rawOutput;
+    if (!parseJson)
+        return rawOutput;
+    try {
+        return JSON.parse(rawOutput);
+    }
+    catch {
+        return rawOutput;
+    }
+}
+function validateMultimodalInput(messages) {
+    const errors = [];
+    if (!Array.isArray(messages) || messages.length === 0) {
+        return { ok: false, errors: [{ messageIndex: 0, reason: 'empty_content' }] };
+    }
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        if (!msg || (msg.role !== 'user' && msg.role !== 'assistant' && msg.role !== 'system')) {
+            errors.push({ messageIndex: i, reason: 'invalid_role' });
+            continue;
+        }
+        if (typeof msg.content === 'string')
+            continue;
+        if (!Array.isArray(msg.content) || msg.content.length === 0) {
+            errors.push({ messageIndex: i, reason: 'empty_content' });
+            continue;
+        }
+        for (let j = 0; j < msg.content.length; j++) {
+            const part = msg.content[j];
+            if (part.type === 'text')
+                continue;
+            const url = part.type === 'image_url' ? part.image_url.url
+                : part.type === 'audio_url' ? part.audio_url.url
+                    : part.video_url.url;
+            if (!url || typeof url !== 'string') {
+                errors.push({ messageIndex: i, partIndex: j, reason: 'invalid_url' });
+                continue;
+            }
+            if (!url.startsWith('data:') && !url.startsWith('https://') && !url.startsWith('http://')) {
+                errors.push({ messageIndex: i, partIndex: j, reason: 'unsupported_scheme', detail: url.slice(0, 24) });
+                continue;
+            }
+            const mime = detectMime(url);
+            if (!mime) {
+                errors.push({ messageIndex: i, partIndex: j, reason: 'unsupported_mime', detail: url.slice(0, 24) });
+                continue;
+            }
+            const ok = part.type === 'image_url' ? isImageMime(mime)
+                : part.type === 'audio_url' ? isAudioMime(mime)
+                    : isVideoMime(mime);
+            if (!ok) {
+                errors.push({ messageIndex: i, partIndex: j, reason: 'unsupported_mime', detail: mime });
+            }
+        }
+    }
+    return errors.length === 0 ? { ok: true } : { ok: false, errors };
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/output-errors.js
+/**
+ * M5 — Output validation error + retry mode primitives.
+ *
+ * OutputValidationError is thrown by `runPipelineV2` after the configured
+ * retry budget (none|single|loop) is exhausted. The server route
+ * `packages/server/src/routes/pipelines/invoke.ts` catches it and
+ * surfaces a structured HTTP 500 envelope (see PIPELINE.md §"Stage
+ * output validation (M5)").
+ */
+class OutputValidationError extends Error {
+    stageId;
+    attempt;
+    violations;
+    lastError;
+    constructor(stageId, attempt, violations) {
+        const summary = violations.length > 0
+            ? violations.map((v) => `${v.path}: ${v.message}`).join('; ')
+            : 'unknown validation failure';
+        super(`Output validation failed for stage '${stageId}' after ${attempt} attempt(s): ${summary}`);
+        this.name = 'OUTPUT_VALIDATION_FAILED';
+        this.stageId = stageId;
+        this.attempt = attempt;
+        this.violations = violations;
+        this.lastError = summary;
+    }
+}
+const OUTPUT_VALIDATION_RETRY_ATTEMPTS = {
+    none: 1,
+    single: 2,
+    loop: 3,
+};
+function isOutputValidationMode(value) {
+    return value === 'none' || value === 'single' || value === 'loop';
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/shell-stage.js
+/**
+ * P4 — Shell stages (CLI-only).
+ *
+ * A `shell` stage lets a pipeline run a local command as part of its DAG.
+ * Useful for: running tests, linting, formatting, refactoring tools that
+ * live on the local machine.
+ *
+ * **Server-side is REJECTED.** Cloudflare Workers cannot spawn child
+ * processes. A pipeline with shell stages works only via `pipeline call
+ * --local`. The server explicitly throws `ShellStageUnsupportedError` so
+ * the user gets a clear 400 instead of a confusing 500.
+ *
+ * **Execution model:**
+ *   - `spawn(cmd, args, { shell: false })` — no shell interpretation, args
+ *     are passed verbatim to the OS as argv. Prevents shell injection.
+ *   - `timeout` option sends SIGTERM after `timeout_ms`; the executor
+ *     maps that to `ShellStageTimeoutError`.
+ *   - Non-zero exit code → `ShellStageExecError` with stderr in message.
+ *
+ * **Why dynamic import of `node:child_process`:** the runtime package is
+ * also loaded by Cloudflare Workers (which have no Node bindings). Importing
+ * `child_process` at module top-level would crash Workers startup. The
+ * `NodeShellExecutor` lazily imports it inside `.exec()` so Workers
+ * never touch the binding (the server uses a throwing stub).
+ *
+ * Stage schema (two forms):
+ *   shell: "npm test"                            # shorthand: auto-split
+ *   shell:                                      # explicit form
+ *     cmd: "npm"
+ *     args: ["test"]
+ *     cwd: "./my-project"
+ *     timeout_ms: 60000
+ */
+const SHELL_DEFAULT_TIMEOUT_MS = 30_000;
+const SHELL_MAX_OUTPUT_BYTES = 1024 * 1024;
+const SHELL_MAX_TIMEOUT_MS = 600_000;
+function normalizeShellStage(raw) {
+    if (typeof raw === 'string') {
+        const trimmed = raw.trim();
+        if (trimmed.length === 0)
+            return null;
+        const parts = trimmed.split(/\s+/);
+        return { cmd: parts[0], args: parts.slice(1) };
+    }
+    if (!raw || typeof raw !== 'object')
+        return null;
+    const obj = raw;
+    if (typeof obj.cmd !== 'string' || obj.cmd.trim().length === 0)
+        return null;
+    const spec = { cmd: obj.cmd.trim() };
+    if (Array.isArray(obj.args)) {
+        const args = obj.args.filter((a) => typeof a === 'string');
+        if (args.length > 0)
+            spec.args = args;
+    }
+    if (typeof obj.cwd === 'string' && obj.cwd.length > 0)
+        spec.cwd = obj.cwd;
+    if (typeof obj.timeout_ms === 'number' && Number.isFinite(obj.timeout_ms) && obj.timeout_ms > 0) {
+        spec.timeout_ms = Math.min(obj.timeout_ms, SHELL_MAX_TIMEOUT_MS);
+    }
+    return spec;
+}
+class ShellStageUnsupportedError extends Error {
+    stageId;
+    reason;
+    constructor(stageId, reason) {
+        super(`Stage '${stageId}' uses a shell command but ${reason}`);
+        this.stageId = stageId;
+        this.reason = reason;
+        this.name = 'SHELL_STAGE_UNSUPPORTED';
+    }
+}
+class ShellStageExecError extends Error {
+    stageId;
+    exitCode;
+    stderrSnippet;
+    constructor(stageId, exitCode, stderrSnippet) {
+        super(`Shell stage '${stageId}' exited with code ${exitCode}: ${stderrSnippet.slice(0, 500)}`);
+        this.stageId = stageId;
+        this.exitCode = exitCode;
+        this.stderrSnippet = stderrSnippet;
+        this.name = 'SHELL_STAGE_EXEC_FAILED';
+    }
+}
+class ShellStageTimeoutError extends Error {
+    stageId;
+    timeoutMs;
+    constructor(stageId, timeoutMs) {
+        super(`Shell stage '${stageId}' exceeded timeout of ${timeoutMs}ms`);
+        this.stageId = stageId;
+        this.timeoutMs = timeoutMs;
+        this.name = 'SHELL_STAGE_TIMEOUT';
+    }
+}
+class ThrowingShellExecutor {
+    reason;
+    constructor(reason) {
+        this.reason = reason;
+    }
+    async exec() {
+        throw new ShellStageUnsupportedError('<unknown>', this.reason);
+    }
+}
+class NodeShellExecutor {
+    async exec(spec, opts) {
+        const { spawn } = await Promise.resolve(/* import() */).then(__nccwpck_require__.t.bind(__nccwpck_require__, 421, 19));
+        const args = spec.args ?? [];
+        const t0 = Date.now();
+        return new Promise((resolve, reject) => {
+            const child = spawn(spec.cmd, args, {
+                cwd: opts.cwd,
+                timeout: opts.timeoutMs,
+                shell: false,
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            let stdout = '';
+            let stderr = '';
+            let stdoutTruncated = false;
+            let stderrTruncated = false;
+            const onChunk = (target) => (chunk) => {
+                const text = typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
+                if (target === 'stdout') {
+                    if (stdout.length + text.length > SHELL_MAX_OUTPUT_BYTES) {
+                        if (!stdoutTruncated) {
+                            stdout = stdout.slice(0, SHELL_MAX_OUTPUT_BYTES) + '\n[stdout truncated at 1MB]';
+                            stdoutTruncated = true;
+                        }
+                        return;
+                    }
+                    stdout += text;
+                }
+                else {
+                    if (stderr.length + text.length > SHELL_MAX_OUTPUT_BYTES) {
+                        if (!stderrTruncated) {
+                            stderr = stderr.slice(0, SHELL_MAX_OUTPUT_BYTES) + '\n[stderr truncated at 1MB]';
+                            stderrTruncated = true;
+                        }
+                        return;
+                    }
+                    stderr += text;
+                }
+            };
+            child.stdout.on('data', onChunk('stdout'));
+            child.stderr.on('data', onChunk('stderr'));
+            let settled = false;
+            const settle = (fn) => {
+                if (settled)
+                    return;
+                settled = true;
+                fn();
+            };
+            child.on('error', (e) => {
+                settle(() => reject(e));
+            });
+            child.on('close', (code, signal) => {
+                const durationMs = Date.now() - t0;
+                if (signal === 'SIGTERM' || signal === 'SIGKILL') {
+                    settle(() => reject(new ShellStageTimeoutError('<shell>', opts.timeoutMs)));
+                    return;
+                }
+                if (code === 0) {
+                    settle(() => resolve({ stdout, stderr, exitCode: 0, durationMs, cmd: spec.cmd, args }));
+                    return;
+                }
+                settle(() => reject(new ShellStageExecError('<shell>', code ?? -1, stderr || stdout)));
+            });
+        });
+    }
+}
+
 // EXTERNAL MODULE: external "node:crypto"
 var external_node_crypto_ = __nccwpck_require__(598);
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/stages.js
@@ -43802,6 +46758,14 @@ var external_node_crypto_ = __nccwpck_require__(598);
  * Pure functions — takes StageExecutorDeps as parameter, no DB/global access.
  * Both server (passes DB-backed fetchSkill) and CLI (passes HTTP fetchSkill) use this.
  */
+
+
+
+
+
+
+
+
 
 
 
@@ -43872,7 +46836,7 @@ function parseUsesList(stage) {
     return [];
 }
 function getPath(obj, dotted) {
-    const parts = dotted.split('.');
+    const parts = dotted.match(/[^.\[]+|\[\*\]/g)?.map((p) => (p === '[*]' ? '*' : p)) ?? [];
     let cursor = obj;
     for (let i = 0; i < parts.length; i++) {
         if (cursor == null)
@@ -43881,6 +46845,19 @@ function getPath(obj, dotted) {
             return { found: false, reason: `expected object at segment '${parts[i]}', got ${typeof cursor}` };
         }
         const key = parts[i];
+        if (key === '*') {
+            if (!Array.isArray(cursor)) {
+                return { found: false, reason: `expected array at segment '${parts[i - 1]}' for wildcard, got ${typeof cursor}` };
+            }
+            const restPath = parts.slice(i + 1).join('.');
+            for (let j = 0; j < cursor.length; j++) {
+                const itemResult = getPath(cursor[j], restPath);
+                if (!itemResult.found) {
+                    return { found: false, reason: `array item [${j}]: ${itemResult.reason}` };
+                }
+            }
+            return { found: true, reason: '' };
+        }
         if (Array.isArray(cursor)) {
             const idx = Number(key);
             if (!Number.isInteger(idx) || idx < 0 || idx >= cursor.length) {
@@ -43974,6 +46951,12 @@ class StageBadConfigError extends Error {
     }
 }
 function resolveStageProvider(deps, stage, model) {
+    // F12: --mock must override explicit per-stage `provider:` declarations,
+    // otherwise canonical seeded pipelines (which all declare
+    // `provider: minimax`) would hit the real API and 429 instead of the
+    // deterministic mock. forceMock wins over registry resolution.
+    if (deps.forceMock)
+        return deps.provider;
     if (!stage.provider)
         return deps.provider;
     if (!deps.registry) {
@@ -43981,19 +46964,92 @@ function resolveStageProvider(deps, stage, model) {
     }
     return deps.registry.resolveWithSupports(stage.provider, model);
 }
-async function invokeSkill(skill, input, previousContext, skillLabel, provider) {
+async function invokeSkill(skill, input, previousContext, skillLabel, provider, retry, retryCtx, outputFormat) {
     const t0 = Date.now();
     const inputStr = JSON.stringify(input ?? {}, null, 2);
     const fullMd = skill.full_md ?? '';
     const description = skill.description ?? '';
     const composedPrompt = `${previousContext}${fullMd}\n\n---\n\nInput:\n${inputStr}`;
-    const result = await provider.generateText(composedPrompt, {
+    const ran = await runWithRetry(() => provider.generateText(composedPrompt, {
         system: `${skillLabel}\n${description}`,
         complexity: 'complex',
         maxTokens: 4096,
-    });
-    return { result, durationMs: Date.now() - t0 };
+        ...(outputFormat ? { outputFormat } : {}),
+    }), retry, retryCtx);
+    return { result: ran.value, durationMs: Date.now() - t0, attempts: ran.attempts };
 }
+function readErrorStatus(e) {
+    if (!e || typeof e !== 'object')
+        return undefined;
+    const rec = e;
+    const raw = rec.status ?? rec.statusCode ?? rec.code;
+    if (typeof raw === 'number' && Number.isFinite(raw))
+        return raw;
+    if (typeof raw === 'string') {
+        const n = Number(raw);
+        if (Number.isFinite(n))
+            return n;
+    }
+    return undefined;
+}
+async function stages_sleep(ms) {
+    if (ms <= 0)
+        return;
+    await new Promise((r) => setTimeout(r, ms));
+}
+/**
+ * Retry the wrapped operation on transient retryable statuses per the
+ * supplied `RetryConfig`. Wraps OpenAI/Anthropic SDK errors that surface
+ * a numeric `status`/`statusCode` field. Any other thrown value is
+ * re-thrown verbatim on the first attempt (untouched).
+ *
+ * Default config: 3 attempts, exponential backoff, 1000ms initial,
+ * retryable statuses {429, 503}. Pass `attempts: 1` to disable retry.
+ *
+ * When `retryCtx` carries an `eventSink`, a `stage.retry` event is
+ * emitted for every attempt that fails with a retryable status and
+ * triggers another try. Final-exhaustion emits `stage.failed` via the
+ * caller (not here — `runWithRetry` only signals retry decisions).
+ */
+async function runWithRetry(op, retry, retryCtx) {
+    const cfg = retry ?? DEFAULT_RETRY;
+    const attempts = Math.max(1, cfg.attempts ?? DEFAULT_RETRY.attempts);
+    const retryable = cfg.retryable_status ?? [...DEFAULT_RETRYABLE_STATUSES_FALLBACK];
+    let lastError;
+    let lastStatus;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+            const value = await op();
+            return { value, attempts: attempt };
+        }
+        catch (e) {
+            lastError = e;
+            lastStatus = readErrorStatus(e);
+            if (attempt >= attempts)
+                break;
+            if (lastStatus === undefined || !isRetryableStatus(lastStatus, { retryable_status: retryable })) {
+                throw e;
+            }
+            const backoffMs = computeBackoffMs(attempt, cfg);
+            if (retryCtx?.eventSink) {
+                const errorMessage = e instanceof Error ? e.message : String(e);
+                retryCtx.eventSink.emit(makeStageRetriedEvent({
+                    stageId: retryCtx.stageId,
+                    attempt,
+                    maxAttempts: attempts,
+                    errorMessage,
+                    ...(lastStatus !== undefined ? { errorStatus: lastStatus } : {}),
+                    nextBackoffMs: backoffMs,
+                }));
+            }
+            await stages_sleep(backoffMs);
+        }
+    }
+    const lastMessage = lastError instanceof Error ? lastError.message : String(lastError);
+    throw new RetryExhaustedError(retryCtx?.stageId ?? '<stage>', attempts, lastMessage + (lastStatus !== undefined ? ` (status ${lastStatus})` : ''));
+}
+// Fallback constant (kept local — retry.ts owns the canonical list).
+const DEFAULT_RETRYABLE_STATUSES_FALLBACK = [429, 503];
 async function executeStage(stage, pipeline, ctx, deps) {
     const mcpResult = validateMCPConfig(stage.mcp_servers, stage.mcp_tools, deps.validateMCPRefs);
     const workingDir = typeof stage.working_dir === 'string' && stage.working_dir.length > 0
@@ -44002,13 +47058,68 @@ async function executeStage(stage, pipeline, ctx, deps) {
     const workingDirIgnoredOnServer = !!workingDir && !deps.isLocal;
     const previousContext = buildPreviousContext(ctx.previousOutputs);
     const inputsString = buildInputsString(ctx.inputs);
+    const retryCtx = deps.eventSink
+        ? { stageId: stage.id, eventSink: deps.eventSink }
+        : undefined;
     const usesList = parseUsesList(stage);
     const hasUses = usesList.length > 0;
     const hasModel = typeof stage.model === 'string' && stage.model.length > 0;
-    const hasPrompt = typeof stage.prompt === 'string' && stage.prompt.length > 0;
+    const hasStringPrompt = typeof stage.prompt === 'string' && stage.prompt.length > 0;
+    const hasMultimodalPrompt = Array.isArray(stage.prompt) && stage.prompt.length > 0;
+    const hasPrompt = hasStringPrompt || hasMultimodalPrompt;
     const hasSystem = typeof stage.system === 'string' && stage.system.length > 0;
-    if (!hasUses && !hasModel && !hasPrompt) {
-        throw new StageBadConfigError(`Stage '${stage.id}' requires one of: 'uses' (skill stage), 'model'+'prompt' (LLM stage), or just 'prompt' with default model`);
+    const hasShell = stage.shell !== undefined && stage.shell !== null;
+    const hasLoop = stage.loop !== undefined && stage.loop !== null;
+    if (!hasShell && !hasUses && !hasModel && !hasPrompt && !hasLoop) {
+        throw new StageBadConfigError(`Stage '${stage.id}' requires one of: 'shell' (shell stage, CLI --local only), 'uses' (skill stage), 'model'+'prompt' (LLM stage), 'loop' (M6.2 iterative executor), or just 'prompt' with default model`);
+    }
+    if (hasShell) {
+        if (!deps.shellExecutor) {
+            throw new ShellStageUnsupportedError(stage.id, 'no shell executor is configured for this run');
+        }
+        if (!deps.isLocal) {
+            throw new ShellStageUnsupportedError(stage.id, 'shell stages require CLI invocation with --local; the server cannot spawn child processes');
+        }
+        const spec = normalizeShellStage(stage.shell);
+        if (!spec) {
+            throw new StageBadConfigError(`Stage '${stage.id}' has a malformed 'shell' spec (expected string or { cmd, args?, cwd?, timeout_ms? })`);
+        }
+        const shellT0 = Date.now();
+        try {
+            const result = await deps.shellExecutor.exec(spec, {
+                cwd: spec.cwd ?? process.cwd(),
+                timeoutMs: spec.timeout_ms ?? SHELL_DEFAULT_TIMEOUT_MS,
+            });
+            const output = JSON.stringify({
+                cmd: spec.cmd,
+                args: spec.args ?? [],
+                cwd: spec.cwd ?? null,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                exit_code: result.exitCode,
+                duration_ms: result.durationMs,
+            });
+            return {
+                output,
+                costMicroUsdc: 0,
+                usage: { inputTokens: 0, outputTokens: 0 },
+                nestedCalls: [],
+                modelUsed: 'shell',
+                ...(spec.cwd ? { working_dir: spec.cwd, working_dir_ignored_on_server: false } : {}),
+            };
+        }
+        catch (e) {
+            if (e instanceof ShellStageExecError) {
+                throw new StageBadConfigError(`Stage '${stage.id}' ${e.message}`);
+            }
+            if (e instanceof ShellStageTimeoutError) {
+                throw new StageBadConfigError(`Stage '${stage.id}' ${e.message}`);
+            }
+            throw e;
+        }
+        finally {
+            void shellT0;
+        }
     }
     if (hasUses) {
         let chainedInput = stage.input ?? ctx.inputs;
@@ -44068,8 +47179,29 @@ async function executeStage(stage, pipeline, ctx, deps) {
             const stageProvider = resolveStageProvider(deps, stage, skillModel);
             const resolvedInput = typeof chainedInput === 'string'
                 ? resolveStageOutputRefs(chainedInput, ctx.previousOutputs)
-                : chainedInput;
-            const { result, durationMs } = await invokeSkill(skill, resolvedInput, previousContext, label, stageProvider);
+                : resolveInputRefs(chainedInput, { inputs: ctx.inputs, previousOutputs: ctx.previousOutputs });
+            if (isToolSkill(use.id)) {
+                const toolT0 = Date.now();
+                const toolResult = await invokeToolSkill(use.id, resolvedInput, {
+                    agentId: deps.getCurrentAgentId(),
+                });
+                const toolDurationMs = Date.now() - toolT0;
+                deps.onLlmResponse?.(`${stage.id}:${use.id}`, toolResult.text, 'tool');
+                lastResult = {
+                    text: toolResult.text,
+                    usage: toolResult.usage,
+                };
+                chainedInput = { input_from_previous_skill: toolResult.text };
+                nestedCalls.push({
+                    step_id: `${stage.id}:${i + 1}`,
+                    skill_id: use.id,
+                    duration_ms: toolDurationMs,
+                    ok: true,
+                });
+                continue;
+            }
+            const { result, durationMs } = await invokeSkill(skill, resolvedInput, previousContext, label, stageProvider, stage.retry, retryCtx, stage.output_format);
+            deps.onLlmResponse?.(`${stage.id}:${use.id}`, result.text, skillModel);
             lastResult = result;
             chainedInput = { input_from_previous_skill: result.text };
             nestedCalls.push({
@@ -44101,17 +47233,52 @@ async function executeStage(stage, pipeline, ctx, deps) {
     const model = deps.modelResolver.resolveSync(stage, pipeline);
     const stageProvider = resolveStageProvider(deps, stage, model);
     const resolvedSystem = stage.system
-        ? resolveStageOutputRefs(stage.system, ctx.previousOutputs)
+        ? resolveSpecialKeys(resolveStageOutputRefs(stage.system, ctx.previousOutputs))
         : stage.system;
-    const resolvedPrompt = resolveStageOutputRefs(stage.prompt ?? '', ctx.previousOutputs);
-    const prompt = previousContext + `Inputs:\n${inputsString}\n---\n\n${resolvedPrompt}`;
-    const result = await stageProvider.generateText(prompt, {
-        model,
-        system: resolvedSystem,
-        complexity: stage.model?.includes('M3') || stage.model?.includes('opus') ? 'complex' : 'simple',
-        maxTokens: 4096,
-    });
+    const stageProviderName = (stage.provider ?? stageProvider.name);
+    // M1 — multimodal prompt path. When stage.prompt is an array of
+    // MultimodalMessage, route through opts.messages and prepend a
+    // synthetic user message carrying the prior context + inputs.
+    // Text-only callers keep the legacy single-string path unchanged.
+    const rawPrompt = stage.prompt;
+    const isMultimodal = Array.isArray(rawPrompt);
+    if (isMultimodal) {
+        assertMultimodalSupported(stageProviderName, model);
+    }
+    const ctxPrefix = previousContext.length > 0 || inputsString.length > 0
+        ? `${previousContext}Inputs:\n${inputsString}\n---\n\n`
+        : '';
+    const ran = await runWithRetry(() => isMultimodal
+        ? stageProvider.generateText('', {
+            model,
+            system: resolvedSystem,
+            complexity: stage.model?.includes('M3') || stage.model?.includes('opus') ? 'complex' : 'simple',
+            maxTokens: 4096,
+            fields: stage.fields,
+            outputFormat: stage.output_format,
+            messages: ctxPrefix.length > 0
+                ? [
+                    { role: 'user', content: ctxPrefix },
+                    ...rawPrompt,
+                ]
+                : rawPrompt,
+        })
+        : (() => {
+            const stringPrompt = typeof stage.prompt === 'string' ? stage.prompt : '';
+            const resolvedPrompt = resolveSpecialKeys(resolveStageOutputRefs(stringPrompt, ctx.previousOutputs));
+            const prompt = `${previousContext}Inputs:\n${inputsString}\n---\n\n${resolvedPrompt}`;
+            return stageProvider.generateText(prompt, {
+                model,
+                system: resolvedSystem,
+                complexity: stage.model?.includes('M3') || stage.model?.includes('opus') ? 'complex' : 'simple',
+                maxTokens: 4096,
+                fields: stage.fields,
+                outputFormat: stage.output_format,
+            });
+        })(), stage.retry, retryCtx);
+    const result = ran.value;
     const costMicroUsdc = await deps.pricing.resolveCostMicroUsdc(model, result.usage);
+    deps.onLlmResponse?.(stage.id, result.text, model);
     validateOutputFormat(result.text, stage.output_format, stage.fields);
     return {
         output: result.text,
@@ -44147,13 +47314,19 @@ async function runOneStage(stage, shared) {
     for (const w of collectRuntimeWarnings(stage, shared.constraints)) {
         shared.emit({ type: 'stage.started', at: new Date().toISOString(), stageId, reason: 'normal' });
     }
+    for (const w of collectRuntimeWarnings(stage, shared.constraints)) {
+        shared.emit({ type: 'stage.started', at: new Date().toISOString(), stageId, reason: 'normal' });
+    }
     const t0 = Date.now();
     try {
         const stageModel = stage.model ?? shared.opts.spec.defaults?.model ?? 'MiniMax-M3';
         const stageDeps = shared.opts.providerResolver
             ? { ...shared.opts.deps, provider: shared.opts.providerResolver(stageModel) }
             : shared.opts.deps;
-        const result = await executeStage(stage, shared.opts.spec, { inputs: shared.opts.inputs, previousOutputs: shared.outputs }, stageDeps);
+        const stageDepsWithSink = shared.opts.eventSink
+            ? { ...stageDeps, eventSink: shared.opts.eventSink }
+            : stageDeps;
+        const result = await runStageWithOutputValidation(stage, shared.opts.spec, { inputs: shared.opts.inputs, previousOutputs: shared.outputs }, stageDepsWithSink);
         const ms = Date.now() - t0;
         shared.outputs[stageId] = result.output;
         shared.stageTimings.push({
@@ -44188,6 +47361,45 @@ async function runOneStage(stage, shared) {
         return { kind: 'failed', stageId, error: err };
     }
 }
+/**
+ * M5 — wraps `executeStage` with optional JSON Schema output validation.
+ *
+ * Behavior by `output_retry` mode:
+ *   - 'none'   — single attempt; fail-fast on validation error
+ *   - 'single' — at most 2 attempts (initial + 1 retry)
+ *   - 'loop'   — at most 3 attempts (initial + 2 retries)
+ *
+ * Independent of HTTP-status `retry:` (which is handled inside
+ * `runWithRetry` per call). Output validation retries invoke the entire
+ * stage body again (LLM call + output) — this is the M5 contract.
+ */
+async function runStageWithOutputValidation(stage, pipeline, ctx, deps) {
+    const schema = stage.output_schema;
+    if (!schema) {
+        return executeStage(stage, pipeline, ctx, deps);
+    }
+    const schemaCheck = validateJsonSchema(schema);
+    if (!schemaCheck.ok) {
+        throw new OutputValidationError(stage.id, 1, schemaCheck.violations);
+    }
+    const mode = isOutputValidationMode(stage.output_retry)
+        ? stage.output_retry
+        : 'none';
+    const maxAttempts = OUTPUT_VALIDATION_RETRY_ATTEMPTS[mode];
+    let lastViolations = [];
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const result = await executeStage(stage, pipeline, ctx, deps);
+        const validation = validateOutput(result.output, schema);
+        if (validation.ok) {
+            return result;
+        }
+        lastViolations = validation.violations;
+        if (attempt >= maxAttempts) {
+            throw new OutputValidationError(stage.id, attempt, lastViolations);
+        }
+    }
+    throw new OutputValidationError(stage.id, maxAttempts, lastViolations);
+}
 async function runPipelineV2(opts) {
     const outputs = {};
     const stageTimings = [];
@@ -44204,7 +47416,9 @@ async function runPipelineV2(opts) {
     const pipelineName = opts.spec.name;
     const pipelineVersion = opts.spec.version;
     const baseStages = opts.deps.fetchPipeline
-        ? await expandComposition(opts.spec.stages.map((s) => ({ ...s })), opts.deps.fetchPipeline)
+        ? await expandComposition(opts.spec.stages.map((s) => ({ ...s })), opts.deps.fetchPipeline, 0, opts.spec.composition?.max_depth !== undefined
+            ? { maxDepth: opts.spec.composition.max_depth }
+            : {})
         : opts.spec.stages;
     function emit(ev) { sink.emit(ev); }
     // R10.4 checkpoint lifecycle: assign runId (or use caller's), restore
@@ -44340,6 +47554,5484 @@ async function runPipelineV2(opts) {
 }
 
 
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/output-spec.js
+/**
+ * P1.1 — PipelineOutputSpec type + validateOutputSpec pure function.
+ *
+ * The top-level `output` block in a pipeline YAML declares what the
+ * pipeline produces after all stages complete. Two concerns:
+ *
+ *   - format    : how the output is shaped (text / json / zip / files)
+ *   - delivery  : how the caller receives it (inline body or signed URL)
+ *
+ * Glob patterns in `files` are matched against the pipeline's working
+ * directory after execution. P1.2 wires CLI glob tracking; P5 (deferred)
+ * wires R2 upload + signed URLs server-side.
+ */
+const DEFAULT_OUTPUT_FORMAT = 'text';
+const DEFAULT_OUTPUT_DELIVERY = 'inline';
+const DEFAULT_OUTPUT_EXPIRES_IN = 86_400;
+const MIN_OUTPUT_EXPIRES_IN = 60;
+const MAX_OUTPUT_EXPIRES_IN = 604_800;
+function validateOutputSpec(raw) {
+    if (raw === undefined || raw === null) {
+        return {
+            ok: true,
+            value: {
+                format: DEFAULT_OUTPUT_FORMAT,
+                delivery: DEFAULT_OUTPUT_DELIVERY,
+            },
+        };
+    }
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+        return {
+            ok: false,
+            errors: [{ field: 'output', error: 'output must be an object' }],
+        };
+    }
+    const spec = raw;
+    const errors = [];
+    const format = typeof spec.format === 'string' ? spec.format : DEFAULT_OUTPUT_FORMAT;
+    if (!['text', 'json', 'zip', 'files'].includes(format)) {
+        errors.push({
+            field: 'output.format',
+            error: `format must be one of: text, json, zip, files (got '${format}')`,
+        });
+    }
+    const delivery = typeof spec.delivery === 'string' ? spec.delivery : DEFAULT_OUTPUT_DELIVERY;
+    if (!['inline', 'signed_url'].includes(delivery)) {
+        errors.push({
+            field: 'output.delivery',
+            error: `delivery must be one of: inline, signed_url (got '${delivery}')`,
+        });
+    }
+    let files;
+    if (spec.files !== undefined) {
+        if (!Array.isArray(spec.files)) {
+            errors.push({
+                field: 'output.files',
+                error: 'files must be an array of glob strings',
+            });
+        }
+        else if (spec.files.length === 0) {
+            errors.push({
+                field: 'output.files',
+                error: 'files must contain at least one glob pattern',
+            });
+        }
+        else {
+            const invalid = spec.files.filter((f) => typeof f !== 'string' || f.length === 0);
+            if (invalid.length > 0) {
+                errors.push({
+                    field: 'output.files',
+                    error: `files contains non-string or empty entries: ${JSON.stringify(invalid)}`,
+                });
+            }
+            else {
+                files = spec.files;
+            }
+        }
+    }
+    let expires_in;
+    if (spec.expires_in !== undefined) {
+        if (typeof spec.expires_in !== 'number' || !Number.isInteger(spec.expires_in)) {
+            errors.push({
+                field: 'output.expires_in',
+                error: 'expires_in must be an integer (seconds)',
+            });
+        }
+        else if (spec.expires_in < MIN_OUTPUT_EXPIRES_IN ||
+            spec.expires_in > MAX_OUTPUT_EXPIRES_IN) {
+            errors.push({
+                field: 'output.expires_in',
+                error: `expires_in must be between ${MIN_OUTPUT_EXPIRES_IN} and ${MAX_OUTPUT_EXPIRES_IN} seconds (got ${spec.expires_in})`,
+            });
+        }
+        else {
+            expires_in = spec.expires_in;
+        }
+    }
+    if (format === 'files' && (!files || files.length === 0)) {
+        errors.push({
+            field: 'output.files',
+            error: 'format "files" requires a non-empty files array (glob patterns)',
+        });
+    }
+    if (delivery === 'signed_url' && expires_in === undefined) {
+        errors.push({
+            field: 'output.expires_in',
+            error: 'delivery "signed_url" requires expires_in (60 ≤ seconds ≤ 604800)',
+        });
+    }
+    if (errors.length > 0)
+        return { ok: false, errors };
+    const value = {
+        format: format,
+        delivery: delivery,
+    };
+    if (files !== undefined)
+        value.files = files;
+    if (expires_in !== undefined)
+        value.expires_in = expires_in;
+    return { ok: true, value };
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/capabilities.js
+/**
+ * P2.1 — analyzeCapabilities: pure function over a parsed pipeline spec.
+ *
+ * Derives a structured `PipelineCapabilities` object that lets callers
+ * reason about what a pipeline does WITHOUT executing it. Used by:
+ *   - Server: include in every pipeline response (P2.2)
+ *   - MCP tools: search_pipelines can filter by capabilities
+ *   - Marketplace UI: show "this pipeline uses OpenAI", "produces files"
+ *
+ * Derivation rules:
+ *   network        : required if any stage uses an LLM provider or skill
+ *                   forbidden if all stages are pure (no LLM, no skill)
+ *                   optional otherwise
+ *   requires_env   : ${VAR} names extracted from all string fields (deduped, sorted)
+ *   produces_files : any stage has working_dir OR top-level output.files non-empty
+ *   produces_format: union of stage-level output_format values
+ *   stages_count   : spec.stages.length
+ *   has_parallel   : any stage declares parallel OR has dependency edges to siblings
+ *   has_composition: any stage uses pipeline:NAME@VERSION (composition)
+ *   has_when       : any stage has a non-empty when clause
+ *   has_retry      : any stage declares a retry config
+ *
+ * Pure function — no I/O, no DB. Safe to call on parsed YAML.
+ */
+const ENV_VAR_RE = /\$\{([A-Z_][A-Z0-9_]*)(?::-[^}]*)?\}/g;
+const PIPELINE_REF_RE = /^pipeline:[A-Za-z0-9_.-]+(?:@[A-Za-z0-9_.-]+)?$/;
+function analyzeCapabilities(spec) {
+    const stages = spec?.stages ?? [];
+    return {
+        network: deriveNetwork(stages),
+        requires_env: deriveRequiresEnv(spec ?? {}, stages),
+        produces_files: deriveProducesFiles(spec ?? {}, stages),
+        produces_format: deriveProducesFormat(stages),
+        stages_count: stages.length,
+        has_parallel: deriveHasParallel(stages),
+        has_composition: deriveHasComposition(stages),
+        has_when: deriveHasWhen(stages),
+        has_retry: deriveHasRetry(stages),
+        capabilities_schema_version: 1,
+    };
+}
+function deriveNetwork(stages) {
+    let hasLLM = false;
+    let hasSkill = false;
+    let hasAny = stages.length > 0;
+    for (const s of stages) {
+        if (typeof s.provider === 'string' && s.provider.length > 0)
+            hasLLM = true;
+        const uses = s.uses;
+        if (typeof uses === 'string' && uses.length > 0)
+            hasSkill = true;
+        else if (Array.isArray(uses) && uses.length > 0)
+            hasSkill = true;
+    }
+    if (hasLLM || hasSkill)
+        return 'required';
+    if (!hasAny)
+        return 'forbidden';
+    return 'forbidden';
+}
+function collectStrings(value, out) {
+    if (typeof value === 'string') {
+        out.push(value);
+        return;
+    }
+    if (Array.isArray(value)) {
+        for (const item of value)
+            collectStrings(item, out);
+        return;
+    }
+    if (value && typeof value === 'object') {
+        for (const v of Object.values(value)) {
+            collectStrings(v, out);
+        }
+    }
+}
+function deriveRequiresEnv(spec, stages) {
+    const strings = [];
+    if (spec?.name)
+        strings.push(spec.name);
+    for (const s of stages) {
+        collectStrings(s.prompt, strings);
+        collectStrings(s.system, strings);
+        collectStrings(s.input, strings);
+    }
+    const names = new Set();
+    for (const text of strings) {
+        const re = new RegExp(ENV_VAR_RE.source, 'g');
+        let m;
+        while ((m = re.exec(text)) !== null) {
+            if (m[1])
+                names.add(m[1]);
+        }
+    }
+    return Array.from(names).sort();
+}
+function deriveProducesFiles(spec, stages) {
+    const out = spec?.output;
+    if (out && Array.isArray(out.files) && out.files.length > 0)
+        return true;
+    for (const s of stages) {
+        if (typeof s.working_dir === 'string' && s.working_dir.length > 0)
+            return true;
+    }
+    return false;
+}
+function deriveProducesFormat(stages) {
+    const formats = new Set();
+    for (const s of stages) {
+        if (typeof s.output_format === 'string' && s.output_format.length > 0) {
+            formats.add(s.output_format);
+        }
+    }
+    return Array.from(formats).sort();
+}
+function deriveHasParallel(stages) {
+    for (const s of stages) {
+        if (s.parallel === true || s.parallel === 'true')
+            return true;
+    }
+    const depsCount = new Map();
+    for (const s of stages) {
+        const deps = [
+            ...(Array.isArray(s.depends_on) ? s.depends_on : []),
+            ...(Array.isArray(s.requires) ? s.requires : []),
+            ...(Array.isArray(s.needs) ? s.needs : []),
+        ];
+        if (deps.length > 0) {
+            const key = deps.join('|');
+            depsCount.set(key, (depsCount.get(key) ?? 0) + 1);
+            if ((depsCount.get(key) ?? 0) > 1)
+                return true;
+        }
+    }
+    return false;
+}
+function deriveHasComposition(stages) {
+    for (const s of stages) {
+        const uses = s.uses;
+        if (typeof uses === 'string' && PIPELINE_REF_RE.test(uses))
+            return true;
+        if (Array.isArray(uses) && uses.some((u) => typeof u === 'string' && PIPELINE_REF_RE.test(u))) {
+            return true;
+        }
+    }
+    return false;
+}
+function deriveHasWhen(stages) {
+    for (const s of stages) {
+        if (s.when && typeof s.when === 'object')
+            return true;
+    }
+    return false;
+}
+function deriveHasRetry(stages) {
+    for (const s of stages) {
+        if (s.retry && typeof s.retry === 'object')
+            return true;
+    }
+    return false;
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/file-output.js
+/**
+ * P5 — Server-side file output collection.
+ *
+ * Scans the outputs of every executed stage for a structured
+ * `produced_files` array, extracts each file's content, and validates
+ * against the pipeline's declared `output.files` glob patterns.
+ *
+ * Stage authors opt-in by emitting structured JSON output of the shape:
+ *   {
+ *     "...": "...",
+ *     "produced_files": [
+ *       { "name": "report.md", "content_type": "text/markdown", "content_b64": "IyBUaXRsZQo..." }
+ *     ]
+ *   }
+ *
+ * Pure functions only — no I/O, no Cloudflare bindings, no Node.js
+ * primitives beyond `atob` (available in both V8 isolates and Node ≥16).
+ * The caller (server invoke.ts) is responsible for uploading the decoded
+ * bytes to R2 and generating signed URLs.
+ */
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
+const MAX_FILES = 100;
+function extractProducedFiles(stageOutputs, spec) {
+    const files = [];
+    const errors = [];
+    const warnings = [];
+    let totalBytes = 0;
+    for (const [stageId, text] of Object.entries(stageOutputs)) {
+        let parsed;
+        try {
+            parsed = JSON.parse(text);
+        }
+        catch {
+            continue;
+        }
+        if (!parsed || typeof parsed !== 'object')
+            continue;
+        const obj = parsed;
+        const produced = obj.produced_files;
+        if (!Array.isArray(produced))
+            continue;
+        for (const entry of produced) {
+            if (!entry || typeof entry !== 'object') {
+                warnings.push(`stage '${stageId}' produced_files entry is not an object`);
+                continue;
+            }
+            const rec = entry;
+            const name = rec.name;
+            const content_b64 = rec.content_b64;
+            const content_type = rec.content_type ?? 'application/octet-stream';
+            if (typeof name !== 'string' || name.length === 0) {
+                errors.push(`stage '${stageId}' produced_files entry missing 'name'`);
+                continue;
+            }
+            if (name.includes('/') || name.includes('\\') || name.includes('..')) {
+                errors.push(`stage '${stageId}' produced_files name '${name}' contains path separators or traversal`);
+                continue;
+            }
+            if (typeof content_b64 !== 'string' || content_b64.length === 0) {
+                errors.push(`stage '${stageId}' produced_files entry for '${name}' missing or empty 'content_b64'`);
+                continue;
+            }
+            if (typeof content_type !== 'string') {
+                errors.push(`stage '${stageId}' produced_files entry for '${name}' has non-string 'content_type'`);
+                continue;
+            }
+            let decodedLen;
+            try {
+                decodedLen = atob(content_b64).length;
+            }
+            catch (e) {
+                errors.push(`stage '${stageId}' produced_files entry for '${name}' has invalid base64: ${e.message}`);
+                continue;
+            }
+            if (decodedLen > MAX_FILE_BYTES) {
+                errors.push(`stage '${stageId}' produced file '${name}' is ${decodedLen} bytes (max ${MAX_FILE_BYTES})`);
+                continue;
+            }
+            if (totalBytes + decodedLen > MAX_TOTAL_BYTES) {
+                errors.push(`total file size exceeds ${MAX_TOTAL_BYTES} bytes; aborted at stage '${stageId}'`);
+                return { files, errors, warnings };
+            }
+            if (files.length >= MAX_FILES) {
+                errors.push(`produced_files count exceeds ${MAX_FILES}; aborted at stage '${stageId}'`);
+                return { files, errors, warnings };
+            }
+            totalBytes += decodedLen;
+            files.push({
+                stage_id: stageId,
+                name,
+                size: decodedLen,
+                content_type,
+                content_b64,
+            });
+        }
+    }
+    if (spec.files && spec.files.length > 0 && files.length > 0) {
+        for (const pattern of spec.files) {
+            const regex = globToRegex(pattern);
+            const matches = files.some((f) => regex.test(f.name));
+            if (!matches) {
+                warnings.push(`output.files pattern '${pattern}' did not match any produced file`);
+            }
+        }
+    }
+    return { files, errors, warnings };
+}
+function globToRegex(pattern) {
+    let regex = '';
+    let i = 0;
+    while (i < pattern.length) {
+        const c = pattern[i];
+        if (c === '*' && pattern[i + 1] === '*') {
+            regex += '.*';
+            i += 2;
+            if (pattern[i] === '/')
+                i += 1;
+        }
+        else if (c === '*') {
+            regex += '[^/]*';
+            i += 1;
+        }
+        else if (c === '?') {
+            regex += '[^/]';
+            i += 1;
+        }
+        else if (c && '.+^$()|{}[]\\'.includes(c)) {
+            regex += '\\' + c;
+            i += 1;
+        }
+        else if (c) {
+            regex += c;
+            i += 1;
+        }
+        else {
+            i += 1;
+        }
+    }
+    return new RegExp('^' + regex + '$');
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/loop.js
+/**
+ * M6.2 — Loop executor for pipeline stages (2026-09-25).
+ *
+ * Executes a `loop:` block that contains nested body stages. The loop
+ * runs body stages up to `max_iterations` times, evaluating `exit_when`
+ * after each iteration. Iteration state (counter + previous outputs) is
+ * persisted via the memory primitives (M6.1) so callers can introspect.
+ *
+ * Expression grammar (deliberately small for safety — no eval):
+ *   `outputs.KEY OP VALUE`
+ * where OP is one of: `>=`, `<=`, `==`, `!=`, `>`, `<`
+ * VALUE may be a number, boolean, or quoted string.
+ *
+ * Example:
+ *   loop:
+ *     max_iterations: 5
+ *     exit_when: "outputs.quality_score >= 0.9"
+ *     body:
+ *       - id: generate
+ *         provider: minimax
+ *         model: MiniMax-M3
+ *         prompt: "..."
+ *       - id: score
+ *         provider: minimax
+ *         model: MiniMax-M3
+ *         output_schema: { ... }
+ */
+const LOOP_SCHEMA_VERSION = 1;
+const DEFAULT_MAX_ITERATIONS = 3;
+const ABSOLUTE_MAX_ITERATIONS = 10;
+class LoopConfigError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'LOOP_CONFIG_ERROR';
+    }
+}
+class LoopMaxIterationsExceededError extends Error {
+    loop_id;
+    max;
+    constructor(loop_id, max) {
+        super(`Loop '${loop_id}' exceeded max_iterations=${max}`);
+        this.loop_id = loop_id;
+        this.max = max;
+        this.name = 'LOOP_MAX_ITERATIONS_EXCEEDED';
+    }
+}
+const OP_PATTERN = /^(>=|<=|==|!=|>|<)$/;
+const EXPR_PATTERN = /^outputs\.([A-Za-z_][A-Za-z0-9_]*)\s*(>=|<=|==|!=|>|<)\s*(.+)$/;
+function parseExitExpression(expr) {
+    const match = EXPR_PATTERN.exec(expr.trim());
+    if (!match || !match[1] || !match[2] || match[3] === undefined) {
+        throw new LoopConfigError(`Invalid exit_when expression: '${expr}'. Expected: outputs.KEY OP VALUE (e.g., outputs.quality_score >= 0.9)`);
+    }
+    const [, outputsKey, op, rawValue] = match;
+    if (!outputsKey || !op || rawValue === undefined) {
+        throw new LoopConfigError(`Invalid exit_when expression: '${expr}'`);
+    }
+    if (!OP_PATTERN.test(op)) {
+        throw new LoopConfigError(`Invalid operator in exit_when: '${op}'`);
+    }
+    const value = parseLiteral(rawValue.trim());
+    return {
+        outputs_key: outputsKey,
+        operator: op,
+        value,
+    };
+}
+function parseLiteral(raw) {
+    if (raw === 'true')
+        return true;
+    if (raw === 'false')
+        return false;
+    if (raw === 'null')
+        return null;
+    const num = Number(raw);
+    if (Number.isFinite(num) && raw !== '')
+        return num;
+    if (raw.startsWith('"') && raw.endsWith('"'))
+        return raw.slice(1, -1);
+    if (raw.startsWith("'") && raw.endsWith("'"))
+        return raw.slice(1, -1);
+    return raw;
+}
+function evaluateExitExpression(outputs, expr) {
+    const lhs = outputs[expr.outputs_key];
+    const rhs = expr.value;
+    switch (expr.operator) {
+        case '>=': return compare(lhs, rhs) >= 0;
+        case '<=': return compare(lhs, rhs) <= 0;
+        case '==': return looseEq(lhs, rhs);
+        case '!=': return !looseEq(lhs, rhs);
+        case '>': return compare(lhs, rhs) > 0;
+        case '<': return compare(lhs, rhs) < 0;
+    }
+}
+function looseEq(a, b) {
+    if (a === b)
+        return true;
+    if (typeof a === 'number' && typeof b === 'number')
+        return a === b;
+    if (typeof a === 'string' && typeof b === 'string')
+        return a === b;
+    if (typeof a === 'boolean' && typeof b === 'boolean')
+        return a === b;
+    return String(a) === String(b);
+}
+function compare(a, b) {
+    const na = typeof a === 'number' ? a : Number(a);
+    const nb = typeof b === 'number' ? b : Number(b);
+    if (Number.isNaN(na) || Number.isNaN(nb)) {
+        return -1;
+    }
+    return na - nb;
+}
+function flattenOutputs(iterOutputs) {
+    const flat = {};
+    for (const [stageId, stageOutput] of Object.entries(iterOutputs)) {
+        if (stageOutput !== null && typeof stageOutput === 'object' && !Array.isArray(stageOutput)) {
+            for (const [key, value] of Object.entries(stageOutput)) {
+                flat[key] = value;
+                flat[`${stageId}.${key}`] = value;
+            }
+        }
+        else {
+            flat[stageId] = stageOutput;
+        }
+    }
+    return flat;
+}
+async function executeLoop(opts) {
+    const max = Math.min(Math.max(opts.spec.max_iterations ?? DEFAULT_MAX_ITERATIONS, 1), ABSOLUTE_MAX_ITERATIONS);
+    const expr = opts.spec.exit_when
+        ? typeof opts.spec.exit_when === 'string'
+            ? parseExitExpression(opts.spec.exit_when)
+            : opts.spec.exit_when
+        : null;
+    if (!Array.isArray(opts.spec.body) || opts.spec.body.length === 0) {
+        throw new LoopConfigError(`Loop '${opts.loop_id}' must have a non-empty body`);
+    }
+    const iterations = [];
+    let prevOutputs = {};
+    let totalCost = 0;
+    let exited = false;
+    let exitedBy = 'max_iterations';
+    for (let i = 1; i <= max; i++) {
+        const bodyStages = opts.spec.body;
+        const iterOutputs = {};
+        let iterCost = 0;
+        const start = Date.now();
+        for (const bodyStage of bodyStages) {
+            const stageId = typeof bodyStage['id'] === 'string' ? bodyStage['id'] : `stage_${i}`;
+            const result = await opts.runBodyStage(bodyStage, i, prevOutputs);
+            iterOutputs[stageId] = result.outputs;
+            iterCost += result.cost_micro_usdc;
+        }
+        const iterDuration = Date.now() - start;
+        totalCost += iterCost;
+        let exitEval = null;
+        if (expr) {
+            const flat = flattenOutputs(iterOutputs);
+            exitEval = evaluateExitExpression(flat, expr);
+        }
+        const iteration = {
+            iteration: i,
+            outputs: iterOutputs,
+            cost_micro_usdc: iterCost,
+            duration_ms: iterDuration,
+            exit_evaluated: exitEval,
+            exited: exitEval === true,
+        };
+        iterations.push(iteration);
+        if (opts.memory) {
+            await opts.memory.set({ pipeline_id: opts.pipeline_id, partition: 'loop_state', scope: 'pipeline' }, `${opts.loop_id}:iteration_${i}`, iteration, 86400);
+        }
+        if (exitEval === true) {
+            exited = true;
+            exitedBy = 'exit_when';
+            prevOutputs = iterOutputs;
+            break;
+        }
+        prevOutputs = iterOutputs;
+    }
+    if (!exited && exitedBy === 'max_iterations') {
+        if (iterations.length >= max) {
+            throw new LoopMaxIterationsExceededError(opts.loop_id, max);
+        }
+    }
+    const trace = {
+        schema_version: LOOP_SCHEMA_VERSION,
+        loop_id: opts.loop_id,
+        pipeline_id: opts.pipeline_id,
+        max_iterations: max,
+        total_iterations: iterations.length,
+        exited_by: exitedBy,
+        final_outputs: prevOutputs,
+        total_cost_micro_usdc: totalCost,
+        iterations,
+    };
+    return { trace };
+}
+
+;// CONCATENATED MODULE: ../../node_modules/zod/v3/helpers/util.js
+var util;
+(function (util) {
+    util.assertEqual = (_) => { };
+    function assertIs(_arg) { }
+    util.assertIs = assertIs;
+    function assertNever(_x) {
+        throw new Error();
+    }
+    util.assertNever = assertNever;
+    util.arrayToEnum = (items) => {
+        const obj = {};
+        for (const item of items) {
+            obj[item] = item;
+        }
+        return obj;
+    };
+    util.getValidEnumValues = (obj) => {
+        const validKeys = util.objectKeys(obj).filter((k) => typeof obj[obj[k]] !== "number");
+        const filtered = {};
+        for (const k of validKeys) {
+            filtered[k] = obj[k];
+        }
+        return util.objectValues(filtered);
+    };
+    util.objectValues = (obj) => {
+        return util.objectKeys(obj).map(function (e) {
+            return obj[e];
+        });
+    };
+    util.objectKeys = typeof Object.keys === "function" // eslint-disable-line ban/ban
+        ? (obj) => Object.keys(obj) // eslint-disable-line ban/ban
+        : (object) => {
+            const keys = [];
+            for (const key in object) {
+                if (Object.prototype.hasOwnProperty.call(object, key)) {
+                    keys.push(key);
+                }
+            }
+            return keys;
+        };
+    util.find = (arr, checker) => {
+        for (const item of arr) {
+            if (checker(item))
+                return item;
+        }
+        return undefined;
+    };
+    util.isInteger = typeof Number.isInteger === "function"
+        ? (val) => Number.isInteger(val) // eslint-disable-line ban/ban
+        : (val) => typeof val === "number" && Number.isFinite(val) && Math.floor(val) === val;
+    function joinValues(array, separator = " | ") {
+        return array.map((val) => (typeof val === "string" ? `'${val}'` : val)).join(separator);
+    }
+    util.joinValues = joinValues;
+    util.jsonStringifyReplacer = (_, value) => {
+        if (typeof value === "bigint") {
+            return value.toString();
+        }
+        return value;
+    };
+})(util || (util = {}));
+var objectUtil;
+(function (objectUtil) {
+    objectUtil.mergeShapes = (first, second) => {
+        return {
+            ...first,
+            ...second, // second overwrites first
+        };
+    };
+})(objectUtil || (objectUtil = {}));
+const ZodParsedType = util.arrayToEnum([
+    "string",
+    "nan",
+    "number",
+    "integer",
+    "float",
+    "boolean",
+    "date",
+    "bigint",
+    "symbol",
+    "function",
+    "undefined",
+    "null",
+    "array",
+    "object",
+    "unknown",
+    "promise",
+    "void",
+    "never",
+    "map",
+    "set",
+]);
+const getParsedType = (data) => {
+    const t = typeof data;
+    switch (t) {
+        case "undefined":
+            return ZodParsedType.undefined;
+        case "string":
+            return ZodParsedType.string;
+        case "number":
+            return Number.isNaN(data) ? ZodParsedType.nan : ZodParsedType.number;
+        case "boolean":
+            return ZodParsedType.boolean;
+        case "function":
+            return ZodParsedType.function;
+        case "bigint":
+            return ZodParsedType.bigint;
+        case "symbol":
+            return ZodParsedType.symbol;
+        case "object":
+            if (Array.isArray(data)) {
+                return ZodParsedType.array;
+            }
+            if (data === null) {
+                return ZodParsedType.null;
+            }
+            if (data.then && typeof data.then === "function" && data.catch && typeof data.catch === "function") {
+                return ZodParsedType.promise;
+            }
+            if (typeof Map !== "undefined" && data instanceof Map) {
+                return ZodParsedType.map;
+            }
+            if (typeof Set !== "undefined" && data instanceof Set) {
+                return ZodParsedType.set;
+            }
+            if (typeof Date !== "undefined" && data instanceof Date) {
+                return ZodParsedType.date;
+            }
+            return ZodParsedType.object;
+        default:
+            return ZodParsedType.unknown;
+    }
+};
+
+;// CONCATENATED MODULE: ../../node_modules/zod/v3/ZodError.js
+
+const ZodIssueCode = util.arrayToEnum([
+    "invalid_type",
+    "invalid_literal",
+    "custom",
+    "invalid_union",
+    "invalid_union_discriminator",
+    "invalid_enum_value",
+    "unrecognized_keys",
+    "invalid_arguments",
+    "invalid_return_type",
+    "invalid_date",
+    "invalid_string",
+    "too_small",
+    "too_big",
+    "invalid_intersection_types",
+    "not_multiple_of",
+    "not_finite",
+]);
+const quotelessJson = (obj) => {
+    const json = JSON.stringify(obj, null, 2);
+    return json.replace(/"([^"]+)":/g, "$1:");
+};
+class ZodError extends Error {
+    get errors() {
+        return this.issues;
+    }
+    constructor(issues) {
+        super();
+        this.issues = [];
+        this.addIssue = (sub) => {
+            this.issues = [...this.issues, sub];
+        };
+        this.addIssues = (subs = []) => {
+            this.issues = [...this.issues, ...subs];
+        };
+        const actualProto = new.target.prototype;
+        if (Object.setPrototypeOf) {
+            // eslint-disable-next-line ban/ban
+            Object.setPrototypeOf(this, actualProto);
+        }
+        else {
+            this.__proto__ = actualProto;
+        }
+        this.name = "ZodError";
+        this.issues = issues;
+    }
+    format(_mapper) {
+        const mapper = _mapper ||
+            function (issue) {
+                return issue.message;
+            };
+        const fieldErrors = { _errors: [] };
+        const processError = (error) => {
+            for (const issue of error.issues) {
+                if (issue.code === "invalid_union") {
+                    issue.unionErrors.map(processError);
+                }
+                else if (issue.code === "invalid_return_type") {
+                    processError(issue.returnTypeError);
+                }
+                else if (issue.code === "invalid_arguments") {
+                    processError(issue.argumentsError);
+                }
+                else if (issue.path.length === 0) {
+                    fieldErrors._errors.push(mapper(issue));
+                }
+                else {
+                    let curr = fieldErrors;
+                    let i = 0;
+                    while (i < issue.path.length) {
+                        const el = issue.path[i];
+                        const terminal = i === issue.path.length - 1;
+                        if (!terminal) {
+                            curr[el] = curr[el] || { _errors: [] };
+                            // if (typeof el === "string") {
+                            //   curr[el] = curr[el] || { _errors: [] };
+                            // } else if (typeof el === "number") {
+                            //   const errorArray: any = [];
+                            //   errorArray._errors = [];
+                            //   curr[el] = curr[el] || errorArray;
+                            // }
+                        }
+                        else {
+                            curr[el] = curr[el] || { _errors: [] };
+                            curr[el]._errors.push(mapper(issue));
+                        }
+                        curr = curr[el];
+                        i++;
+                    }
+                }
+            }
+        };
+        processError(this);
+        return fieldErrors;
+    }
+    static assert(value) {
+        if (!(value instanceof ZodError)) {
+            throw new Error(`Not a ZodError: ${value}`);
+        }
+    }
+    toString() {
+        return this.message;
+    }
+    get message() {
+        return JSON.stringify(this.issues, util.jsonStringifyReplacer, 2);
+    }
+    get isEmpty() {
+        return this.issues.length === 0;
+    }
+    flatten(mapper = (issue) => issue.message) {
+        const fieldErrors = {};
+        const formErrors = [];
+        for (const sub of this.issues) {
+            if (sub.path.length > 0) {
+                const firstEl = sub.path[0];
+                fieldErrors[firstEl] = fieldErrors[firstEl] || [];
+                fieldErrors[firstEl].push(mapper(sub));
+            }
+            else {
+                formErrors.push(mapper(sub));
+            }
+        }
+        return { formErrors, fieldErrors };
+    }
+    get formErrors() {
+        return this.flatten();
+    }
+}
+ZodError.create = (issues) => {
+    const error = new ZodError(issues);
+    return error;
+};
+
+;// CONCATENATED MODULE: ../../node_modules/zod/v3/locales/en.js
+
+
+const errorMap = (issue, _ctx) => {
+    let message;
+    switch (issue.code) {
+        case ZodIssueCode.invalid_type:
+            if (issue.received === ZodParsedType.undefined) {
+                message = "Required";
+            }
+            else {
+                message = `Expected ${issue.expected}, received ${issue.received}`;
+            }
+            break;
+        case ZodIssueCode.invalid_literal:
+            message = `Invalid literal value, expected ${JSON.stringify(issue.expected, util.jsonStringifyReplacer)}`;
+            break;
+        case ZodIssueCode.unrecognized_keys:
+            message = `Unrecognized key(s) in object: ${util.joinValues(issue.keys, ", ")}`;
+            break;
+        case ZodIssueCode.invalid_union:
+            message = `Invalid input`;
+            break;
+        case ZodIssueCode.invalid_union_discriminator:
+            message = `Invalid discriminator value. Expected ${util.joinValues(issue.options)}`;
+            break;
+        case ZodIssueCode.invalid_enum_value:
+            message = `Invalid enum value. Expected ${util.joinValues(issue.options)}, received '${issue.received}'`;
+            break;
+        case ZodIssueCode.invalid_arguments:
+            message = `Invalid function arguments`;
+            break;
+        case ZodIssueCode.invalid_return_type:
+            message = `Invalid function return type`;
+            break;
+        case ZodIssueCode.invalid_date:
+            message = `Invalid date`;
+            break;
+        case ZodIssueCode.invalid_string:
+            if (typeof issue.validation === "object") {
+                if ("includes" in issue.validation) {
+                    message = `Invalid input: must include "${issue.validation.includes}"`;
+                    if (typeof issue.validation.position === "number") {
+                        message = `${message} at one or more positions greater than or equal to ${issue.validation.position}`;
+                    }
+                }
+                else if ("startsWith" in issue.validation) {
+                    message = `Invalid input: must start with "${issue.validation.startsWith}"`;
+                }
+                else if ("endsWith" in issue.validation) {
+                    message = `Invalid input: must end with "${issue.validation.endsWith}"`;
+                }
+                else {
+                    util.assertNever(issue.validation);
+                }
+            }
+            else if (issue.validation !== "regex") {
+                message = `Invalid ${issue.validation}`;
+            }
+            else {
+                message = "Invalid";
+            }
+            break;
+        case ZodIssueCode.too_small:
+            if (issue.type === "array")
+                message = `Array must contain ${issue.exact ? "exactly" : issue.inclusive ? `at least` : `more than`} ${issue.minimum} element(s)`;
+            else if (issue.type === "string")
+                message = `String must contain ${issue.exact ? "exactly" : issue.inclusive ? `at least` : `over`} ${issue.minimum} character(s)`;
+            else if (issue.type === "number")
+                message = `Number must be ${issue.exact ? `exactly equal to ` : issue.inclusive ? `greater than or equal to ` : `greater than `}${issue.minimum}`;
+            else if (issue.type === "bigint")
+                message = `Number must be ${issue.exact ? `exactly equal to ` : issue.inclusive ? `greater than or equal to ` : `greater than `}${issue.minimum}`;
+            else if (issue.type === "date")
+                message = `Date must be ${issue.exact ? `exactly equal to ` : issue.inclusive ? `greater than or equal to ` : `greater than `}${new Date(Number(issue.minimum))}`;
+            else
+                message = "Invalid input";
+            break;
+        case ZodIssueCode.too_big:
+            if (issue.type === "array")
+                message = `Array must contain ${issue.exact ? `exactly` : issue.inclusive ? `at most` : `less than`} ${issue.maximum} element(s)`;
+            else if (issue.type === "string")
+                message = `String must contain ${issue.exact ? `exactly` : issue.inclusive ? `at most` : `under`} ${issue.maximum} character(s)`;
+            else if (issue.type === "number")
+                message = `Number must be ${issue.exact ? `exactly` : issue.inclusive ? `less than or equal to` : `less than`} ${issue.maximum}`;
+            else if (issue.type === "bigint")
+                message = `BigInt must be ${issue.exact ? `exactly` : issue.inclusive ? `less than or equal to` : `less than`} ${issue.maximum}`;
+            else if (issue.type === "date")
+                message = `Date must be ${issue.exact ? `exactly` : issue.inclusive ? `smaller than or equal to` : `smaller than`} ${new Date(Number(issue.maximum))}`;
+            else
+                message = "Invalid input";
+            break;
+        case ZodIssueCode.custom:
+            message = `Invalid input`;
+            break;
+        case ZodIssueCode.invalid_intersection_types:
+            message = `Intersection results could not be merged`;
+            break;
+        case ZodIssueCode.not_multiple_of:
+            message = `Number must be a multiple of ${issue.multipleOf}`;
+            break;
+        case ZodIssueCode.not_finite:
+            message = "Number must be finite";
+            break;
+        default:
+            message = _ctx.defaultError;
+            util.assertNever(issue);
+    }
+    return { message };
+};
+/* harmony default export */ const en = (errorMap);
+
+;// CONCATENATED MODULE: ../../node_modules/zod/v3/errors.js
+
+let overrideErrorMap = en;
+
+function setErrorMap(map) {
+    overrideErrorMap = map;
+}
+function getErrorMap() {
+    return overrideErrorMap;
+}
+
+;// CONCATENATED MODULE: ../../node_modules/zod/v3/helpers/errorUtil.js
+var errorUtil;
+(function (errorUtil) {
+    errorUtil.errToObj = (message) => typeof message === "string" ? { message } : message || {};
+    // biome-ignore lint:
+    errorUtil.toString = (message) => typeof message === "string" ? message : message?.message;
+})(errorUtil || (errorUtil = {}));
+
+;// CONCATENATED MODULE: ../../node_modules/zod/v3/helpers/parseUtil.js
+
+
+const makeIssue = (params) => {
+    const { data, path, errorMaps, issueData } = params;
+    const fullPath = [...path, ...(issueData.path || [])];
+    const fullIssue = {
+        ...issueData,
+        path: fullPath,
+    };
+    if (issueData.message !== undefined) {
+        return {
+            ...issueData,
+            path: fullPath,
+            message: issueData.message,
+        };
+    }
+    let errorMessage = "";
+    const maps = errorMaps
+        .filter((m) => !!m)
+        .slice()
+        .reverse();
+    for (const map of maps) {
+        errorMessage = map(fullIssue, { data, defaultError: errorMessage }).message;
+    }
+    return {
+        ...issueData,
+        path: fullPath,
+        message: errorMessage,
+    };
+};
+const EMPTY_PATH = (/* unused pure expression or super */ null && ([]));
+function addIssueToContext(ctx, issueData) {
+    const overrideMap = getErrorMap();
+    const issue = makeIssue({
+        issueData: issueData,
+        data: ctx.data,
+        path: ctx.path,
+        errorMaps: [
+            ctx.common.contextualErrorMap, // contextual error map is first priority
+            ctx.schemaErrorMap, // then schema-bound map if available
+            overrideMap, // then global override map
+            overrideMap === en ? undefined : en, // then global default map
+        ].filter((x) => !!x),
+    });
+    ctx.common.issues.push(issue);
+}
+class ParseStatus {
+    constructor() {
+        this.value = "valid";
+    }
+    dirty() {
+        if (this.value === "valid")
+            this.value = "dirty";
+    }
+    abort() {
+        if (this.value !== "aborted")
+            this.value = "aborted";
+    }
+    static mergeArray(status, results) {
+        const arrayValue = [];
+        for (const s of results) {
+            if (s.status === "aborted")
+                return parseUtil_INVALID;
+            if (s.status === "dirty")
+                status.dirty();
+            arrayValue.push(s.value);
+        }
+        return { status: status.value, value: arrayValue };
+    }
+    static async mergeObjectAsync(status, pairs) {
+        const syncPairs = [];
+        for (const pair of pairs) {
+            const key = await pair.key;
+            const value = await pair.value;
+            syncPairs.push({
+                key,
+                value,
+            });
+        }
+        return ParseStatus.mergeObjectSync(status, syncPairs);
+    }
+    static mergeObjectSync(status, pairs) {
+        const finalObject = {};
+        for (const pair of pairs) {
+            const { key, value } = pair;
+            if (key.status === "aborted")
+                return parseUtil_INVALID;
+            if (value.status === "aborted")
+                return parseUtil_INVALID;
+            if (key.status === "dirty")
+                status.dirty();
+            if (value.status === "dirty")
+                status.dirty();
+            if (key.value !== "__proto__" && (typeof value.value !== "undefined" || pair.alwaysSet)) {
+                finalObject[key.value] = value.value;
+            }
+        }
+        return { status: status.value, value: finalObject };
+    }
+}
+const parseUtil_INVALID = Object.freeze({
+    status: "aborted",
+});
+const DIRTY = (value) => ({ status: "dirty", value });
+const OK = (value) => ({ status: "valid", value });
+const isAborted = (x) => x.status === "aborted";
+const isDirty = (x) => x.status === "dirty";
+const isValid = (x) => x.status === "valid";
+const isAsync = (x) => typeof Promise !== "undefined" && x instanceof Promise;
+
+;// CONCATENATED MODULE: ../../node_modules/zod/v3/types.js
+
+
+
+
+
+class ParseInputLazyPath {
+    constructor(parent, value, path, key) {
+        this._cachedPath = [];
+        this.parent = parent;
+        this.data = value;
+        this._path = path;
+        this._key = key;
+    }
+    get path() {
+        if (!this._cachedPath.length) {
+            if (Array.isArray(this._key)) {
+                this._cachedPath.push(...this._path, ...this._key);
+            }
+            else {
+                this._cachedPath.push(...this._path, this._key);
+            }
+        }
+        return this._cachedPath;
+    }
+}
+const handleResult = (ctx, result) => {
+    if (isValid(result)) {
+        return { success: true, data: result.value };
+    }
+    else {
+        if (!ctx.common.issues.length) {
+            throw new Error("Validation failed but no issues detected.");
+        }
+        return {
+            success: false,
+            get error() {
+                if (this._error)
+                    return this._error;
+                const error = new ZodError(ctx.common.issues);
+                this._error = error;
+                return this._error;
+            },
+        };
+    }
+};
+function processCreateParams(params) {
+    if (!params)
+        return {};
+    const { errorMap, invalid_type_error, required_error, description } = params;
+    if (errorMap && (invalid_type_error || required_error)) {
+        throw new Error(`Can't use "invalid_type_error" or "required_error" in conjunction with custom error map.`);
+    }
+    if (errorMap)
+        return { errorMap: errorMap, description };
+    const customMap = (iss, ctx) => {
+        const { message } = params;
+        if (iss.code === "invalid_enum_value") {
+            return { message: message ?? ctx.defaultError };
+        }
+        if (typeof ctx.data === "undefined") {
+            return { message: message ?? required_error ?? ctx.defaultError };
+        }
+        if (iss.code !== "invalid_type")
+            return { message: ctx.defaultError };
+        return { message: message ?? invalid_type_error ?? ctx.defaultError };
+    };
+    return { errorMap: customMap, description };
+}
+class ZodType {
+    get description() {
+        return this._def.description;
+    }
+    _getType(input) {
+        return getParsedType(input.data);
+    }
+    _getOrReturnCtx(input, ctx) {
+        return (ctx || {
+            common: input.parent.common,
+            data: input.data,
+            parsedType: getParsedType(input.data),
+            schemaErrorMap: this._def.errorMap,
+            path: input.path,
+            parent: input.parent,
+        });
+    }
+    _processInputParams(input) {
+        return {
+            status: new ParseStatus(),
+            ctx: {
+                common: input.parent.common,
+                data: input.data,
+                parsedType: getParsedType(input.data),
+                schemaErrorMap: this._def.errorMap,
+                path: input.path,
+                parent: input.parent,
+            },
+        };
+    }
+    _parseSync(input) {
+        const result = this._parse(input);
+        if (isAsync(result)) {
+            throw new Error("Synchronous parse encountered promise.");
+        }
+        return result;
+    }
+    _parseAsync(input) {
+        const result = this._parse(input);
+        return Promise.resolve(result);
+    }
+    parse(data, params) {
+        const result = this.safeParse(data, params);
+        if (result.success)
+            return result.data;
+        throw result.error;
+    }
+    safeParse(data, params) {
+        const ctx = {
+            common: {
+                issues: [],
+                async: params?.async ?? false,
+                contextualErrorMap: params?.errorMap,
+            },
+            path: params?.path || [],
+            schemaErrorMap: this._def.errorMap,
+            parent: null,
+            data,
+            parsedType: getParsedType(data),
+        };
+        const result = this._parseSync({ data, path: ctx.path, parent: ctx });
+        return handleResult(ctx, result);
+    }
+    "~validate"(data) {
+        const ctx = {
+            common: {
+                issues: [],
+                async: !!this["~standard"].async,
+            },
+            path: [],
+            schemaErrorMap: this._def.errorMap,
+            parent: null,
+            data,
+            parsedType: getParsedType(data),
+        };
+        if (!this["~standard"].async) {
+            try {
+                const result = this._parseSync({ data, path: [], parent: ctx });
+                return isValid(result)
+                    ? {
+                        value: result.value,
+                    }
+                    : {
+                        issues: ctx.common.issues,
+                    };
+            }
+            catch (err) {
+                if (err?.message?.toLowerCase()?.includes("encountered")) {
+                    this["~standard"].async = true;
+                }
+                ctx.common = {
+                    issues: [],
+                    async: true,
+                };
+            }
+        }
+        return this._parseAsync({ data, path: [], parent: ctx }).then((result) => isValid(result)
+            ? {
+                value: result.value,
+            }
+            : {
+                issues: ctx.common.issues,
+            });
+    }
+    async parseAsync(data, params) {
+        const result = await this.safeParseAsync(data, params);
+        if (result.success)
+            return result.data;
+        throw result.error;
+    }
+    async safeParseAsync(data, params) {
+        const ctx = {
+            common: {
+                issues: [],
+                contextualErrorMap: params?.errorMap,
+                async: true,
+            },
+            path: params?.path || [],
+            schemaErrorMap: this._def.errorMap,
+            parent: null,
+            data,
+            parsedType: getParsedType(data),
+        };
+        const maybeAsyncResult = this._parse({ data, path: ctx.path, parent: ctx });
+        const result = await (isAsync(maybeAsyncResult) ? maybeAsyncResult : Promise.resolve(maybeAsyncResult));
+        return handleResult(ctx, result);
+    }
+    refine(check, message) {
+        const getIssueProperties = (val) => {
+            if (typeof message === "string" || typeof message === "undefined") {
+                return { message };
+            }
+            else if (typeof message === "function") {
+                return message(val);
+            }
+            else {
+                return message;
+            }
+        };
+        return this._refinement((val, ctx) => {
+            const result = check(val);
+            const setError = () => ctx.addIssue({
+                code: ZodIssueCode.custom,
+                ...getIssueProperties(val),
+            });
+            if (typeof Promise !== "undefined" && result instanceof Promise) {
+                return result.then((data) => {
+                    if (!data) {
+                        setError();
+                        return false;
+                    }
+                    else {
+                        return true;
+                    }
+                });
+            }
+            if (!result) {
+                setError();
+                return false;
+            }
+            else {
+                return true;
+            }
+        });
+    }
+    refinement(check, refinementData) {
+        return this._refinement((val, ctx) => {
+            if (!check(val)) {
+                ctx.addIssue(typeof refinementData === "function" ? refinementData(val, ctx) : refinementData);
+                return false;
+            }
+            else {
+                return true;
+            }
+        });
+    }
+    _refinement(refinement) {
+        return new ZodEffects({
+            schema: this,
+            typeName: ZodFirstPartyTypeKind.ZodEffects,
+            effect: { type: "refinement", refinement },
+        });
+    }
+    superRefine(refinement) {
+        return this._refinement(refinement);
+    }
+    constructor(def) {
+        /** Alias of safeParseAsync */
+        this.spa = this.safeParseAsync;
+        this._def = def;
+        this.parse = this.parse.bind(this);
+        this.safeParse = this.safeParse.bind(this);
+        this.parseAsync = this.parseAsync.bind(this);
+        this.safeParseAsync = this.safeParseAsync.bind(this);
+        this.spa = this.spa.bind(this);
+        this.refine = this.refine.bind(this);
+        this.refinement = this.refinement.bind(this);
+        this.superRefine = this.superRefine.bind(this);
+        this.optional = this.optional.bind(this);
+        this.nullable = this.nullable.bind(this);
+        this.nullish = this.nullish.bind(this);
+        this.array = this.array.bind(this);
+        this.promise = this.promise.bind(this);
+        this.or = this.or.bind(this);
+        this.and = this.and.bind(this);
+        this.transform = this.transform.bind(this);
+        this.brand = this.brand.bind(this);
+        this.default = this.default.bind(this);
+        this.catch = this.catch.bind(this);
+        this.describe = this.describe.bind(this);
+        this.pipe = this.pipe.bind(this);
+        this.readonly = this.readonly.bind(this);
+        this.isNullable = this.isNullable.bind(this);
+        this.isOptional = this.isOptional.bind(this);
+        this["~standard"] = {
+            version: 1,
+            vendor: "zod",
+            validate: (data) => this["~validate"](data),
+        };
+    }
+    optional() {
+        return ZodOptional.create(this, this._def);
+    }
+    nullable() {
+        return ZodNullable.create(this, this._def);
+    }
+    nullish() {
+        return this.nullable().optional();
+    }
+    array() {
+        return ZodArray.create(this);
+    }
+    promise() {
+        return ZodPromise.create(this, this._def);
+    }
+    or(option) {
+        return ZodUnion.create([this, option], this._def);
+    }
+    and(incoming) {
+        return ZodIntersection.create(this, incoming, this._def);
+    }
+    transform(transform) {
+        return new ZodEffects({
+            ...processCreateParams(this._def),
+            schema: this,
+            typeName: ZodFirstPartyTypeKind.ZodEffects,
+            effect: { type: "transform", transform },
+        });
+    }
+    default(def) {
+        const defaultValueFunc = typeof def === "function" ? def : () => def;
+        return new ZodDefault({
+            ...processCreateParams(this._def),
+            innerType: this,
+            defaultValue: defaultValueFunc,
+            typeName: ZodFirstPartyTypeKind.ZodDefault,
+        });
+    }
+    brand() {
+        return new ZodBranded({
+            typeName: ZodFirstPartyTypeKind.ZodBranded,
+            type: this,
+            ...processCreateParams(this._def),
+        });
+    }
+    catch(def) {
+        const catchValueFunc = typeof def === "function" ? def : () => def;
+        return new ZodCatch({
+            ...processCreateParams(this._def),
+            innerType: this,
+            catchValue: catchValueFunc,
+            typeName: ZodFirstPartyTypeKind.ZodCatch,
+        });
+    }
+    describe(description) {
+        const This = this.constructor;
+        return new This({
+            ...this._def,
+            description,
+        });
+    }
+    pipe(target) {
+        return ZodPipeline.create(this, target);
+    }
+    readonly() {
+        return ZodReadonly.create(this);
+    }
+    isOptional() {
+        return this.safeParse(undefined).success;
+    }
+    isNullable() {
+        return this.safeParse(null).success;
+    }
+}
+const cuidRegex = /^c[^\s-]{8,}$/i;
+const cuid2Regex = /^[0-9a-z]+$/;
+const ulidRegex = /^[0-9A-HJKMNP-TV-Z]{26}$/i;
+// const uuidRegex =
+//   /^([a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[a-f0-9]{4}-[a-f0-9]{12}|00000000-0000-0000-0000-000000000000)$/i;
+const uuidRegex = /^[0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{12}$/i;
+const nanoidRegex = /^[a-z0-9_-]{21}$/i;
+const jwtRegex = /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]*$/;
+const durationRegex = /^[-+]?P(?!$)(?:(?:[-+]?\d+Y)|(?:[-+]?\d+[.,]\d+Y$))?(?:(?:[-+]?\d+M)|(?:[-+]?\d+[.,]\d+M$))?(?:(?:[-+]?\d+W)|(?:[-+]?\d+[.,]\d+W$))?(?:(?:[-+]?\d+D)|(?:[-+]?\d+[.,]\d+D$))?(?:T(?=[\d+-])(?:(?:[-+]?\d+H)|(?:[-+]?\d+[.,]\d+H$))?(?:(?:[-+]?\d+M)|(?:[-+]?\d+[.,]\d+M$))?(?:[-+]?\d+(?:[.,]\d+)?S)?)??$/;
+// from https://stackoverflow.com/a/46181/1550155
+// old version: too slow, didn't support unicode
+// const emailRegex = /^((([a-z]|\d|[!#\$%&'\*\+\-\/=\?\^_`{\|}~]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])+(\.([a-z]|\d|[!#\$%&'\*\+\-\/=\?\^_`{\|}~]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])+)*)|((\x22)((((\x20|\x09)*(\x0d\x0a))?(\x20|\x09)+)?(([\x01-\x08\x0b\x0c\x0e-\x1f\x7f]|\x21|[\x23-\x5b]|[\x5d-\x7e]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(\\([\x01-\x09\x0b\x0c\x0d-\x7f]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF]))))*(((\x20|\x09)*(\x0d\x0a))?(\x20|\x09)+)?(\x22)))@((([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])*([a-z]|\d|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])))\.)+(([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])|(([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])([a-z]|\d|-|\.|_|~|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])*([a-z]|[\u00A0-\uD7FF\uF900-\uFDCF\uFDF0-\uFFEF])))$/i;
+//old email regex
+// const emailRegex = /^(([^<>()[\].,;:\s@"]+(\.[^<>()[\].,;:\s@"]+)*)|(".+"))@((?!-)([^<>()[\].,;:\s@"]+\.)+[^<>()[\].,;:\s@"]{1,})[^-<>()[\].,;:\s@"]$/i;
+// eslint-disable-next-line
+// const emailRegex =
+//   /^(([^<>()[\]\\.,;:\s@\"]+(\.[^<>()[\]\\.,;:\s@\"]+)*)|(\".+\"))@((\[(((25[0-5])|(2[0-4][0-9])|(1[0-9]{2})|([0-9]{1,2}))\.){3}((25[0-5])|(2[0-4][0-9])|(1[0-9]{2})|([0-9]{1,2}))\])|(\[IPv6:(([a-f0-9]{1,4}:){7}|::([a-f0-9]{1,4}:){0,6}|([a-f0-9]{1,4}:){1}:([a-f0-9]{1,4}:){0,5}|([a-f0-9]{1,4}:){2}:([a-f0-9]{1,4}:){0,4}|([a-f0-9]{1,4}:){3}:([a-f0-9]{1,4}:){0,3}|([a-f0-9]{1,4}:){4}:([a-f0-9]{1,4}:){0,2}|([a-f0-9]{1,4}:){5}:([a-f0-9]{1,4}:){0,1})([a-f0-9]{1,4}|(((25[0-5])|(2[0-4][0-9])|(1[0-9]{2})|([0-9]{1,2}))\.){3}((25[0-5])|(2[0-4][0-9])|(1[0-9]{2})|([0-9]{1,2})))\])|([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])*(\.[A-Za-z]{2,})+))$/;
+// const emailRegex =
+//   /^[a-zA-Z0-9\.\!\#\$\%\&\'\*\+\/\=\?\^\_\`\{\|\}\~\-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+// const emailRegex =
+//   /^(?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])$/i;
+const emailRegex = /^(?!\.)(?!.*\.\.)([A-Z0-9_'+\-\.]*)[A-Z0-9_+-]@([A-Z0-9][A-Z0-9\-]*\.)+[A-Z]{2,}$/i;
+// const emailRegex =
+//   /^[a-z0-9.!#$%&’*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9\-]+)*$/i;
+// from https://thekevinscott.com/emojis-in-javascript/#writing-a-regular-expression
+const _emojiRegex = `^(\\p{Extended_Pictographic}|\\p{Emoji_Component})+$`;
+let emojiRegex;
+// faster, simpler, safer
+const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$/;
+const ipv4CidrRegex = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\/(3[0-2]|[12]?[0-9])$/;
+// const ipv6Regex =
+// /^(([a-f0-9]{1,4}:){7}|::([a-f0-9]{1,4}:){0,6}|([a-f0-9]{1,4}:){1}:([a-f0-9]{1,4}:){0,5}|([a-f0-9]{1,4}:){2}:([a-f0-9]{1,4}:){0,4}|([a-f0-9]{1,4}:){3}:([a-f0-9]{1,4}:){0,3}|([a-f0-9]{1,4}:){4}:([a-f0-9]{1,4}:){0,2}|([a-f0-9]{1,4}:){5}:([a-f0-9]{1,4}:){0,1})([a-f0-9]{1,4}|(((25[0-5])|(2[0-4][0-9])|(1[0-9]{2})|([0-9]{1,2}))\.){3}((25[0-5])|(2[0-4][0-9])|(1[0-9]{2})|([0-9]{1,2})))$/;
+const ipv6Regex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/;
+const ipv6CidrRegex = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))\/(12[0-8]|1[01][0-9]|[1-9]?[0-9])$/;
+// https://stackoverflow.com/questions/7860392/determine-if-string-is-in-base64-using-javascript
+const base64Regex = /^([0-9a-zA-Z+/]{4})*(([0-9a-zA-Z+/]{2}==)|([0-9a-zA-Z+/]{3}=))?$/;
+// https://base64.guru/standards/base64url
+const base64urlRegex = /^([0-9a-zA-Z-_]{4})*(([0-9a-zA-Z-_]{2}(==)?)|([0-9a-zA-Z-_]{3}(=)?))?$/;
+// simple
+// const dateRegexSource = `\\d{4}-\\d{2}-\\d{2}`;
+// no leap year validation
+// const dateRegexSource = `\\d{4}-((0[13578]|10|12)-31|(0[13-9]|1[0-2])-30|(0[1-9]|1[0-2])-(0[1-9]|1\\d|2\\d))`;
+// with leap year validation
+const dateRegexSource = `((\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-((0[13578]|1[02])-(0[1-9]|[12]\\d|3[01])|(0[469]|11)-(0[1-9]|[12]\\d|30)|(02)-(0[1-9]|1\\d|2[0-8])))`;
+const dateRegex = new RegExp(`^${dateRegexSource}$`);
+function timeRegexSource(args) {
+    let secondsRegexSource = `[0-5]\\d`;
+    if (args.precision) {
+        secondsRegexSource = `${secondsRegexSource}\\.\\d{${args.precision}}`;
+    }
+    else if (args.precision == null) {
+        secondsRegexSource = `${secondsRegexSource}(\\.\\d+)?`;
+    }
+    const secondsQuantifier = args.precision ? "+" : "?"; // require seconds if precision is nonzero
+    return `([01]\\d|2[0-3]):[0-5]\\d(:${secondsRegexSource})${secondsQuantifier}`;
+}
+function timeRegex(args) {
+    return new RegExp(`^${timeRegexSource(args)}$`);
+}
+// Adapted from https://stackoverflow.com/a/3143231
+function datetimeRegex(args) {
+    let regex = `${dateRegexSource}T${timeRegexSource(args)}`;
+    const opts = [];
+    opts.push(args.local ? `Z?` : `Z`);
+    if (args.offset)
+        opts.push(`([+-]\\d{2}:?\\d{2})`);
+    regex = `${regex}(${opts.join("|")})`;
+    return new RegExp(`^${regex}$`);
+}
+function isValidIP(ip, version) {
+    if ((version === "v4" || !version) && ipv4Regex.test(ip)) {
+        return true;
+    }
+    if ((version === "v6" || !version) && ipv6Regex.test(ip)) {
+        return true;
+    }
+    return false;
+}
+function isValidJWT(jwt, alg) {
+    if (!jwtRegex.test(jwt))
+        return false;
+    try {
+        const [header] = jwt.split(".");
+        if (!header)
+            return false;
+        // Convert base64url to base64
+        const base64 = header
+            .replace(/-/g, "+")
+            .replace(/_/g, "/")
+            .padEnd(header.length + ((4 - (header.length % 4)) % 4), "=");
+        const decoded = JSON.parse(atob(base64));
+        if (typeof decoded !== "object" || decoded === null)
+            return false;
+        if ("typ" in decoded && decoded?.typ !== "JWT")
+            return false;
+        if (!decoded.alg)
+            return false;
+        if (alg && decoded.alg !== alg)
+            return false;
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+function isValidCidr(ip, version) {
+    if ((version === "v4" || !version) && ipv4CidrRegex.test(ip)) {
+        return true;
+    }
+    if ((version === "v6" || !version) && ipv6CidrRegex.test(ip)) {
+        return true;
+    }
+    return false;
+}
+class ZodString extends ZodType {
+    _parse(input) {
+        if (this._def.coerce) {
+            input.data = String(input.data);
+        }
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.string) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.string,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        const status = new ParseStatus();
+        let ctx = undefined;
+        for (const check of this._def.checks) {
+            if (check.kind === "min") {
+                if (input.data.length < check.value) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.too_small,
+                        minimum: check.value,
+                        type: "string",
+                        inclusive: true,
+                        exact: false,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "max") {
+                if (input.data.length > check.value) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.too_big,
+                        maximum: check.value,
+                        type: "string",
+                        inclusive: true,
+                        exact: false,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "length") {
+                const tooBig = input.data.length > check.value;
+                const tooSmall = input.data.length < check.value;
+                if (tooBig || tooSmall) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    if (tooBig) {
+                        addIssueToContext(ctx, {
+                            code: ZodIssueCode.too_big,
+                            maximum: check.value,
+                            type: "string",
+                            inclusive: true,
+                            exact: true,
+                            message: check.message,
+                        });
+                    }
+                    else if (tooSmall) {
+                        addIssueToContext(ctx, {
+                            code: ZodIssueCode.too_small,
+                            minimum: check.value,
+                            type: "string",
+                            inclusive: true,
+                            exact: true,
+                            message: check.message,
+                        });
+                    }
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "email") {
+                if (!emailRegex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "email",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "emoji") {
+                if (!emojiRegex) {
+                    emojiRegex = new RegExp(_emojiRegex, "u");
+                }
+                if (!emojiRegex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "emoji",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "uuid") {
+                if (!uuidRegex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "uuid",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "nanoid") {
+                if (!nanoidRegex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "nanoid",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "cuid") {
+                if (!cuidRegex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "cuid",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "cuid2") {
+                if (!cuid2Regex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "cuid2",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "ulid") {
+                if (!ulidRegex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "ulid",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "url") {
+                try {
+                    new URL(input.data);
+                }
+                catch {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "url",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "regex") {
+                check.regex.lastIndex = 0;
+                const testResult = check.regex.test(input.data);
+                if (!testResult) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "regex",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "trim") {
+                input.data = input.data.trim();
+            }
+            else if (check.kind === "includes") {
+                if (!input.data.includes(check.value, check.position)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.invalid_string,
+                        validation: { includes: check.value, position: check.position },
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "toLowerCase") {
+                input.data = input.data.toLowerCase();
+            }
+            else if (check.kind === "toUpperCase") {
+                input.data = input.data.toUpperCase();
+            }
+            else if (check.kind === "startsWith") {
+                if (!input.data.startsWith(check.value)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.invalid_string,
+                        validation: { startsWith: check.value },
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "endsWith") {
+                if (!input.data.endsWith(check.value)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.invalid_string,
+                        validation: { endsWith: check.value },
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "datetime") {
+                const regex = datetimeRegex(check);
+                if (!regex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.invalid_string,
+                        validation: "datetime",
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "date") {
+                const regex = dateRegex;
+                if (!regex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.invalid_string,
+                        validation: "date",
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "time") {
+                const regex = timeRegex(check);
+                if (!regex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.invalid_string,
+                        validation: "time",
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "duration") {
+                if (!durationRegex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "duration",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "ip") {
+                if (!isValidIP(input.data, check.version)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "ip",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "jwt") {
+                if (!isValidJWT(input.data, check.alg)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "jwt",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "cidr") {
+                if (!isValidCidr(input.data, check.version)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "cidr",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "base64") {
+                if (!base64Regex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "base64",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "base64url") {
+                if (!base64urlRegex.test(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        validation: "base64url",
+                        code: ZodIssueCode.invalid_string,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else {
+                util.assertNever(check);
+            }
+        }
+        return { status: status.value, value: input.data };
+    }
+    _regex(regex, validation, message) {
+        return this.refinement((data) => regex.test(data), {
+            validation,
+            code: ZodIssueCode.invalid_string,
+            ...errorUtil.errToObj(message),
+        });
+    }
+    _addCheck(check) {
+        return new ZodString({
+            ...this._def,
+            checks: [...this._def.checks, check],
+        });
+    }
+    email(message) {
+        return this._addCheck({ kind: "email", ...errorUtil.errToObj(message) });
+    }
+    url(message) {
+        return this._addCheck({ kind: "url", ...errorUtil.errToObj(message) });
+    }
+    emoji(message) {
+        return this._addCheck({ kind: "emoji", ...errorUtil.errToObj(message) });
+    }
+    uuid(message) {
+        return this._addCheck({ kind: "uuid", ...errorUtil.errToObj(message) });
+    }
+    nanoid(message) {
+        return this._addCheck({ kind: "nanoid", ...errorUtil.errToObj(message) });
+    }
+    cuid(message) {
+        return this._addCheck({ kind: "cuid", ...errorUtil.errToObj(message) });
+    }
+    cuid2(message) {
+        return this._addCheck({ kind: "cuid2", ...errorUtil.errToObj(message) });
+    }
+    ulid(message) {
+        return this._addCheck({ kind: "ulid", ...errorUtil.errToObj(message) });
+    }
+    base64(message) {
+        return this._addCheck({ kind: "base64", ...errorUtil.errToObj(message) });
+    }
+    base64url(message) {
+        // base64url encoding is a modification of base64 that can safely be used in URLs and filenames
+        return this._addCheck({
+            kind: "base64url",
+            ...errorUtil.errToObj(message),
+        });
+    }
+    jwt(options) {
+        return this._addCheck({ kind: "jwt", ...errorUtil.errToObj(options) });
+    }
+    ip(options) {
+        return this._addCheck({ kind: "ip", ...errorUtil.errToObj(options) });
+    }
+    cidr(options) {
+        return this._addCheck({ kind: "cidr", ...errorUtil.errToObj(options) });
+    }
+    datetime(options) {
+        if (typeof options === "string") {
+            return this._addCheck({
+                kind: "datetime",
+                precision: null,
+                offset: false,
+                local: false,
+                message: options,
+            });
+        }
+        return this._addCheck({
+            kind: "datetime",
+            precision: typeof options?.precision === "undefined" ? null : options?.precision,
+            offset: options?.offset ?? false,
+            local: options?.local ?? false,
+            ...errorUtil.errToObj(options?.message),
+        });
+    }
+    date(message) {
+        return this._addCheck({ kind: "date", message });
+    }
+    time(options) {
+        if (typeof options === "string") {
+            return this._addCheck({
+                kind: "time",
+                precision: null,
+                message: options,
+            });
+        }
+        return this._addCheck({
+            kind: "time",
+            precision: typeof options?.precision === "undefined" ? null : options?.precision,
+            ...errorUtil.errToObj(options?.message),
+        });
+    }
+    duration(message) {
+        return this._addCheck({ kind: "duration", ...errorUtil.errToObj(message) });
+    }
+    regex(regex, message) {
+        return this._addCheck({
+            kind: "regex",
+            regex: regex,
+            ...errorUtil.errToObj(message),
+        });
+    }
+    includes(value, options) {
+        return this._addCheck({
+            kind: "includes",
+            value: value,
+            position: options?.position,
+            ...errorUtil.errToObj(options?.message),
+        });
+    }
+    startsWith(value, message) {
+        return this._addCheck({
+            kind: "startsWith",
+            value: value,
+            ...errorUtil.errToObj(message),
+        });
+    }
+    endsWith(value, message) {
+        return this._addCheck({
+            kind: "endsWith",
+            value: value,
+            ...errorUtil.errToObj(message),
+        });
+    }
+    min(minLength, message) {
+        return this._addCheck({
+            kind: "min",
+            value: minLength,
+            ...errorUtil.errToObj(message),
+        });
+    }
+    max(maxLength, message) {
+        return this._addCheck({
+            kind: "max",
+            value: maxLength,
+            ...errorUtil.errToObj(message),
+        });
+    }
+    length(len, message) {
+        return this._addCheck({
+            kind: "length",
+            value: len,
+            ...errorUtil.errToObj(message),
+        });
+    }
+    /**
+     * Equivalent to `.min(1)`
+     */
+    nonempty(message) {
+        return this.min(1, errorUtil.errToObj(message));
+    }
+    trim() {
+        return new ZodString({
+            ...this._def,
+            checks: [...this._def.checks, { kind: "trim" }],
+        });
+    }
+    toLowerCase() {
+        return new ZodString({
+            ...this._def,
+            checks: [...this._def.checks, { kind: "toLowerCase" }],
+        });
+    }
+    toUpperCase() {
+        return new ZodString({
+            ...this._def,
+            checks: [...this._def.checks, { kind: "toUpperCase" }],
+        });
+    }
+    get isDatetime() {
+        return !!this._def.checks.find((ch) => ch.kind === "datetime");
+    }
+    get isDate() {
+        return !!this._def.checks.find((ch) => ch.kind === "date");
+    }
+    get isTime() {
+        return !!this._def.checks.find((ch) => ch.kind === "time");
+    }
+    get isDuration() {
+        return !!this._def.checks.find((ch) => ch.kind === "duration");
+    }
+    get isEmail() {
+        return !!this._def.checks.find((ch) => ch.kind === "email");
+    }
+    get isURL() {
+        return !!this._def.checks.find((ch) => ch.kind === "url");
+    }
+    get isEmoji() {
+        return !!this._def.checks.find((ch) => ch.kind === "emoji");
+    }
+    get isUUID() {
+        return !!this._def.checks.find((ch) => ch.kind === "uuid");
+    }
+    get isNANOID() {
+        return !!this._def.checks.find((ch) => ch.kind === "nanoid");
+    }
+    get isCUID() {
+        return !!this._def.checks.find((ch) => ch.kind === "cuid");
+    }
+    get isCUID2() {
+        return !!this._def.checks.find((ch) => ch.kind === "cuid2");
+    }
+    get isULID() {
+        return !!this._def.checks.find((ch) => ch.kind === "ulid");
+    }
+    get isIP() {
+        return !!this._def.checks.find((ch) => ch.kind === "ip");
+    }
+    get isCIDR() {
+        return !!this._def.checks.find((ch) => ch.kind === "cidr");
+    }
+    get isBase64() {
+        return !!this._def.checks.find((ch) => ch.kind === "base64");
+    }
+    get isBase64url() {
+        // base64url encoding is a modification of base64 that can safely be used in URLs and filenames
+        return !!this._def.checks.find((ch) => ch.kind === "base64url");
+    }
+    get minLength() {
+        let min = null;
+        for (const ch of this._def.checks) {
+            if (ch.kind === "min") {
+                if (min === null || ch.value > min)
+                    min = ch.value;
+            }
+        }
+        return min;
+    }
+    get maxLength() {
+        let max = null;
+        for (const ch of this._def.checks) {
+            if (ch.kind === "max") {
+                if (max === null || ch.value < max)
+                    max = ch.value;
+            }
+        }
+        return max;
+    }
+}
+ZodString.create = (params) => {
+    return new ZodString({
+        checks: [],
+        typeName: ZodFirstPartyTypeKind.ZodString,
+        coerce: params?.coerce ?? false,
+        ...processCreateParams(params),
+    });
+};
+// https://stackoverflow.com/questions/3966484/why-does-modulus-operator-return-fractional-number-in-javascript/31711034#31711034
+function floatSafeRemainder(val, step) {
+    const valDecCount = (val.toString().split(".")[1] || "").length;
+    const stepDecCount = (step.toString().split(".")[1] || "").length;
+    const decCount = valDecCount > stepDecCount ? valDecCount : stepDecCount;
+    const valInt = Number.parseInt(val.toFixed(decCount).replace(".", ""));
+    const stepInt = Number.parseInt(step.toFixed(decCount).replace(".", ""));
+    return (valInt % stepInt) / 10 ** decCount;
+}
+class ZodNumber extends ZodType {
+    constructor() {
+        super(...arguments);
+        this.min = this.gte;
+        this.max = this.lte;
+        this.step = this.multipleOf;
+    }
+    _parse(input) {
+        if (this._def.coerce) {
+            input.data = Number(input.data);
+        }
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.number) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.number,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        let ctx = undefined;
+        const status = new ParseStatus();
+        for (const check of this._def.checks) {
+            if (check.kind === "int") {
+                if (!util.isInteger(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.invalid_type,
+                        expected: "integer",
+                        received: "float",
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "min") {
+                const tooSmall = check.inclusive ? input.data < check.value : input.data <= check.value;
+                if (tooSmall) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.too_small,
+                        minimum: check.value,
+                        type: "number",
+                        inclusive: check.inclusive,
+                        exact: false,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "max") {
+                const tooBig = check.inclusive ? input.data > check.value : input.data >= check.value;
+                if (tooBig) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.too_big,
+                        maximum: check.value,
+                        type: "number",
+                        inclusive: check.inclusive,
+                        exact: false,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "multipleOf") {
+                if (floatSafeRemainder(input.data, check.value) !== 0) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.not_multiple_of,
+                        multipleOf: check.value,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "finite") {
+                if (!Number.isFinite(input.data)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.not_finite,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else {
+                util.assertNever(check);
+            }
+        }
+        return { status: status.value, value: input.data };
+    }
+    gte(value, message) {
+        return this.setLimit("min", value, true, errorUtil.toString(message));
+    }
+    gt(value, message) {
+        return this.setLimit("min", value, false, errorUtil.toString(message));
+    }
+    lte(value, message) {
+        return this.setLimit("max", value, true, errorUtil.toString(message));
+    }
+    lt(value, message) {
+        return this.setLimit("max", value, false, errorUtil.toString(message));
+    }
+    setLimit(kind, value, inclusive, message) {
+        return new ZodNumber({
+            ...this._def,
+            checks: [
+                ...this._def.checks,
+                {
+                    kind,
+                    value,
+                    inclusive,
+                    message: errorUtil.toString(message),
+                },
+            ],
+        });
+    }
+    _addCheck(check) {
+        return new ZodNumber({
+            ...this._def,
+            checks: [...this._def.checks, check],
+        });
+    }
+    int(message) {
+        return this._addCheck({
+            kind: "int",
+            message: errorUtil.toString(message),
+        });
+    }
+    positive(message) {
+        return this._addCheck({
+            kind: "min",
+            value: 0,
+            inclusive: false,
+            message: errorUtil.toString(message),
+        });
+    }
+    negative(message) {
+        return this._addCheck({
+            kind: "max",
+            value: 0,
+            inclusive: false,
+            message: errorUtil.toString(message),
+        });
+    }
+    nonpositive(message) {
+        return this._addCheck({
+            kind: "max",
+            value: 0,
+            inclusive: true,
+            message: errorUtil.toString(message),
+        });
+    }
+    nonnegative(message) {
+        return this._addCheck({
+            kind: "min",
+            value: 0,
+            inclusive: true,
+            message: errorUtil.toString(message),
+        });
+    }
+    multipleOf(value, message) {
+        return this._addCheck({
+            kind: "multipleOf",
+            value: value,
+            message: errorUtil.toString(message),
+        });
+    }
+    finite(message) {
+        return this._addCheck({
+            kind: "finite",
+            message: errorUtil.toString(message),
+        });
+    }
+    safe(message) {
+        return this._addCheck({
+            kind: "min",
+            inclusive: true,
+            value: Number.MIN_SAFE_INTEGER,
+            message: errorUtil.toString(message),
+        })._addCheck({
+            kind: "max",
+            inclusive: true,
+            value: Number.MAX_SAFE_INTEGER,
+            message: errorUtil.toString(message),
+        });
+    }
+    get minValue() {
+        let min = null;
+        for (const ch of this._def.checks) {
+            if (ch.kind === "min") {
+                if (min === null || ch.value > min)
+                    min = ch.value;
+            }
+        }
+        return min;
+    }
+    get maxValue() {
+        let max = null;
+        for (const ch of this._def.checks) {
+            if (ch.kind === "max") {
+                if (max === null || ch.value < max)
+                    max = ch.value;
+            }
+        }
+        return max;
+    }
+    get isInt() {
+        return !!this._def.checks.find((ch) => ch.kind === "int" || (ch.kind === "multipleOf" && util.isInteger(ch.value)));
+    }
+    get isFinite() {
+        let max = null;
+        let min = null;
+        for (const ch of this._def.checks) {
+            if (ch.kind === "finite" || ch.kind === "int" || ch.kind === "multipleOf") {
+                return true;
+            }
+            else if (ch.kind === "min") {
+                if (min === null || ch.value > min)
+                    min = ch.value;
+            }
+            else if (ch.kind === "max") {
+                if (max === null || ch.value < max)
+                    max = ch.value;
+            }
+        }
+        return Number.isFinite(min) && Number.isFinite(max);
+    }
+}
+ZodNumber.create = (params) => {
+    return new ZodNumber({
+        checks: [],
+        typeName: ZodFirstPartyTypeKind.ZodNumber,
+        coerce: params?.coerce || false,
+        ...processCreateParams(params),
+    });
+};
+class ZodBigInt extends ZodType {
+    constructor() {
+        super(...arguments);
+        this.min = this.gte;
+        this.max = this.lte;
+    }
+    _parse(input) {
+        if (this._def.coerce) {
+            try {
+                input.data = BigInt(input.data);
+            }
+            catch {
+                return this._getInvalidInput(input);
+            }
+        }
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.bigint) {
+            return this._getInvalidInput(input);
+        }
+        let ctx = undefined;
+        const status = new ParseStatus();
+        for (const check of this._def.checks) {
+            if (check.kind === "min") {
+                const tooSmall = check.inclusive ? input.data < check.value : input.data <= check.value;
+                if (tooSmall) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.too_small,
+                        type: "bigint",
+                        minimum: check.value,
+                        inclusive: check.inclusive,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "max") {
+                const tooBig = check.inclusive ? input.data > check.value : input.data >= check.value;
+                if (tooBig) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.too_big,
+                        type: "bigint",
+                        maximum: check.value,
+                        inclusive: check.inclusive,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "multipleOf") {
+                if (input.data % check.value !== BigInt(0)) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.not_multiple_of,
+                        multipleOf: check.value,
+                        message: check.message,
+                    });
+                    status.dirty();
+                }
+            }
+            else {
+                util.assertNever(check);
+            }
+        }
+        return { status: status.value, value: input.data };
+    }
+    _getInvalidInput(input) {
+        const ctx = this._getOrReturnCtx(input);
+        addIssueToContext(ctx, {
+            code: ZodIssueCode.invalid_type,
+            expected: ZodParsedType.bigint,
+            received: ctx.parsedType,
+        });
+        return parseUtil_INVALID;
+    }
+    gte(value, message) {
+        return this.setLimit("min", value, true, errorUtil.toString(message));
+    }
+    gt(value, message) {
+        return this.setLimit("min", value, false, errorUtil.toString(message));
+    }
+    lte(value, message) {
+        return this.setLimit("max", value, true, errorUtil.toString(message));
+    }
+    lt(value, message) {
+        return this.setLimit("max", value, false, errorUtil.toString(message));
+    }
+    setLimit(kind, value, inclusive, message) {
+        return new ZodBigInt({
+            ...this._def,
+            checks: [
+                ...this._def.checks,
+                {
+                    kind,
+                    value,
+                    inclusive,
+                    message: errorUtil.toString(message),
+                },
+            ],
+        });
+    }
+    _addCheck(check) {
+        return new ZodBigInt({
+            ...this._def,
+            checks: [...this._def.checks, check],
+        });
+    }
+    positive(message) {
+        return this._addCheck({
+            kind: "min",
+            value: BigInt(0),
+            inclusive: false,
+            message: errorUtil.toString(message),
+        });
+    }
+    negative(message) {
+        return this._addCheck({
+            kind: "max",
+            value: BigInt(0),
+            inclusive: false,
+            message: errorUtil.toString(message),
+        });
+    }
+    nonpositive(message) {
+        return this._addCheck({
+            kind: "max",
+            value: BigInt(0),
+            inclusive: true,
+            message: errorUtil.toString(message),
+        });
+    }
+    nonnegative(message) {
+        return this._addCheck({
+            kind: "min",
+            value: BigInt(0),
+            inclusive: true,
+            message: errorUtil.toString(message),
+        });
+    }
+    multipleOf(value, message) {
+        return this._addCheck({
+            kind: "multipleOf",
+            value,
+            message: errorUtil.toString(message),
+        });
+    }
+    get minValue() {
+        let min = null;
+        for (const ch of this._def.checks) {
+            if (ch.kind === "min") {
+                if (min === null || ch.value > min)
+                    min = ch.value;
+            }
+        }
+        return min;
+    }
+    get maxValue() {
+        let max = null;
+        for (const ch of this._def.checks) {
+            if (ch.kind === "max") {
+                if (max === null || ch.value < max)
+                    max = ch.value;
+            }
+        }
+        return max;
+    }
+}
+ZodBigInt.create = (params) => {
+    return new ZodBigInt({
+        checks: [],
+        typeName: ZodFirstPartyTypeKind.ZodBigInt,
+        coerce: params?.coerce ?? false,
+        ...processCreateParams(params),
+    });
+};
+class ZodBoolean extends ZodType {
+    _parse(input) {
+        if (this._def.coerce) {
+            input.data = Boolean(input.data);
+        }
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.boolean) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.boolean,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        return OK(input.data);
+    }
+}
+ZodBoolean.create = (params) => {
+    return new ZodBoolean({
+        typeName: ZodFirstPartyTypeKind.ZodBoolean,
+        coerce: params?.coerce || false,
+        ...processCreateParams(params),
+    });
+};
+class ZodDate extends ZodType {
+    _parse(input) {
+        if (this._def.coerce) {
+            input.data = new Date(input.data);
+        }
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.date) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.date,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        if (Number.isNaN(input.data.getTime())) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_date,
+            });
+            return parseUtil_INVALID;
+        }
+        const status = new ParseStatus();
+        let ctx = undefined;
+        for (const check of this._def.checks) {
+            if (check.kind === "min") {
+                if (input.data.getTime() < check.value) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.too_small,
+                        message: check.message,
+                        inclusive: true,
+                        exact: false,
+                        minimum: check.value,
+                        type: "date",
+                    });
+                    status.dirty();
+                }
+            }
+            else if (check.kind === "max") {
+                if (input.data.getTime() > check.value) {
+                    ctx = this._getOrReturnCtx(input, ctx);
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.too_big,
+                        message: check.message,
+                        inclusive: true,
+                        exact: false,
+                        maximum: check.value,
+                        type: "date",
+                    });
+                    status.dirty();
+                }
+            }
+            else {
+                util.assertNever(check);
+            }
+        }
+        return {
+            status: status.value,
+            value: new Date(input.data.getTime()),
+        };
+    }
+    _addCheck(check) {
+        return new ZodDate({
+            ...this._def,
+            checks: [...this._def.checks, check],
+        });
+    }
+    min(minDate, message) {
+        return this._addCheck({
+            kind: "min",
+            value: minDate.getTime(),
+            message: errorUtil.toString(message),
+        });
+    }
+    max(maxDate, message) {
+        return this._addCheck({
+            kind: "max",
+            value: maxDate.getTime(),
+            message: errorUtil.toString(message),
+        });
+    }
+    get minDate() {
+        let min = null;
+        for (const ch of this._def.checks) {
+            if (ch.kind === "min") {
+                if (min === null || ch.value > min)
+                    min = ch.value;
+            }
+        }
+        return min != null ? new Date(min) : null;
+    }
+    get maxDate() {
+        let max = null;
+        for (const ch of this._def.checks) {
+            if (ch.kind === "max") {
+                if (max === null || ch.value < max)
+                    max = ch.value;
+            }
+        }
+        return max != null ? new Date(max) : null;
+    }
+}
+ZodDate.create = (params) => {
+    return new ZodDate({
+        checks: [],
+        coerce: params?.coerce || false,
+        typeName: ZodFirstPartyTypeKind.ZodDate,
+        ...processCreateParams(params),
+    });
+};
+class ZodSymbol extends ZodType {
+    _parse(input) {
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.symbol) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.symbol,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        return OK(input.data);
+    }
+}
+ZodSymbol.create = (params) => {
+    return new ZodSymbol({
+        typeName: ZodFirstPartyTypeKind.ZodSymbol,
+        ...processCreateParams(params),
+    });
+};
+class ZodUndefined extends ZodType {
+    _parse(input) {
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.undefined) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.undefined,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        return OK(input.data);
+    }
+}
+ZodUndefined.create = (params) => {
+    return new ZodUndefined({
+        typeName: ZodFirstPartyTypeKind.ZodUndefined,
+        ...processCreateParams(params),
+    });
+};
+class ZodNull extends ZodType {
+    _parse(input) {
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.null) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.null,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        return OK(input.data);
+    }
+}
+ZodNull.create = (params) => {
+    return new ZodNull({
+        typeName: ZodFirstPartyTypeKind.ZodNull,
+        ...processCreateParams(params),
+    });
+};
+class ZodAny extends ZodType {
+    constructor() {
+        super(...arguments);
+        // to prevent instances of other classes from extending ZodAny. this causes issues with catchall in ZodObject.
+        this._any = true;
+    }
+    _parse(input) {
+        return OK(input.data);
+    }
+}
+ZodAny.create = (params) => {
+    return new ZodAny({
+        typeName: ZodFirstPartyTypeKind.ZodAny,
+        ...processCreateParams(params),
+    });
+};
+class ZodUnknown extends ZodType {
+    constructor() {
+        super(...arguments);
+        // required
+        this._unknown = true;
+    }
+    _parse(input) {
+        return OK(input.data);
+    }
+}
+ZodUnknown.create = (params) => {
+    return new ZodUnknown({
+        typeName: ZodFirstPartyTypeKind.ZodUnknown,
+        ...processCreateParams(params),
+    });
+};
+class ZodNever extends ZodType {
+    _parse(input) {
+        const ctx = this._getOrReturnCtx(input);
+        addIssueToContext(ctx, {
+            code: ZodIssueCode.invalid_type,
+            expected: ZodParsedType.never,
+            received: ctx.parsedType,
+        });
+        return parseUtil_INVALID;
+    }
+}
+ZodNever.create = (params) => {
+    return new ZodNever({
+        typeName: ZodFirstPartyTypeKind.ZodNever,
+        ...processCreateParams(params),
+    });
+};
+class ZodVoid extends ZodType {
+    _parse(input) {
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.undefined) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.void,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        return OK(input.data);
+    }
+}
+ZodVoid.create = (params) => {
+    return new ZodVoid({
+        typeName: ZodFirstPartyTypeKind.ZodVoid,
+        ...processCreateParams(params),
+    });
+};
+class ZodArray extends ZodType {
+    _parse(input) {
+        const { ctx, status } = this._processInputParams(input);
+        const def = this._def;
+        if (ctx.parsedType !== ZodParsedType.array) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.array,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        if (def.exactLength !== null) {
+            const tooBig = ctx.data.length > def.exactLength.value;
+            const tooSmall = ctx.data.length < def.exactLength.value;
+            if (tooBig || tooSmall) {
+                addIssueToContext(ctx, {
+                    code: tooBig ? ZodIssueCode.too_big : ZodIssueCode.too_small,
+                    minimum: (tooSmall ? def.exactLength.value : undefined),
+                    maximum: (tooBig ? def.exactLength.value : undefined),
+                    type: "array",
+                    inclusive: true,
+                    exact: true,
+                    message: def.exactLength.message,
+                });
+                status.dirty();
+            }
+        }
+        if (def.minLength !== null) {
+            if (ctx.data.length < def.minLength.value) {
+                addIssueToContext(ctx, {
+                    code: ZodIssueCode.too_small,
+                    minimum: def.minLength.value,
+                    type: "array",
+                    inclusive: true,
+                    exact: false,
+                    message: def.minLength.message,
+                });
+                status.dirty();
+            }
+        }
+        if (def.maxLength !== null) {
+            if (ctx.data.length > def.maxLength.value) {
+                addIssueToContext(ctx, {
+                    code: ZodIssueCode.too_big,
+                    maximum: def.maxLength.value,
+                    type: "array",
+                    inclusive: true,
+                    exact: false,
+                    message: def.maxLength.message,
+                });
+                status.dirty();
+            }
+        }
+        if (ctx.common.async) {
+            return Promise.all([...ctx.data].map((item, i) => {
+                return def.type._parseAsync(new ParseInputLazyPath(ctx, item, ctx.path, i));
+            })).then((result) => {
+                return ParseStatus.mergeArray(status, result);
+            });
+        }
+        const result = [...ctx.data].map((item, i) => {
+            return def.type._parseSync(new ParseInputLazyPath(ctx, item, ctx.path, i));
+        });
+        return ParseStatus.mergeArray(status, result);
+    }
+    get element() {
+        return this._def.type;
+    }
+    min(minLength, message) {
+        return new ZodArray({
+            ...this._def,
+            minLength: { value: minLength, message: errorUtil.toString(message) },
+        });
+    }
+    max(maxLength, message) {
+        return new ZodArray({
+            ...this._def,
+            maxLength: { value: maxLength, message: errorUtil.toString(message) },
+        });
+    }
+    length(len, message) {
+        return new ZodArray({
+            ...this._def,
+            exactLength: { value: len, message: errorUtil.toString(message) },
+        });
+    }
+    nonempty(message) {
+        return this.min(1, message);
+    }
+}
+ZodArray.create = (schema, params) => {
+    return new ZodArray({
+        type: schema,
+        minLength: null,
+        maxLength: null,
+        exactLength: null,
+        typeName: ZodFirstPartyTypeKind.ZodArray,
+        ...processCreateParams(params),
+    });
+};
+function deepPartialify(schema) {
+    if (schema instanceof ZodObject) {
+        const newShape = {};
+        for (const key in schema.shape) {
+            const fieldSchema = schema.shape[key];
+            newShape[key] = ZodOptional.create(deepPartialify(fieldSchema));
+        }
+        return new ZodObject({
+            ...schema._def,
+            shape: () => newShape,
+        });
+    }
+    else if (schema instanceof ZodArray) {
+        return new ZodArray({
+            ...schema._def,
+            type: deepPartialify(schema.element),
+        });
+    }
+    else if (schema instanceof ZodOptional) {
+        return ZodOptional.create(deepPartialify(schema.unwrap()));
+    }
+    else if (schema instanceof ZodNullable) {
+        return ZodNullable.create(deepPartialify(schema.unwrap()));
+    }
+    else if (schema instanceof ZodTuple) {
+        return ZodTuple.create(schema.items.map((item) => deepPartialify(item)));
+    }
+    else {
+        return schema;
+    }
+}
+class ZodObject extends ZodType {
+    constructor() {
+        super(...arguments);
+        this._cached = null;
+        /**
+         * @deprecated In most cases, this is no longer needed - unknown properties are now silently stripped.
+         * If you want to pass through unknown properties, use `.passthrough()` instead.
+         */
+        this.nonstrict = this.passthrough;
+        // extend<
+        //   Augmentation extends ZodRawShape,
+        //   NewOutput extends util.flatten<{
+        //     [k in keyof Augmentation | keyof Output]: k extends keyof Augmentation
+        //       ? Augmentation[k]["_output"]
+        //       : k extends keyof Output
+        //       ? Output[k]
+        //       : never;
+        //   }>,
+        //   NewInput extends util.flatten<{
+        //     [k in keyof Augmentation | keyof Input]: k extends keyof Augmentation
+        //       ? Augmentation[k]["_input"]
+        //       : k extends keyof Input
+        //       ? Input[k]
+        //       : never;
+        //   }>
+        // >(
+        //   augmentation: Augmentation
+        // ): ZodObject<
+        //   extendShape<T, Augmentation>,
+        //   UnknownKeys,
+        //   Catchall,
+        //   NewOutput,
+        //   NewInput
+        // > {
+        //   return new ZodObject({
+        //     ...this._def,
+        //     shape: () => ({
+        //       ...this._def.shape(),
+        //       ...augmentation,
+        //     }),
+        //   }) as any;
+        // }
+        /**
+         * @deprecated Use `.extend` instead
+         *  */
+        this.augment = this.extend;
+    }
+    _getCached() {
+        if (this._cached !== null)
+            return this._cached;
+        const shape = this._def.shape();
+        const keys = util.objectKeys(shape);
+        this._cached = { shape, keys };
+        return this._cached;
+    }
+    _parse(input) {
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.object) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.object,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        const { status, ctx } = this._processInputParams(input);
+        const { shape, keys: shapeKeys } = this._getCached();
+        const extraKeys = [];
+        if (!(this._def.catchall instanceof ZodNever && this._def.unknownKeys === "strip")) {
+            for (const key in ctx.data) {
+                if (!shapeKeys.includes(key)) {
+                    extraKeys.push(key);
+                }
+            }
+        }
+        const pairs = [];
+        for (const key of shapeKeys) {
+            const keyValidator = shape[key];
+            const value = ctx.data[key];
+            pairs.push({
+                key: { status: "valid", value: key },
+                value: keyValidator._parse(new ParseInputLazyPath(ctx, value, ctx.path, key)),
+                alwaysSet: key in ctx.data,
+            });
+        }
+        if (this._def.catchall instanceof ZodNever) {
+            const unknownKeys = this._def.unknownKeys;
+            if (unknownKeys === "passthrough") {
+                for (const key of extraKeys) {
+                    pairs.push({
+                        key: { status: "valid", value: key },
+                        value: { status: "valid", value: ctx.data[key] },
+                    });
+                }
+            }
+            else if (unknownKeys === "strict") {
+                if (extraKeys.length > 0) {
+                    addIssueToContext(ctx, {
+                        code: ZodIssueCode.unrecognized_keys,
+                        keys: extraKeys,
+                    });
+                    status.dirty();
+                }
+            }
+            else if (unknownKeys === "strip") {
+            }
+            else {
+                throw new Error(`Internal ZodObject error: invalid unknownKeys value.`);
+            }
+        }
+        else {
+            // run catchall validation
+            const catchall = this._def.catchall;
+            for (const key of extraKeys) {
+                const value = ctx.data[key];
+                pairs.push({
+                    key: { status: "valid", value: key },
+                    value: catchall._parse(new ParseInputLazyPath(ctx, value, ctx.path, key) //, ctx.child(key), value, getParsedType(value)
+                    ),
+                    alwaysSet: key in ctx.data,
+                });
+            }
+        }
+        if (ctx.common.async) {
+            return Promise.resolve()
+                .then(async () => {
+                const syncPairs = [];
+                for (const pair of pairs) {
+                    const key = await pair.key;
+                    const value = await pair.value;
+                    syncPairs.push({
+                        key,
+                        value,
+                        alwaysSet: pair.alwaysSet,
+                    });
+                }
+                return syncPairs;
+            })
+                .then((syncPairs) => {
+                return ParseStatus.mergeObjectSync(status, syncPairs);
+            });
+        }
+        else {
+            return ParseStatus.mergeObjectSync(status, pairs);
+        }
+    }
+    get shape() {
+        return this._def.shape();
+    }
+    strict(message) {
+        errorUtil.errToObj;
+        return new ZodObject({
+            ...this._def,
+            unknownKeys: "strict",
+            ...(message !== undefined
+                ? {
+                    errorMap: (issue, ctx) => {
+                        const defaultError = this._def.errorMap?.(issue, ctx).message ?? ctx.defaultError;
+                        if (issue.code === "unrecognized_keys")
+                            return {
+                                message: errorUtil.errToObj(message).message ?? defaultError,
+                            };
+                        return {
+                            message: defaultError,
+                        };
+                    },
+                }
+                : {}),
+        });
+    }
+    strip() {
+        return new ZodObject({
+            ...this._def,
+            unknownKeys: "strip",
+        });
+    }
+    passthrough() {
+        return new ZodObject({
+            ...this._def,
+            unknownKeys: "passthrough",
+        });
+    }
+    // const AugmentFactory =
+    //   <Def extends ZodObjectDef>(def: Def) =>
+    //   <Augmentation extends ZodRawShape>(
+    //     augmentation: Augmentation
+    //   ): ZodObject<
+    //     extendShape<ReturnType<Def["shape"]>, Augmentation>,
+    //     Def["unknownKeys"],
+    //     Def["catchall"]
+    //   > => {
+    //     return new ZodObject({
+    //       ...def,
+    //       shape: () => ({
+    //         ...def.shape(),
+    //         ...augmentation,
+    //       }),
+    //     }) as any;
+    //   };
+    extend(augmentation) {
+        return new ZodObject({
+            ...this._def,
+            shape: () => ({
+                ...this._def.shape(),
+                ...augmentation,
+            }),
+        });
+    }
+    /**
+     * Prior to zod@1.0.12 there was a bug in the
+     * inferred type of merged objects. Please
+     * upgrade if you are experiencing issues.
+     */
+    merge(merging) {
+        const merged = new ZodObject({
+            unknownKeys: merging._def.unknownKeys,
+            catchall: merging._def.catchall,
+            shape: () => ({
+                ...this._def.shape(),
+                ...merging._def.shape(),
+            }),
+            typeName: ZodFirstPartyTypeKind.ZodObject,
+        });
+        return merged;
+    }
+    // merge<
+    //   Incoming extends AnyZodObject,
+    //   Augmentation extends Incoming["shape"],
+    //   NewOutput extends {
+    //     [k in keyof Augmentation | keyof Output]: k extends keyof Augmentation
+    //       ? Augmentation[k]["_output"]
+    //       : k extends keyof Output
+    //       ? Output[k]
+    //       : never;
+    //   },
+    //   NewInput extends {
+    //     [k in keyof Augmentation | keyof Input]: k extends keyof Augmentation
+    //       ? Augmentation[k]["_input"]
+    //       : k extends keyof Input
+    //       ? Input[k]
+    //       : never;
+    //   }
+    // >(
+    //   merging: Incoming
+    // ): ZodObject<
+    //   extendShape<T, ReturnType<Incoming["_def"]["shape"]>>,
+    //   Incoming["_def"]["unknownKeys"],
+    //   Incoming["_def"]["catchall"],
+    //   NewOutput,
+    //   NewInput
+    // > {
+    //   const merged: any = new ZodObject({
+    //     unknownKeys: merging._def.unknownKeys,
+    //     catchall: merging._def.catchall,
+    //     shape: () =>
+    //       objectUtil.mergeShapes(this._def.shape(), merging._def.shape()),
+    //     typeName: ZodFirstPartyTypeKind.ZodObject,
+    //   }) as any;
+    //   return merged;
+    // }
+    setKey(key, schema) {
+        return this.augment({ [key]: schema });
+    }
+    // merge<Incoming extends AnyZodObject>(
+    //   merging: Incoming
+    // ): //ZodObject<T & Incoming["_shape"], UnknownKeys, Catchall> = (merging) => {
+    // ZodObject<
+    //   extendShape<T, ReturnType<Incoming["_def"]["shape"]>>,
+    //   Incoming["_def"]["unknownKeys"],
+    //   Incoming["_def"]["catchall"]
+    // > {
+    //   // const mergedShape = objectUtil.mergeShapes(
+    //   //   this._def.shape(),
+    //   //   merging._def.shape()
+    //   // );
+    //   const merged: any = new ZodObject({
+    //     unknownKeys: merging._def.unknownKeys,
+    //     catchall: merging._def.catchall,
+    //     shape: () =>
+    //       objectUtil.mergeShapes(this._def.shape(), merging._def.shape()),
+    //     typeName: ZodFirstPartyTypeKind.ZodObject,
+    //   }) as any;
+    //   return merged;
+    // }
+    catchall(index) {
+        return new ZodObject({
+            ...this._def,
+            catchall: index,
+        });
+    }
+    pick(mask) {
+        const shape = {};
+        for (const key of util.objectKeys(mask)) {
+            if (mask[key] && this.shape[key]) {
+                shape[key] = this.shape[key];
+            }
+        }
+        return new ZodObject({
+            ...this._def,
+            shape: () => shape,
+        });
+    }
+    omit(mask) {
+        const shape = {};
+        for (const key of util.objectKeys(this.shape)) {
+            if (!mask[key]) {
+                shape[key] = this.shape[key];
+            }
+        }
+        return new ZodObject({
+            ...this._def,
+            shape: () => shape,
+        });
+    }
+    /**
+     * @deprecated
+     */
+    deepPartial() {
+        return deepPartialify(this);
+    }
+    partial(mask) {
+        const newShape = {};
+        for (const key of util.objectKeys(this.shape)) {
+            const fieldSchema = this.shape[key];
+            if (mask && !mask[key]) {
+                newShape[key] = fieldSchema;
+            }
+            else {
+                newShape[key] = fieldSchema.optional();
+            }
+        }
+        return new ZodObject({
+            ...this._def,
+            shape: () => newShape,
+        });
+    }
+    required(mask) {
+        const newShape = {};
+        for (const key of util.objectKeys(this.shape)) {
+            if (mask && !mask[key]) {
+                newShape[key] = this.shape[key];
+            }
+            else {
+                const fieldSchema = this.shape[key];
+                let newField = fieldSchema;
+                while (newField instanceof ZodOptional) {
+                    newField = newField._def.innerType;
+                }
+                newShape[key] = newField;
+            }
+        }
+        return new ZodObject({
+            ...this._def,
+            shape: () => newShape,
+        });
+    }
+    keyof() {
+        return createZodEnum(util.objectKeys(this.shape));
+    }
+}
+ZodObject.create = (shape, params) => {
+    return new ZodObject({
+        shape: () => shape,
+        unknownKeys: "strip",
+        catchall: ZodNever.create(),
+        typeName: ZodFirstPartyTypeKind.ZodObject,
+        ...processCreateParams(params),
+    });
+};
+ZodObject.strictCreate = (shape, params) => {
+    return new ZodObject({
+        shape: () => shape,
+        unknownKeys: "strict",
+        catchall: ZodNever.create(),
+        typeName: ZodFirstPartyTypeKind.ZodObject,
+        ...processCreateParams(params),
+    });
+};
+ZodObject.lazycreate = (shape, params) => {
+    return new ZodObject({
+        shape,
+        unknownKeys: "strip",
+        catchall: ZodNever.create(),
+        typeName: ZodFirstPartyTypeKind.ZodObject,
+        ...processCreateParams(params),
+    });
+};
+class ZodUnion extends ZodType {
+    _parse(input) {
+        const { ctx } = this._processInputParams(input);
+        const options = this._def.options;
+        function handleResults(results) {
+            // return first issue-free validation if it exists
+            for (const result of results) {
+                if (result.result.status === "valid") {
+                    return result.result;
+                }
+            }
+            for (const result of results) {
+                if (result.result.status === "dirty") {
+                    // add issues from dirty option
+                    ctx.common.issues.push(...result.ctx.common.issues);
+                    return result.result;
+                }
+            }
+            // return invalid
+            const unionErrors = results.map((result) => new ZodError(result.ctx.common.issues));
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_union,
+                unionErrors,
+            });
+            return parseUtil_INVALID;
+        }
+        if (ctx.common.async) {
+            return Promise.all(options.map(async (option) => {
+                const childCtx = {
+                    ...ctx,
+                    common: {
+                        ...ctx.common,
+                        issues: [],
+                    },
+                    parent: null,
+                };
+                return {
+                    result: await option._parseAsync({
+                        data: ctx.data,
+                        path: ctx.path,
+                        parent: childCtx,
+                    }),
+                    ctx: childCtx,
+                };
+            })).then(handleResults);
+        }
+        else {
+            let dirty = undefined;
+            const issues = [];
+            for (const option of options) {
+                const childCtx = {
+                    ...ctx,
+                    common: {
+                        ...ctx.common,
+                        issues: [],
+                    },
+                    parent: null,
+                };
+                const result = option._parseSync({
+                    data: ctx.data,
+                    path: ctx.path,
+                    parent: childCtx,
+                });
+                if (result.status === "valid") {
+                    return result;
+                }
+                else if (result.status === "dirty" && !dirty) {
+                    dirty = { result, ctx: childCtx };
+                }
+                if (childCtx.common.issues.length) {
+                    issues.push(childCtx.common.issues);
+                }
+            }
+            if (dirty) {
+                ctx.common.issues.push(...dirty.ctx.common.issues);
+                return dirty.result;
+            }
+            const unionErrors = issues.map((issues) => new ZodError(issues));
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_union,
+                unionErrors,
+            });
+            return parseUtil_INVALID;
+        }
+    }
+    get options() {
+        return this._def.options;
+    }
+}
+ZodUnion.create = (types, params) => {
+    return new ZodUnion({
+        options: types,
+        typeName: ZodFirstPartyTypeKind.ZodUnion,
+        ...processCreateParams(params),
+    });
+};
+/////////////////////////////////////////////////////
+/////////////////////////////////////////////////////
+//////////                                 //////////
+//////////      ZodDiscriminatedUnion      //////////
+//////////                                 //////////
+/////////////////////////////////////////////////////
+/////////////////////////////////////////////////////
+const getDiscriminator = (type) => {
+    if (type instanceof ZodLazy) {
+        return getDiscriminator(type.schema);
+    }
+    else if (type instanceof ZodEffects) {
+        return getDiscriminator(type.innerType());
+    }
+    else if (type instanceof ZodLiteral) {
+        return [type.value];
+    }
+    else if (type instanceof ZodEnum) {
+        return type.options;
+    }
+    else if (type instanceof ZodNativeEnum) {
+        // eslint-disable-next-line ban/ban
+        return util.objectValues(type.enum);
+    }
+    else if (type instanceof ZodDefault) {
+        return getDiscriminator(type._def.innerType);
+    }
+    else if (type instanceof ZodUndefined) {
+        return [undefined];
+    }
+    else if (type instanceof ZodNull) {
+        return [null];
+    }
+    else if (type instanceof ZodOptional) {
+        return [undefined, ...getDiscriminator(type.unwrap())];
+    }
+    else if (type instanceof ZodNullable) {
+        return [null, ...getDiscriminator(type.unwrap())];
+    }
+    else if (type instanceof ZodBranded) {
+        return getDiscriminator(type.unwrap());
+    }
+    else if (type instanceof ZodReadonly) {
+        return getDiscriminator(type.unwrap());
+    }
+    else if (type instanceof ZodCatch) {
+        return getDiscriminator(type._def.innerType);
+    }
+    else {
+        return [];
+    }
+};
+class ZodDiscriminatedUnion extends ZodType {
+    _parse(input) {
+        const { ctx } = this._processInputParams(input);
+        if (ctx.parsedType !== ZodParsedType.object) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.object,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        const discriminator = this.discriminator;
+        const discriminatorValue = ctx.data[discriminator];
+        const option = this.optionsMap.get(discriminatorValue);
+        if (!option) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_union_discriminator,
+                options: Array.from(this.optionsMap.keys()),
+                path: [discriminator],
+            });
+            return parseUtil_INVALID;
+        }
+        if (ctx.common.async) {
+            return option._parseAsync({
+                data: ctx.data,
+                path: ctx.path,
+                parent: ctx,
+            });
+        }
+        else {
+            return option._parseSync({
+                data: ctx.data,
+                path: ctx.path,
+                parent: ctx,
+            });
+        }
+    }
+    get discriminator() {
+        return this._def.discriminator;
+    }
+    get options() {
+        return this._def.options;
+    }
+    get optionsMap() {
+        return this._def.optionsMap;
+    }
+    /**
+     * The constructor of the discriminated union schema. Its behaviour is very similar to that of the normal z.union() constructor.
+     * However, it only allows a union of objects, all of which need to share a discriminator property. This property must
+     * have a different value for each object in the union.
+     * @param discriminator the name of the discriminator property
+     * @param types an array of object schemas
+     * @param params
+     */
+    static create(discriminator, options, params) {
+        // Get all the valid discriminator values
+        const optionsMap = new Map();
+        // try {
+        for (const type of options) {
+            const discriminatorValues = getDiscriminator(type.shape[discriminator]);
+            if (!discriminatorValues.length) {
+                throw new Error(`A discriminator value for key \`${discriminator}\` could not be extracted from all schema options`);
+            }
+            for (const value of discriminatorValues) {
+                if (optionsMap.has(value)) {
+                    throw new Error(`Discriminator property ${String(discriminator)} has duplicate value ${String(value)}`);
+                }
+                optionsMap.set(value, type);
+            }
+        }
+        return new ZodDiscriminatedUnion({
+            typeName: ZodFirstPartyTypeKind.ZodDiscriminatedUnion,
+            discriminator,
+            options,
+            optionsMap,
+            ...processCreateParams(params),
+        });
+    }
+}
+function mergeValues(a, b) {
+    const aType = getParsedType(a);
+    const bType = getParsedType(b);
+    if (a === b) {
+        return { valid: true, data: a };
+    }
+    else if (aType === ZodParsedType.object && bType === ZodParsedType.object) {
+        const bKeys = util.objectKeys(b);
+        const sharedKeys = util.objectKeys(a).filter((key) => bKeys.indexOf(key) !== -1);
+        const newObj = { ...a, ...b };
+        for (const key of sharedKeys) {
+            const sharedValue = mergeValues(a[key], b[key]);
+            if (!sharedValue.valid) {
+                return { valid: false };
+            }
+            newObj[key] = sharedValue.data;
+        }
+        return { valid: true, data: newObj };
+    }
+    else if (aType === ZodParsedType.array && bType === ZodParsedType.array) {
+        if (a.length !== b.length) {
+            return { valid: false };
+        }
+        const newArray = [];
+        for (let index = 0; index < a.length; index++) {
+            const itemA = a[index];
+            const itemB = b[index];
+            const sharedValue = mergeValues(itemA, itemB);
+            if (!sharedValue.valid) {
+                return { valid: false };
+            }
+            newArray.push(sharedValue.data);
+        }
+        return { valid: true, data: newArray };
+    }
+    else if (aType === ZodParsedType.date && bType === ZodParsedType.date && +a === +b) {
+        return { valid: true, data: a };
+    }
+    else {
+        return { valid: false };
+    }
+}
+class ZodIntersection extends ZodType {
+    _parse(input) {
+        const { status, ctx } = this._processInputParams(input);
+        const handleParsed = (parsedLeft, parsedRight) => {
+            if (isAborted(parsedLeft) || isAborted(parsedRight)) {
+                return parseUtil_INVALID;
+            }
+            const merged = mergeValues(parsedLeft.value, parsedRight.value);
+            if (!merged.valid) {
+                addIssueToContext(ctx, {
+                    code: ZodIssueCode.invalid_intersection_types,
+                });
+                return parseUtil_INVALID;
+            }
+            if (isDirty(parsedLeft) || isDirty(parsedRight)) {
+                status.dirty();
+            }
+            return { status: status.value, value: merged.data };
+        };
+        if (ctx.common.async) {
+            return Promise.all([
+                this._def.left._parseAsync({
+                    data: ctx.data,
+                    path: ctx.path,
+                    parent: ctx,
+                }),
+                this._def.right._parseAsync({
+                    data: ctx.data,
+                    path: ctx.path,
+                    parent: ctx,
+                }),
+            ]).then(([left, right]) => handleParsed(left, right));
+        }
+        else {
+            return handleParsed(this._def.left._parseSync({
+                data: ctx.data,
+                path: ctx.path,
+                parent: ctx,
+            }), this._def.right._parseSync({
+                data: ctx.data,
+                path: ctx.path,
+                parent: ctx,
+            }));
+        }
+    }
+}
+ZodIntersection.create = (left, right, params) => {
+    return new ZodIntersection({
+        left: left,
+        right: right,
+        typeName: ZodFirstPartyTypeKind.ZodIntersection,
+        ...processCreateParams(params),
+    });
+};
+// type ZodTupleItems = [ZodTypeAny, ...ZodTypeAny[]];
+class ZodTuple extends ZodType {
+    _parse(input) {
+        const { status, ctx } = this._processInputParams(input);
+        if (ctx.parsedType !== ZodParsedType.array) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.array,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        if (ctx.data.length < this._def.items.length) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.too_small,
+                minimum: this._def.items.length,
+                inclusive: true,
+                exact: false,
+                type: "array",
+            });
+            return parseUtil_INVALID;
+        }
+        const rest = this._def.rest;
+        if (!rest && ctx.data.length > this._def.items.length) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.too_big,
+                maximum: this._def.items.length,
+                inclusive: true,
+                exact: false,
+                type: "array",
+            });
+            status.dirty();
+        }
+        const items = [...ctx.data]
+            .map((item, itemIndex) => {
+            const schema = this._def.items[itemIndex] || this._def.rest;
+            if (!schema)
+                return null;
+            return schema._parse(new ParseInputLazyPath(ctx, item, ctx.path, itemIndex));
+        })
+            .filter((x) => !!x); // filter nulls
+        if (ctx.common.async) {
+            return Promise.all(items).then((results) => {
+                return ParseStatus.mergeArray(status, results);
+            });
+        }
+        else {
+            return ParseStatus.mergeArray(status, items);
+        }
+    }
+    get items() {
+        return this._def.items;
+    }
+    rest(rest) {
+        return new ZodTuple({
+            ...this._def,
+            rest,
+        });
+    }
+}
+ZodTuple.create = (schemas, params) => {
+    if (!Array.isArray(schemas)) {
+        throw new Error("You must pass an array of schemas to z.tuple([ ... ])");
+    }
+    return new ZodTuple({
+        items: schemas,
+        typeName: ZodFirstPartyTypeKind.ZodTuple,
+        rest: null,
+        ...processCreateParams(params),
+    });
+};
+class ZodRecord extends ZodType {
+    get keySchema() {
+        return this._def.keyType;
+    }
+    get valueSchema() {
+        return this._def.valueType;
+    }
+    _parse(input) {
+        const { status, ctx } = this._processInputParams(input);
+        if (ctx.parsedType !== ZodParsedType.object) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.object,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        const pairs = [];
+        const keyType = this._def.keyType;
+        const valueType = this._def.valueType;
+        for (const key in ctx.data) {
+            pairs.push({
+                key: keyType._parse(new ParseInputLazyPath(ctx, key, ctx.path, key)),
+                value: valueType._parse(new ParseInputLazyPath(ctx, ctx.data[key], ctx.path, key)),
+                alwaysSet: key in ctx.data,
+            });
+        }
+        if (ctx.common.async) {
+            return ParseStatus.mergeObjectAsync(status, pairs);
+        }
+        else {
+            return ParseStatus.mergeObjectSync(status, pairs);
+        }
+    }
+    get element() {
+        return this._def.valueType;
+    }
+    static create(first, second, third) {
+        if (second instanceof ZodType) {
+            return new ZodRecord({
+                keyType: first,
+                valueType: second,
+                typeName: ZodFirstPartyTypeKind.ZodRecord,
+                ...processCreateParams(third),
+            });
+        }
+        return new ZodRecord({
+            keyType: ZodString.create(),
+            valueType: first,
+            typeName: ZodFirstPartyTypeKind.ZodRecord,
+            ...processCreateParams(second),
+        });
+    }
+}
+class ZodMap extends ZodType {
+    get keySchema() {
+        return this._def.keyType;
+    }
+    get valueSchema() {
+        return this._def.valueType;
+    }
+    _parse(input) {
+        const { status, ctx } = this._processInputParams(input);
+        if (ctx.parsedType !== ZodParsedType.map) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.map,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        const keyType = this._def.keyType;
+        const valueType = this._def.valueType;
+        const pairs = [...ctx.data.entries()].map(([key, value], index) => {
+            return {
+                key: keyType._parse(new ParseInputLazyPath(ctx, key, ctx.path, [index, "key"])),
+                value: valueType._parse(new ParseInputLazyPath(ctx, value, ctx.path, [index, "value"])),
+            };
+        });
+        if (ctx.common.async) {
+            const finalMap = new Map();
+            return Promise.resolve().then(async () => {
+                for (const pair of pairs) {
+                    const key = await pair.key;
+                    const value = await pair.value;
+                    if (key.status === "aborted" || value.status === "aborted") {
+                        return parseUtil_INVALID;
+                    }
+                    if (key.status === "dirty" || value.status === "dirty") {
+                        status.dirty();
+                    }
+                    finalMap.set(key.value, value.value);
+                }
+                return { status: status.value, value: finalMap };
+            });
+        }
+        else {
+            const finalMap = new Map();
+            for (const pair of pairs) {
+                const key = pair.key;
+                const value = pair.value;
+                if (key.status === "aborted" || value.status === "aborted") {
+                    return parseUtil_INVALID;
+                }
+                if (key.status === "dirty" || value.status === "dirty") {
+                    status.dirty();
+                }
+                finalMap.set(key.value, value.value);
+            }
+            return { status: status.value, value: finalMap };
+        }
+    }
+}
+ZodMap.create = (keyType, valueType, params) => {
+    return new ZodMap({
+        valueType,
+        keyType,
+        typeName: ZodFirstPartyTypeKind.ZodMap,
+        ...processCreateParams(params),
+    });
+};
+class ZodSet extends ZodType {
+    _parse(input) {
+        const { status, ctx } = this._processInputParams(input);
+        if (ctx.parsedType !== ZodParsedType.set) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.set,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        const def = this._def;
+        if (def.minSize !== null) {
+            if (ctx.data.size < def.minSize.value) {
+                addIssueToContext(ctx, {
+                    code: ZodIssueCode.too_small,
+                    minimum: def.minSize.value,
+                    type: "set",
+                    inclusive: true,
+                    exact: false,
+                    message: def.minSize.message,
+                });
+                status.dirty();
+            }
+        }
+        if (def.maxSize !== null) {
+            if (ctx.data.size > def.maxSize.value) {
+                addIssueToContext(ctx, {
+                    code: ZodIssueCode.too_big,
+                    maximum: def.maxSize.value,
+                    type: "set",
+                    inclusive: true,
+                    exact: false,
+                    message: def.maxSize.message,
+                });
+                status.dirty();
+            }
+        }
+        const valueType = this._def.valueType;
+        function finalizeSet(elements) {
+            const parsedSet = new Set();
+            for (const element of elements) {
+                if (element.status === "aborted")
+                    return parseUtil_INVALID;
+                if (element.status === "dirty")
+                    status.dirty();
+                parsedSet.add(element.value);
+            }
+            return { status: status.value, value: parsedSet };
+        }
+        const elements = [...ctx.data.values()].map((item, i) => valueType._parse(new ParseInputLazyPath(ctx, item, ctx.path, i)));
+        if (ctx.common.async) {
+            return Promise.all(elements).then((elements) => finalizeSet(elements));
+        }
+        else {
+            return finalizeSet(elements);
+        }
+    }
+    min(minSize, message) {
+        return new ZodSet({
+            ...this._def,
+            minSize: { value: minSize, message: errorUtil.toString(message) },
+        });
+    }
+    max(maxSize, message) {
+        return new ZodSet({
+            ...this._def,
+            maxSize: { value: maxSize, message: errorUtil.toString(message) },
+        });
+    }
+    size(size, message) {
+        return this.min(size, message).max(size, message);
+    }
+    nonempty(message) {
+        return this.min(1, message);
+    }
+}
+ZodSet.create = (valueType, params) => {
+    return new ZodSet({
+        valueType,
+        minSize: null,
+        maxSize: null,
+        typeName: ZodFirstPartyTypeKind.ZodSet,
+        ...processCreateParams(params),
+    });
+};
+class ZodFunction extends ZodType {
+    constructor() {
+        super(...arguments);
+        this.validate = this.implement;
+    }
+    _parse(input) {
+        const { ctx } = this._processInputParams(input);
+        if (ctx.parsedType !== ZodParsedType.function) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.function,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        function makeArgsIssue(args, error) {
+            return makeIssue({
+                data: args,
+                path: ctx.path,
+                errorMaps: [ctx.common.contextualErrorMap, ctx.schemaErrorMap, getErrorMap(), en].filter((x) => !!x),
+                issueData: {
+                    code: ZodIssueCode.invalid_arguments,
+                    argumentsError: error,
+                },
+            });
+        }
+        function makeReturnsIssue(returns, error) {
+            return makeIssue({
+                data: returns,
+                path: ctx.path,
+                errorMaps: [ctx.common.contextualErrorMap, ctx.schemaErrorMap, getErrorMap(), en].filter((x) => !!x),
+                issueData: {
+                    code: ZodIssueCode.invalid_return_type,
+                    returnTypeError: error,
+                },
+            });
+        }
+        const params = { errorMap: ctx.common.contextualErrorMap };
+        const fn = ctx.data;
+        if (this._def.returns instanceof ZodPromise) {
+            // Would love a way to avoid disabling this rule, but we need
+            // an alias (using an arrow function was what caused 2651).
+            // eslint-disable-next-line @typescript-eslint/no-this-alias
+            const me = this;
+            return OK(async function (...args) {
+                const error = new ZodError([]);
+                const parsedArgs = await me._def.args.parseAsync(args, params).catch((e) => {
+                    error.addIssue(makeArgsIssue(args, e));
+                    throw error;
+                });
+                const result = await Reflect.apply(fn, this, parsedArgs);
+                const parsedReturns = await me._def.returns._def.type
+                    .parseAsync(result, params)
+                    .catch((e) => {
+                    error.addIssue(makeReturnsIssue(result, e));
+                    throw error;
+                });
+                return parsedReturns;
+            });
+        }
+        else {
+            // Would love a way to avoid disabling this rule, but we need
+            // an alias (using an arrow function was what caused 2651).
+            // eslint-disable-next-line @typescript-eslint/no-this-alias
+            const me = this;
+            return OK(function (...args) {
+                const parsedArgs = me._def.args.safeParse(args, params);
+                if (!parsedArgs.success) {
+                    throw new ZodError([makeArgsIssue(args, parsedArgs.error)]);
+                }
+                const result = Reflect.apply(fn, this, parsedArgs.data);
+                const parsedReturns = me._def.returns.safeParse(result, params);
+                if (!parsedReturns.success) {
+                    throw new ZodError([makeReturnsIssue(result, parsedReturns.error)]);
+                }
+                return parsedReturns.data;
+            });
+        }
+    }
+    parameters() {
+        return this._def.args;
+    }
+    returnType() {
+        return this._def.returns;
+    }
+    args(...items) {
+        return new ZodFunction({
+            ...this._def,
+            args: ZodTuple.create(items).rest(ZodUnknown.create()),
+        });
+    }
+    returns(returnType) {
+        return new ZodFunction({
+            ...this._def,
+            returns: returnType,
+        });
+    }
+    implement(func) {
+        const validatedFunc = this.parse(func);
+        return validatedFunc;
+    }
+    strictImplement(func) {
+        const validatedFunc = this.parse(func);
+        return validatedFunc;
+    }
+    static create(args, returns, params) {
+        return new ZodFunction({
+            args: (args ? args : ZodTuple.create([]).rest(ZodUnknown.create())),
+            returns: returns || ZodUnknown.create(),
+            typeName: ZodFirstPartyTypeKind.ZodFunction,
+            ...processCreateParams(params),
+        });
+    }
+}
+class ZodLazy extends ZodType {
+    get schema() {
+        return this._def.getter();
+    }
+    _parse(input) {
+        const { ctx } = this._processInputParams(input);
+        const lazySchema = this._def.getter();
+        return lazySchema._parse({ data: ctx.data, path: ctx.path, parent: ctx });
+    }
+}
+ZodLazy.create = (getter, params) => {
+    return new ZodLazy({
+        getter: getter,
+        typeName: ZodFirstPartyTypeKind.ZodLazy,
+        ...processCreateParams(params),
+    });
+};
+class ZodLiteral extends ZodType {
+    _parse(input) {
+        if (input.data !== this._def.value) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                received: ctx.data,
+                code: ZodIssueCode.invalid_literal,
+                expected: this._def.value,
+            });
+            return parseUtil_INVALID;
+        }
+        return { status: "valid", value: input.data };
+    }
+    get value() {
+        return this._def.value;
+    }
+}
+ZodLiteral.create = (value, params) => {
+    return new ZodLiteral({
+        value: value,
+        typeName: ZodFirstPartyTypeKind.ZodLiteral,
+        ...processCreateParams(params),
+    });
+};
+function createZodEnum(values, params) {
+    return new ZodEnum({
+        values,
+        typeName: ZodFirstPartyTypeKind.ZodEnum,
+        ...processCreateParams(params),
+    });
+}
+class ZodEnum extends ZodType {
+    _parse(input) {
+        if (typeof input.data !== "string") {
+            const ctx = this._getOrReturnCtx(input);
+            const expectedValues = this._def.values;
+            addIssueToContext(ctx, {
+                expected: util.joinValues(expectedValues),
+                received: ctx.parsedType,
+                code: ZodIssueCode.invalid_type,
+            });
+            return parseUtil_INVALID;
+        }
+        if (!this._cache) {
+            this._cache = new Set(this._def.values);
+        }
+        if (!this._cache.has(input.data)) {
+            const ctx = this._getOrReturnCtx(input);
+            const expectedValues = this._def.values;
+            addIssueToContext(ctx, {
+                received: ctx.data,
+                code: ZodIssueCode.invalid_enum_value,
+                options: expectedValues,
+            });
+            return parseUtil_INVALID;
+        }
+        return OK(input.data);
+    }
+    get options() {
+        return this._def.values;
+    }
+    get enum() {
+        const enumValues = {};
+        for (const val of this._def.values) {
+            enumValues[val] = val;
+        }
+        return enumValues;
+    }
+    get Values() {
+        const enumValues = {};
+        for (const val of this._def.values) {
+            enumValues[val] = val;
+        }
+        return enumValues;
+    }
+    get Enum() {
+        const enumValues = {};
+        for (const val of this._def.values) {
+            enumValues[val] = val;
+        }
+        return enumValues;
+    }
+    extract(values, newDef = this._def) {
+        return ZodEnum.create(values, {
+            ...this._def,
+            ...newDef,
+        });
+    }
+    exclude(values, newDef = this._def) {
+        return ZodEnum.create(this.options.filter((opt) => !values.includes(opt)), {
+            ...this._def,
+            ...newDef,
+        });
+    }
+}
+ZodEnum.create = createZodEnum;
+class ZodNativeEnum extends ZodType {
+    _parse(input) {
+        const nativeEnumValues = util.getValidEnumValues(this._def.values);
+        const ctx = this._getOrReturnCtx(input);
+        if (ctx.parsedType !== ZodParsedType.string && ctx.parsedType !== ZodParsedType.number) {
+            const expectedValues = util.objectValues(nativeEnumValues);
+            addIssueToContext(ctx, {
+                expected: util.joinValues(expectedValues),
+                received: ctx.parsedType,
+                code: ZodIssueCode.invalid_type,
+            });
+            return parseUtil_INVALID;
+        }
+        if (!this._cache) {
+            this._cache = new Set(util.getValidEnumValues(this._def.values));
+        }
+        if (!this._cache.has(input.data)) {
+            const expectedValues = util.objectValues(nativeEnumValues);
+            addIssueToContext(ctx, {
+                received: ctx.data,
+                code: ZodIssueCode.invalid_enum_value,
+                options: expectedValues,
+            });
+            return parseUtil_INVALID;
+        }
+        return OK(input.data);
+    }
+    get enum() {
+        return this._def.values;
+    }
+}
+ZodNativeEnum.create = (values, params) => {
+    return new ZodNativeEnum({
+        values: values,
+        typeName: ZodFirstPartyTypeKind.ZodNativeEnum,
+        ...processCreateParams(params),
+    });
+};
+class ZodPromise extends ZodType {
+    unwrap() {
+        return this._def.type;
+    }
+    _parse(input) {
+        const { ctx } = this._processInputParams(input);
+        if (ctx.parsedType !== ZodParsedType.promise && ctx.common.async === false) {
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.promise,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        const promisified = ctx.parsedType === ZodParsedType.promise ? ctx.data : Promise.resolve(ctx.data);
+        return OK(promisified.then((data) => {
+            return this._def.type.parseAsync(data, {
+                path: ctx.path,
+                errorMap: ctx.common.contextualErrorMap,
+            });
+        }));
+    }
+}
+ZodPromise.create = (schema, params) => {
+    return new ZodPromise({
+        type: schema,
+        typeName: ZodFirstPartyTypeKind.ZodPromise,
+        ...processCreateParams(params),
+    });
+};
+class ZodEffects extends ZodType {
+    innerType() {
+        return this._def.schema;
+    }
+    sourceType() {
+        return this._def.schema._def.typeName === ZodFirstPartyTypeKind.ZodEffects
+            ? this._def.schema.sourceType()
+            : this._def.schema;
+    }
+    _parse(input) {
+        const { status, ctx } = this._processInputParams(input);
+        const effect = this._def.effect || null;
+        const checkCtx = {
+            addIssue: (arg) => {
+                addIssueToContext(ctx, arg);
+                if (arg.fatal) {
+                    status.abort();
+                }
+                else {
+                    status.dirty();
+                }
+            },
+            get path() {
+                return ctx.path;
+            },
+        };
+        checkCtx.addIssue = checkCtx.addIssue.bind(checkCtx);
+        if (effect.type === "preprocess") {
+            const processed = effect.transform(ctx.data, checkCtx);
+            if (ctx.common.async) {
+                return Promise.resolve(processed).then(async (processed) => {
+                    if (status.value === "aborted")
+                        return parseUtil_INVALID;
+                    const result = await this._def.schema._parseAsync({
+                        data: processed,
+                        path: ctx.path,
+                        parent: ctx,
+                    });
+                    if (result.status === "aborted")
+                        return parseUtil_INVALID;
+                    if (result.status === "dirty")
+                        return DIRTY(result.value);
+                    if (status.value === "dirty")
+                        return DIRTY(result.value);
+                    return result;
+                });
+            }
+            else {
+                if (status.value === "aborted")
+                    return parseUtil_INVALID;
+                const result = this._def.schema._parseSync({
+                    data: processed,
+                    path: ctx.path,
+                    parent: ctx,
+                });
+                if (result.status === "aborted")
+                    return parseUtil_INVALID;
+                if (result.status === "dirty")
+                    return DIRTY(result.value);
+                if (status.value === "dirty")
+                    return DIRTY(result.value);
+                return result;
+            }
+        }
+        if (effect.type === "refinement") {
+            const executeRefinement = (acc) => {
+                const result = effect.refinement(acc, checkCtx);
+                if (ctx.common.async) {
+                    return Promise.resolve(result);
+                }
+                if (result instanceof Promise) {
+                    throw new Error("Async refinement encountered during synchronous parse operation. Use .parseAsync instead.");
+                }
+                return acc;
+            };
+            if (ctx.common.async === false) {
+                const inner = this._def.schema._parseSync({
+                    data: ctx.data,
+                    path: ctx.path,
+                    parent: ctx,
+                });
+                if (inner.status === "aborted")
+                    return parseUtil_INVALID;
+                if (inner.status === "dirty")
+                    status.dirty();
+                // return value is ignored
+                executeRefinement(inner.value);
+                return { status: status.value, value: inner.value };
+            }
+            else {
+                return this._def.schema._parseAsync({ data: ctx.data, path: ctx.path, parent: ctx }).then((inner) => {
+                    if (inner.status === "aborted")
+                        return parseUtil_INVALID;
+                    if (inner.status === "dirty")
+                        status.dirty();
+                    return executeRefinement(inner.value).then(() => {
+                        return { status: status.value, value: inner.value };
+                    });
+                });
+            }
+        }
+        if (effect.type === "transform") {
+            if (ctx.common.async === false) {
+                const base = this._def.schema._parseSync({
+                    data: ctx.data,
+                    path: ctx.path,
+                    parent: ctx,
+                });
+                if (!isValid(base))
+                    return parseUtil_INVALID;
+                const result = effect.transform(base.value, checkCtx);
+                if (result instanceof Promise) {
+                    throw new Error(`Asynchronous transform encountered during synchronous parse operation. Use .parseAsync instead.`);
+                }
+                return { status: status.value, value: result };
+            }
+            else {
+                return this._def.schema._parseAsync({ data: ctx.data, path: ctx.path, parent: ctx }).then((base) => {
+                    if (!isValid(base))
+                        return parseUtil_INVALID;
+                    return Promise.resolve(effect.transform(base.value, checkCtx)).then((result) => ({
+                        status: status.value,
+                        value: result,
+                    }));
+                });
+            }
+        }
+        util.assertNever(effect);
+    }
+}
+ZodEffects.create = (schema, effect, params) => {
+    return new ZodEffects({
+        schema,
+        typeName: ZodFirstPartyTypeKind.ZodEffects,
+        effect,
+        ...processCreateParams(params),
+    });
+};
+ZodEffects.createWithPreprocess = (preprocess, schema, params) => {
+    return new ZodEffects({
+        schema,
+        effect: { type: "preprocess", transform: preprocess },
+        typeName: ZodFirstPartyTypeKind.ZodEffects,
+        ...processCreateParams(params),
+    });
+};
+
+class ZodOptional extends ZodType {
+    _parse(input) {
+        const parsedType = this._getType(input);
+        if (parsedType === ZodParsedType.undefined) {
+            return OK(undefined);
+        }
+        return this._def.innerType._parse(input);
+    }
+    unwrap() {
+        return this._def.innerType;
+    }
+}
+ZodOptional.create = (type, params) => {
+    return new ZodOptional({
+        innerType: type,
+        typeName: ZodFirstPartyTypeKind.ZodOptional,
+        ...processCreateParams(params),
+    });
+};
+class ZodNullable extends ZodType {
+    _parse(input) {
+        const parsedType = this._getType(input);
+        if (parsedType === ZodParsedType.null) {
+            return OK(null);
+        }
+        return this._def.innerType._parse(input);
+    }
+    unwrap() {
+        return this._def.innerType;
+    }
+}
+ZodNullable.create = (type, params) => {
+    return new ZodNullable({
+        innerType: type,
+        typeName: ZodFirstPartyTypeKind.ZodNullable,
+        ...processCreateParams(params),
+    });
+};
+class ZodDefault extends ZodType {
+    _parse(input) {
+        const { ctx } = this._processInputParams(input);
+        let data = ctx.data;
+        if (ctx.parsedType === ZodParsedType.undefined) {
+            data = this._def.defaultValue();
+        }
+        return this._def.innerType._parse({
+            data,
+            path: ctx.path,
+            parent: ctx,
+        });
+    }
+    removeDefault() {
+        return this._def.innerType;
+    }
+}
+ZodDefault.create = (type, params) => {
+    return new ZodDefault({
+        innerType: type,
+        typeName: ZodFirstPartyTypeKind.ZodDefault,
+        defaultValue: typeof params.default === "function" ? params.default : () => params.default,
+        ...processCreateParams(params),
+    });
+};
+class ZodCatch extends ZodType {
+    _parse(input) {
+        const { ctx } = this._processInputParams(input);
+        // newCtx is used to not collect issues from inner types in ctx
+        const newCtx = {
+            ...ctx,
+            common: {
+                ...ctx.common,
+                issues: [],
+            },
+        };
+        const result = this._def.innerType._parse({
+            data: newCtx.data,
+            path: newCtx.path,
+            parent: {
+                ...newCtx,
+            },
+        });
+        if (isAsync(result)) {
+            return result.then((result) => {
+                return {
+                    status: "valid",
+                    value: result.status === "valid"
+                        ? result.value
+                        : this._def.catchValue({
+                            get error() {
+                                return new ZodError(newCtx.common.issues);
+                            },
+                            input: newCtx.data,
+                        }),
+                };
+            });
+        }
+        else {
+            return {
+                status: "valid",
+                value: result.status === "valid"
+                    ? result.value
+                    : this._def.catchValue({
+                        get error() {
+                            return new ZodError(newCtx.common.issues);
+                        },
+                        input: newCtx.data,
+                    }),
+            };
+        }
+    }
+    removeCatch() {
+        return this._def.innerType;
+    }
+}
+ZodCatch.create = (type, params) => {
+    return new ZodCatch({
+        innerType: type,
+        typeName: ZodFirstPartyTypeKind.ZodCatch,
+        catchValue: typeof params.catch === "function" ? params.catch : () => params.catch,
+        ...processCreateParams(params),
+    });
+};
+class ZodNaN extends ZodType {
+    _parse(input) {
+        const parsedType = this._getType(input);
+        if (parsedType !== ZodParsedType.nan) {
+            const ctx = this._getOrReturnCtx(input);
+            addIssueToContext(ctx, {
+                code: ZodIssueCode.invalid_type,
+                expected: ZodParsedType.nan,
+                received: ctx.parsedType,
+            });
+            return parseUtil_INVALID;
+        }
+        return { status: "valid", value: input.data };
+    }
+}
+ZodNaN.create = (params) => {
+    return new ZodNaN({
+        typeName: ZodFirstPartyTypeKind.ZodNaN,
+        ...processCreateParams(params),
+    });
+};
+const BRAND = Symbol("zod_brand");
+class ZodBranded extends ZodType {
+    _parse(input) {
+        const { ctx } = this._processInputParams(input);
+        const data = ctx.data;
+        return this._def.type._parse({
+            data,
+            path: ctx.path,
+            parent: ctx,
+        });
+    }
+    unwrap() {
+        return this._def.type;
+    }
+}
+class ZodPipeline extends ZodType {
+    _parse(input) {
+        const { status, ctx } = this._processInputParams(input);
+        if (ctx.common.async) {
+            const handleAsync = async () => {
+                const inResult = await this._def.in._parseAsync({
+                    data: ctx.data,
+                    path: ctx.path,
+                    parent: ctx,
+                });
+                if (inResult.status === "aborted")
+                    return parseUtil_INVALID;
+                if (inResult.status === "dirty") {
+                    status.dirty();
+                    return DIRTY(inResult.value);
+                }
+                else {
+                    return this._def.out._parseAsync({
+                        data: inResult.value,
+                        path: ctx.path,
+                        parent: ctx,
+                    });
+                }
+            };
+            return handleAsync();
+        }
+        else {
+            const inResult = this._def.in._parseSync({
+                data: ctx.data,
+                path: ctx.path,
+                parent: ctx,
+            });
+            if (inResult.status === "aborted")
+                return parseUtil_INVALID;
+            if (inResult.status === "dirty") {
+                status.dirty();
+                return {
+                    status: "dirty",
+                    value: inResult.value,
+                };
+            }
+            else {
+                return this._def.out._parseSync({
+                    data: inResult.value,
+                    path: ctx.path,
+                    parent: ctx,
+                });
+            }
+        }
+    }
+    static create(a, b) {
+        return new ZodPipeline({
+            in: a,
+            out: b,
+            typeName: ZodFirstPartyTypeKind.ZodPipeline,
+        });
+    }
+}
+class ZodReadonly extends ZodType {
+    _parse(input) {
+        const result = this._def.innerType._parse(input);
+        const freeze = (data) => {
+            if (isValid(data)) {
+                data.value = Object.freeze(data.value);
+            }
+            return data;
+        };
+        return isAsync(result) ? result.then((data) => freeze(data)) : freeze(result);
+    }
+    unwrap() {
+        return this._def.innerType;
+    }
+}
+ZodReadonly.create = (type, params) => {
+    return new ZodReadonly({
+        innerType: type,
+        typeName: ZodFirstPartyTypeKind.ZodReadonly,
+        ...processCreateParams(params),
+    });
+};
+////////////////////////////////////////
+////////////////////////////////////////
+//////////                    //////////
+//////////      z.custom      //////////
+//////////                    //////////
+////////////////////////////////////////
+////////////////////////////////////////
+function cleanParams(params, data) {
+    const p = typeof params === "function" ? params(data) : typeof params === "string" ? { message: params } : params;
+    const p2 = typeof p === "string" ? { message: p } : p;
+    return p2;
+}
+function custom(check, _params = {}, 
+/**
+ * @deprecated
+ *
+ * Pass `fatal` into the params object instead:
+ *
+ * ```ts
+ * z.string().custom((val) => val.length > 5, { fatal: false })
+ * ```
+ *
+ */
+fatal) {
+    if (check)
+        return ZodAny.create().superRefine((data, ctx) => {
+            const r = check(data);
+            if (r instanceof Promise) {
+                return r.then((r) => {
+                    if (!r) {
+                        const params = cleanParams(_params, data);
+                        const _fatal = params.fatal ?? fatal ?? true;
+                        ctx.addIssue({ code: "custom", ...params, fatal: _fatal });
+                    }
+                });
+            }
+            if (!r) {
+                const params = cleanParams(_params, data);
+                const _fatal = params.fatal ?? fatal ?? true;
+                ctx.addIssue({ code: "custom", ...params, fatal: _fatal });
+            }
+            return;
+        });
+    return ZodAny.create();
+}
+
+const late = {
+    object: ZodObject.lazycreate,
+};
+var ZodFirstPartyTypeKind;
+(function (ZodFirstPartyTypeKind) {
+    ZodFirstPartyTypeKind["ZodString"] = "ZodString";
+    ZodFirstPartyTypeKind["ZodNumber"] = "ZodNumber";
+    ZodFirstPartyTypeKind["ZodNaN"] = "ZodNaN";
+    ZodFirstPartyTypeKind["ZodBigInt"] = "ZodBigInt";
+    ZodFirstPartyTypeKind["ZodBoolean"] = "ZodBoolean";
+    ZodFirstPartyTypeKind["ZodDate"] = "ZodDate";
+    ZodFirstPartyTypeKind["ZodSymbol"] = "ZodSymbol";
+    ZodFirstPartyTypeKind["ZodUndefined"] = "ZodUndefined";
+    ZodFirstPartyTypeKind["ZodNull"] = "ZodNull";
+    ZodFirstPartyTypeKind["ZodAny"] = "ZodAny";
+    ZodFirstPartyTypeKind["ZodUnknown"] = "ZodUnknown";
+    ZodFirstPartyTypeKind["ZodNever"] = "ZodNever";
+    ZodFirstPartyTypeKind["ZodVoid"] = "ZodVoid";
+    ZodFirstPartyTypeKind["ZodArray"] = "ZodArray";
+    ZodFirstPartyTypeKind["ZodObject"] = "ZodObject";
+    ZodFirstPartyTypeKind["ZodUnion"] = "ZodUnion";
+    ZodFirstPartyTypeKind["ZodDiscriminatedUnion"] = "ZodDiscriminatedUnion";
+    ZodFirstPartyTypeKind["ZodIntersection"] = "ZodIntersection";
+    ZodFirstPartyTypeKind["ZodTuple"] = "ZodTuple";
+    ZodFirstPartyTypeKind["ZodRecord"] = "ZodRecord";
+    ZodFirstPartyTypeKind["ZodMap"] = "ZodMap";
+    ZodFirstPartyTypeKind["ZodSet"] = "ZodSet";
+    ZodFirstPartyTypeKind["ZodFunction"] = "ZodFunction";
+    ZodFirstPartyTypeKind["ZodLazy"] = "ZodLazy";
+    ZodFirstPartyTypeKind["ZodLiteral"] = "ZodLiteral";
+    ZodFirstPartyTypeKind["ZodEnum"] = "ZodEnum";
+    ZodFirstPartyTypeKind["ZodEffects"] = "ZodEffects";
+    ZodFirstPartyTypeKind["ZodNativeEnum"] = "ZodNativeEnum";
+    ZodFirstPartyTypeKind["ZodOptional"] = "ZodOptional";
+    ZodFirstPartyTypeKind["ZodNullable"] = "ZodNullable";
+    ZodFirstPartyTypeKind["ZodDefault"] = "ZodDefault";
+    ZodFirstPartyTypeKind["ZodCatch"] = "ZodCatch";
+    ZodFirstPartyTypeKind["ZodPromise"] = "ZodPromise";
+    ZodFirstPartyTypeKind["ZodBranded"] = "ZodBranded";
+    ZodFirstPartyTypeKind["ZodPipeline"] = "ZodPipeline";
+    ZodFirstPartyTypeKind["ZodReadonly"] = "ZodReadonly";
+})(ZodFirstPartyTypeKind || (ZodFirstPartyTypeKind = {}));
+// requires TS 4.4+
+class Class {
+    constructor(..._) { }
+}
+const instanceOfType = (
+// const instanceOfType = <T extends new (...args: any[]) => any>(
+cls, params = {
+    message: `Input not instance of ${cls.name}`,
+}) => custom((data) => data instanceof cls, params);
+const stringType = ZodString.create;
+const numberType = ZodNumber.create;
+const nanType = ZodNaN.create;
+const bigIntType = ZodBigInt.create;
+const booleanType = ZodBoolean.create;
+const dateType = ZodDate.create;
+const symbolType = ZodSymbol.create;
+const undefinedType = ZodUndefined.create;
+const nullType = ZodNull.create;
+const anyType = ZodAny.create;
+const unknownType = ZodUnknown.create;
+const neverType = ZodNever.create;
+const voidType = ZodVoid.create;
+const arrayType = ZodArray.create;
+const objectType = ZodObject.create;
+const strictObjectType = ZodObject.strictCreate;
+const unionType = ZodUnion.create;
+const discriminatedUnionType = ZodDiscriminatedUnion.create;
+const intersectionType = ZodIntersection.create;
+const tupleType = ZodTuple.create;
+const recordType = ZodRecord.create;
+const mapType = ZodMap.create;
+const setType = ZodSet.create;
+const functionType = ZodFunction.create;
+const lazyType = ZodLazy.create;
+const literalType = ZodLiteral.create;
+const enumType = ZodEnum.create;
+const nativeEnumType = ZodNativeEnum.create;
+const promiseType = ZodPromise.create;
+const effectsType = ZodEffects.create;
+const optionalType = ZodOptional.create;
+const nullableType = ZodNullable.create;
+const preprocessType = ZodEffects.createWithPreprocess;
+const pipelineType = ZodPipeline.create;
+const ostring = () => stringType().optional();
+const onumber = () => numberType().optional();
+const oboolean = () => booleanType().optional();
+const coerce = {
+    string: ((arg) => ZodString.create({ ...arg, coerce: true })),
+    number: ((arg) => ZodNumber.create({ ...arg, coerce: true })),
+    boolean: ((arg) => ZodBoolean.create({
+        ...arg,
+        coerce: true,
+    })),
+    bigint: ((arg) => ZodBigInt.create({ ...arg, coerce: true })),
+    date: ((arg) => ZodDate.create({ ...arg, coerce: true })),
+};
+
+const NEVER = (/* unused pure expression or super */ null && (INVALID));
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/spec-parser.js
+/**
+ * M9 — YAML test spec parser (TestSpec + Assertion DSL types).
+ *
+ * Format mirrors pipeline YAML: human-authored, zod-validated.
+ */
+
+
+const EqualityAssertion = objectType({ type: literalType('equality'), path: stringType(), value: unknownType() });
+const ContainsAssertion = objectType({ type: literalType('contains'), path: stringType(), value: unionType([stringType(), numberType(), booleanType()]) });
+const RegexAssertion = objectType({ type: literalType('regex'), path: stringType(), pattern: stringType(), flags: stringType().optional() });
+const NumericAssertion = objectType({ type: enumType(['gte', 'lte', 'gt', 'lt']), path: stringType(), value: numberType() });
+const ExistsAssertion = objectType({ type: literalType('exists'), path: stringType() });
+const AbsentAssertion = objectType({ type: literalType('absent'), path: stringType() });
+const JsonpathAssertion = objectType({ type: literalType('jsonpath'), path: stringType(), value: unknownType() });
+const SchemaAssertion = objectType({ type: literalType('schema'), path: stringType(), schema_file: stringType() });
+const AssertionSchema = unionType([
+    EqualityAssertion, ContainsAssertion, RegexAssertion, NumericAssertion,
+    ExistsAssertion, AbsentAssertion, JsonpathAssertion, SchemaAssertion,
+]);
+const TestSpecSchema = objectType({
+    name: stringType().min(1),
+    description: stringType().optional(),
+    pipeline: stringType().optional(),
+    stage: stringType().optional(),
+    inputs: recordType(unknownType()).default({}),
+    mock: booleanType().default(true),
+    expect_error: stringType().optional(),
+    assertions: arrayType(AssertionSchema).default([]),
+}).refine((s) => s.pipeline !== undefined || s.stage !== undefined || s.expect_error !== undefined, {
+    message: 'test spec requires one of: pipeline, stage, or expect_error',
+});
+class TestSpecParseError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'TEST_SPEC_PARSE_ERROR';
+    }
+}
+function parseTestSpec(yamlText) {
+    let raw;
+    try {
+        raw = yaml.load(yamlText);
+    }
+    catch (e) {
+        throw new TestSpecParseError(`invalid YAML: ${e.message}`);
+    }
+    const parsed = TestSpecSchema.safeParse(raw);
+    if (!parsed.success) {
+        throw new TestSpecParseError(`invalid test spec: ${parsed.error.message}`);
+    }
+    return parsed.data;
+}
+function loadTestSpecFile(content, sourcePath) {
+    try {
+        return parseTestSpec(content);
+    }
+    catch (e) {
+        const where = sourcePath ? ` (${sourcePath})` : '';
+        throw new TestSpecParseError(`${e.message}${where}`);
+    }
+}
+
+// EXTERNAL MODULE: external "node:fs"
+var external_node_fs_ = __nccwpck_require__(24);
+// EXTERNAL MODULE: external "node:path"
+var external_node_path_ = __nccwpck_require__(760);
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/assertions.js
+/**
+ * M9 — 8 assertion types for pipeline test specs.
+ *
+ * Each: (output, assertion) => AssertionResult. Pure, synchronous except
+ * `schema` which reads a file synchronously via injected loader.
+ */
+
+
+
+
+/** Traverse dot path with [n] array indices. Returns {found, value}. */
+function assertions_getPath(root, dotPath) {
+    if (dotPath === '' || dotPath === '$')
+        return { found: true, value: root };
+    const normalized = dotPath.replace(/^\$\.?/, '');
+    if (normalized === '')
+        return { found: true, value: root };
+    const tokens = normalized.split('.').filter((t) => t.length > 0);
+    let cur = root;
+    for (const tok of tokens) {
+        const m = tok.match(/^([A-Za-z_][A-Za-z0-9_]*)((\[\d+\])*)$/);
+        if (!m)
+            return { found: false };
+        const key = m[1];
+        if (cur === null || typeof cur !== 'object' || Array.isArray(cur))
+            return { found: false };
+        cur = cur[key];
+        if (cur === undefined)
+            return { found: false };
+        const idxs = m[2] ? [...m[2].matchAll(/\[(\d+)\]/g)].map((x) => Number(x[1])) : [];
+        for (const i of idxs) {
+            if (!Array.isArray(cur) || i >= cur.length)
+                return { found: false };
+            cur = cur[i];
+        }
+    }
+    return { found: true, value: cur };
+}
+function ok(message, expected, actual, t0) {
+    return { passed: true, message, expected, actual, duration_ms: t0 !== undefined ? Date.now() - t0 : 0 };
+}
+function fail(message, expected, actual, t0) {
+    return { passed: false, message, expected, actual, duration_ms: t0 !== undefined ? Date.now() - t0 : 0 };
+}
+function runAssertion(output, assertion, ctx = {}) {
+    const t0 = Date.now();
+    switch (assertion.type) {
+        case 'equality': {
+            const r = assertions_getPath(output, assertion.path);
+            if (!r.found)
+                return fail(`equality: ${assertion.path} not found`, assertion.value, undefined, t0);
+            if (deepEqual(r.value, assertion.value))
+                return ok(`equality: ${assertion.path} == ${JSON.stringify(assertion.value)}`, assertion.value, r.value, t0);
+            return fail(`equality: ${assertion.path} != ${JSON.stringify(assertion.value)} (got ${JSON.stringify(r.value)})`, assertion.value, r.value, t0);
+        }
+        case 'contains': {
+            const r = assertions_getPath(output, assertion.path);
+            if (!r.found)
+                return fail(`contains: ${assertion.path} not found`, assertion.value, undefined, t0);
+            const v = r.value;
+            if (typeof v === 'string' && typeof assertion.value === 'string') {
+                return v.includes(assertion.value)
+                    ? ok(`contains: ${assertion.path} contains "${assertion.value}"`, assertion.value, v, t0)
+                    : fail(`contains: ${assertion.path} does not contain "${assertion.value}"`, assertion.value, v, t0);
+            }
+            if (Array.isArray(v)) {
+                return v.some((el) => deepEqual(el, assertion.value))
+                    ? ok(`contains: ${assertion.path} includes ${JSON.stringify(assertion.value)}`, assertion.value, v, t0)
+                    : fail(`contains: ${assertion.path} does not include ${JSON.stringify(assertion.value)}`, assertion.value, v, t0);
+            }
+            return fail(`contains: ${assertion.path} is neither string nor array`, assertion.value, v, t0);
+        }
+        case 'regex': {
+            const r = assertions_getPath(output, assertion.path);
+            if (!r.found)
+                return fail(`regex: ${assertion.path} not found`, assertion.pattern, undefined, t0);
+            if (typeof r.value !== 'string')
+                return fail(`regex: ${assertion.path} is not a string`, assertion.pattern, r.value, t0);
+            let re;
+            try {
+                re = new RegExp(assertion.pattern, assertion.flags);
+            }
+            catch (e) {
+                return fail(`regex: invalid pattern /${assertion.pattern}/: ${e.message}`, assertion.pattern, r.value, t0);
+            }
+            return re.test(r.value)
+                ? ok(`regex: ${assertion.path} matches /${assertion.pattern}/${assertion.flags ?? ''}`, assertion.pattern, r.value, t0)
+                : fail(`regex: ${assertion.path} does not match /${assertion.pattern}/${assertion.flags ?? ''}`, assertion.pattern, r.value, t0);
+        }
+        case 'gte':
+        case 'lte':
+        case 'gt':
+        case 'lt': {
+            const r = assertions_getPath(output, assertion.path);
+            if (!r.found)
+                return fail(`${assertion.type}: ${assertion.path} not found`, assertion.value, undefined, t0);
+            if (typeof r.value !== 'number')
+                return fail(`${assertion.type}: ${assertion.path} is not a number`, assertion.value, r.value, t0);
+            const ops = {
+                gte: (a, b) => a >= b, lte: (a, b) => a <= b, gt: (a, b) => a > b, lt: (a, b) => a < b,
+            };
+            const symbols = { gte: '>=', lte: '<=', gt: '>', lt: '<' };
+            const pass = ops[assertion.type](r.value, assertion.value);
+            return pass
+                ? ok(`${assertion.type}: ${assertion.path} ${symbols[assertion.type]} ${assertion.value}`, assertion.value, r.value, t0)
+                : fail(`${assertion.type}: ${assertion.path} ${symbols[assertion.type]} ${assertion.value} (got ${r.value})`, assertion.value, r.value, t0);
+        }
+        case 'exists': {
+            const r = assertions_getPath(output, assertion.path);
+            return r.found ? ok(`exists: ${assertion.path} present`, undefined, r.value, t0) : fail(`exists: ${assertion.path} missing`, undefined, undefined, t0);
+        }
+        case 'absent': {
+            const r = assertions_getPath(output, assertion.path);
+            return !r.found ? ok(`absent: ${assertion.path} absent`, undefined, undefined, t0) : fail(`absent: ${assertion.path} present (expected absent)`, undefined, r.value, t0);
+        }
+        case 'jsonpath': {
+            const r = assertions_getPath(output, assertion.path);
+            if (!r.found)
+                return fail(`jsonpath: ${assertion.path} not found`, assertion.value, undefined, t0);
+            if (deepEqual(r.value, assertion.value))
+                return ok(`jsonpath: ${assertion.path} == ${JSON.stringify(assertion.value)}`, assertion.value, r.value, t0);
+            return fail(`jsonpath: ${assertion.path} != ${JSON.stringify(assertion.value)} (got ${JSON.stringify(r.value)})`, assertion.value, r.value, t0);
+        }
+        case 'schema': {
+            const r = assertions_getPath(output, assertion.path);
+            if (!r.found)
+                return fail(`schema: ${assertion.path} not found`, assertion.schema_file, undefined, t0);
+            const schemaPath = ctx.baseDir ? external_node_path_.resolve(ctx.baseDir, assertion.schema_file) : external_node_path_.resolve(assertion.schema_file);
+            let schemaRaw;
+            try {
+                schemaRaw = external_node_fs_.readFileSync(schemaPath, 'utf8');
+            }
+            catch {
+                return fail(`schema: cannot read schema file ${assertion.schema_file}`, assertion.schema_file, undefined, t0);
+            }
+            let schema;
+            try {
+                schema = JSON.parse(schemaRaw);
+            }
+            catch (e) {
+                return fail(`schema: invalid JSON in ${assertion.schema_file}: ${e.message}`, assertion.schema_file, undefined, t0);
+            }
+            const violations = validateAgainstSchema(r.value, schema);
+            if (violations.length === 0)
+                return ok(`schema: ${assertion.path} valid against ${assertion.schema_file}`, assertion.schema_file, r.value, t0);
+            return fail(`schema: ${assertion.path} invalid against ${assertion.schema_file}: ${violations.map((v) => `${v.path}: ${v.message}`).join('; ')}`, assertion.schema_file, r.value, t0);
+        }
+    }
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/stage-extractor.js
+/**
+ * M9 — extract a single stage from a pipeline YAML for stage tests.
+ */
+
+class StageNotFoundInSpecError extends Error {
+    constructor(stageId, available) {
+        super(`stage "${stageId}" not found (available: ${available.join(', ') || 'none'})`);
+        this.name = 'STAGE_NOT_FOUND';
+    }
+}
+function extractStage(pipelineYamlText, stageId) {
+    const spec = loadPipelineYaml(pipelineYamlText);
+    const stages = spec.stages ?? [];
+    const ids = stages.map((s) => String(s.id ?? ''));
+    const found = stages.find((s) => String(s.id) === stageId);
+    if (!found)
+        throw new StageNotFoundInSpecError(stageId, ids);
+    const clone = JSON.parse(JSON.stringify(found));
+    delete clone.depends_on;
+    return {
+        name: spec.name ?? 'stage-test',
+        stage: clone,
+        spec: { name: `${spec.name ?? 'pipeline'}::${stageId}`, version: spec.version, stages: [clone], defaults: spec.defaults },
+    };
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/runner.js
+/**
+ * M9 — test runner: execute a TestSpec in mock mode via runPipelineV2.
+ */
+
+
+
+
+
+
+
+
+
+function buildMockProvider() {
+    return {
+        name: 'mock',
+        models: ['mock-model', 'MiniMax-M2.7', 'MiniMax-M3'],
+        simpleModel: 'mock-model',
+        complexModel: 'mock-model',
+        supports(_model) {
+            return true;
+        },
+        async generateJson(_prompt) {
+            return {};
+        },
+        async generateText(prompt, opts) {
+            await new Promise((r) => setTimeout(r, 5));
+            const fields = opts?.fields ?? [];
+            if (opts?.outputFormat === 'structured_json' || fields.length > 0) {
+                const obj = {};
+                for (const f of fields)
+                    obj[f] = mockValueForField(f);
+                if (Object.keys(obj).length === 0)
+                    obj['result'] = 'mock-output';
+                void prompt;
+                return { text: JSON.stringify(obj), usage: { inputTokens: 10, outputTokens: 10 } };
+            }
+            if (opts?.outputFormat === 'markdown')
+                return { text: '# Mock report\n\nMock summary.\n', usage: { inputTokens: 1, outputTokens: 1 } };
+            if (opts?.outputFormat === 'code')
+                return { text: '```\n// mock code\n```\n', usage: { inputTokens: 1, outputTokens: 1 } };
+            return { text: `mock-output for: ${prompt.slice(0, 80)}`, usage: { inputTokens: 1, outputTokens: 1 } };
+        },
+    };
+}
+function mockValueForField(field) {
+    switch (field) {
+        case 'findings': return [{ severity: 'high', line: 10, description: 'mock finding: unsanitized input', fix_suggestion: 'sanitize input', cwe_id: 'CWE-89', confidence: 0.9 }];
+        case 'summary': return { total_findings: 1, critical_count: 0, high_count: 1, medium_count: 0, low_count: 0, overall_risk_score: 7.5, total_packages: 3, vulnerable_count: 1, perf_score: 6.5, estimated_speedup: 'mock 2x speedup', style_score: 7.0, regions_analyzed: 1, doc_score: 7.0, test_score: 7.0, refactor_score: 7.0, design_score: 7.0, endpoints_reviewed: 1, units_analyzed: 1 };
+        case 'recommendations': return ['mock recommendation: sanitize inputs'];
+        case 'markdown_report': return '# Mock report\n\nMock summary.\n';
+        case 'packages': return [{ name: 'mock-pkg', version: '1.0.0', is_vulnerable: true, cves: [{ id: 'CVE-2024-0001', severity: 'high', description: 'mock CVE', fix_version: '1.0.1', confidence: 0.9 }], fix_version: '1.0.1' }];
+        case 'stats': return { lines_scanned: 10, hunks_scanned: 1 };
+        case 'rejected': return [];
+        case 'new_findings_count': return 0;
+        default: return `mock-${field}`;
+    }
+}
+function buildLocalFetcher(pipelineDir) {
+    return async (id) => {
+        const candidate = external_node_path_.join(pipelineDir, `${id}.yaml`);
+        if (!external_node_fs_.existsSync(candidate))
+            return null;
+        const raw = external_node_fs_.readFileSync(candidate, 'utf8');
+        const spec = loadPipelineYaml(raw);
+        if (!spec || !Array.isArray(spec.stages))
+            return null;
+        return { name: spec.name, version: spec.version, stages: spec.stages };
+    };
+}
+function buildDeps(provider, pipelineDir) {
+    return {
+        provider,
+        forceMock: true,
+        pricing: new StaticPricingResolver({
+            'mock-model': { input: 0.0001, output: 0.0003 },
+            'MiniMax-M3': { input: 0.0001, output: 0.0003 },
+            'MiniMax-M2.7': { input: 0.0001, output: 0.0003 },
+        }),
+        modelResolver: createModelResolver(),
+        fetchSkill: async (skillId) => ({ id: skillId, name: skillId, version: '1.0.0', full_md: `# mock ${skillId}`, preferred_model: 'mock-model' }),
+        getCurrentAgentId: () => 'test-agent',
+        getPipelineAuthorId: () => 'test-agent',
+        isLocal: true,
+        registry: new LLMProviderRegistry([provider]),
+        ...(pipelineDir ? { fetchPipeline: buildLocalFetcher(pipelineDir) } : {}),
+    };
+}
+async function runSingleTest(spec, opts = {}) {
+    const t0 = Date.now();
+    const baseDir = opts.baseDir ?? process.cwd();
+    const withTimeout = async (p) => {
+        const ms = opts.timeoutMs ?? 60_000;
+        let timer;
+        try {
+            return await Promise.race([
+                p,
+                new Promise((_, reject) => {
+                    timer = setTimeout(() => reject(new Error(`test timed out after ${ms}ms`)), ms);
+                }),
+            ]);
+        }
+        finally {
+            if (timer)
+                clearTimeout(timer);
+        }
+    };
+    try {
+        let pipelineSpec;
+        let pipelinePath = '';
+        if (spec.pipeline) {
+            pipelinePath = external_node_path_.isAbsolute(spec.pipeline) ? spec.pipeline : external_node_path_.resolve(baseDir, spec.pipeline);
+            if (!external_node_fs_.existsSync(pipelinePath)) {
+                return { name: spec.name, status: 'error', duration_ms: Date.now() - t0, assertions: [], error: `pipeline file not found: ${spec.pipeline}` };
+            }
+            const raw = external_node_fs_.readFileSync(pipelinePath, 'utf8');
+            if (spec.stage) {
+                const extracted = extractStage(raw, spec.stage);
+                pipelineSpec = extracted.spec;
+            }
+            else {
+                pipelineSpec = loadPipelineYaml(raw);
+            }
+        }
+        else if (spec.stage) {
+            return { name: spec.name, status: 'error', duration_ms: Date.now() - t0, assertions: [], error: 'stage test requires pipeline field (path to pipeline.yaml)' };
+        }
+        else if (spec.expect_error) {
+            return { name: spec.name, status: 'error', duration_ms: Date.now() - t0, assertions: [], error: 'expect_error requires pipeline field' };
+        }
+        else {
+            return { name: spec.name, status: 'error', duration_ms: Date.now() - t0, assertions: [], error: 'no pipeline specified' };
+        }
+        const stages = pipelineSpec.stages ?? [];
+        for (let i = 0; i < stages.length; i++) {
+            const st = stages[i];
+            if (!st || typeof st.id !== 'string' || st.id.length === 0) {
+                throw new Error(`stage at index ${i} is missing required "id"`);
+            }
+        }
+        const provider = buildMockProvider();
+        const deps = buildDeps(provider, pipelinePath ? external_node_path_.dirname(pipelinePath) : undefined);
+        let outputs;
+        try {
+            const result = await withTimeout(runPipelineV2({
+                spec: pipelineSpec,
+                inputs: spec.inputs,
+                deps,
+            }));
+            outputs = result.outputs;
+        }
+        catch (e) {
+            if (spec.expect_error) {
+                const msg = e.message;
+                const pass = msg.includes(spec.expect_error);
+                const dur = Date.now() - t0;
+                return {
+                    name: spec.name, status: pass ? 'passed' : 'failed', duration_ms: dur,
+                    assertions: [{ type: 'expect_error', passed: pass, message: pass ? `got expected error: ${spec.expect_error}` : `expected error "${spec.expect_error}", got "${msg}"`, duration_ms: dur }],
+                    error: pass ? undefined : msg,
+                };
+            }
+            return { name: spec.name, status: 'error', duration_ms: Date.now() - t0, assertions: [], error: e.message };
+        }
+        if (spec.expect_error) {
+            return { name: spec.name, status: 'failed', duration_ms: Date.now() - t0, assertions: [{ type: 'expect_error', passed: false, message: `expected error "${spec.expect_error}" but pipeline succeeded`, duration_ms: 0 }], output: outputs };
+        }
+        const merged = { ...spec.inputs };
+        for (const [stageId, text] of Object.entries(outputs)) {
+            try {
+                merged[stageId] = JSON.parse(text);
+            }
+            catch {
+                merged[stageId] = text;
+            }
+            merged[`stages.${stageId}`] = merged[stageId];
+        }
+        merged['outputs'] = merged;
+        void pipelinePath;
+        const results = [];
+        let allPass = true;
+        for (const a of spec.assertions) {
+            const r = runAssertion(merged, a, { baseDir });
+            results.push({ ...r, type: a.type });
+            if (!r.passed)
+                allPass = false;
+        }
+        return { name: spec.name, status: allPass ? 'passed' : 'failed', duration_ms: Date.now() - t0, assertions: results, output: merged };
+    }
+    catch (e) {
+        const msg = e.message;
+        if (spec.expect_error) {
+            const pass = msg.includes(spec.expect_error);
+            return {
+                name: spec.name, status: pass ? 'passed' : 'failed', duration_ms: Date.now() - t0,
+                assertions: [{ type: 'expect_error', passed: pass, message: pass ? `got expected error: ${spec.expect_error}` : `expected error "${spec.expect_error}", got "${msg}"`, duration_ms: 0 }],
+                error: pass ? undefined : msg,
+            };
+        }
+        return { name: spec.name, status: 'error', duration_ms: Date.now() - t0, assertions: [], error: msg };
+    }
+}
+async function runTestSuite(specs, opts = {}) {
+    const results = [];
+    const n = Math.max(1, opts.parallel ?? 1);
+    if (n === 1) {
+        for (const s of specs) {
+            const r = await runSingleTest(s, opts);
+            results.push(r);
+            if (opts.bail && (r.status === 'failed' || r.status === 'error'))
+                break;
+        }
+        return results;
+    }
+    for (let i = 0; i < specs.length; i += n) {
+        const batch = specs.slice(i, i + n);
+        const out = await Promise.all(batch.map((s) => runSingleTest(s, opts)));
+        results.push(...out);
+        if (opts.bail && out.some((r) => r.status === 'failed' || r.status === 'error'))
+            break;
+    }
+    return results;
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/reporters/text.js
+function colorize(s, code) {
+    if (process.env.NO_COLOR === '1')
+        return s;
+    return `\u001b[${code}m${s}\u001b[0m`;
+}
+function renderText(results) {
+    const lines = [];
+    let passed = 0;
+    let failed = 0;
+    let totalMs = 0;
+    for (const r of results) {
+        totalMs += r.duration_ms;
+        if (r.status === 'passed') {
+            passed++;
+            lines.push(`${colorize('PASS', '32')}  ${r.name} (${r.duration_ms}ms)`);
+            for (const a of r.assertions)
+                lines.push(`  ${colorize('✓', '32')} ${a.type}: ${a.message}`);
+        }
+        else if (r.status === 'skipped') {
+            lines.push(`${colorize('SKIP', '33')}  ${r.name} (${r.duration_ms}ms)`);
+        }
+        else {
+            failed++;
+            lines.push(`${colorize('FAIL', '31')}  ${r.name} (${r.duration_ms}ms)`);
+            for (const a of r.assertions) {
+                const icon = a.passed ? colorize('✓', '32') : colorize('✗', '31');
+                lines.push(`  ${icon} ${a.type}: ${a.message}`);
+            }
+            if (r.error)
+                lines.push(`  ${colorize('error:', '31')} ${r.error}`);
+        }
+    }
+    lines.push('');
+    lines.push(`Summary: ${passed} passed, ${failed} failed (${(totalMs / 1000).toFixed(1)}s total)`);
+    return lines.join('\n');
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/reporters/json.js
+function renderJson(results) {
+    let passed = 0;
+    let failed = 0;
+    let skipped = 0;
+    let duration_ms = 0;
+    const tests = results.map((r) => {
+        duration_ms += r.duration_ms;
+        if (r.status === 'passed')
+            passed++;
+        else if (r.status === 'skipped')
+            skipped++;
+        else
+            failed++;
+        return {
+            name: r.name,
+            status: r.status,
+            duration_ms: r.duration_ms,
+            ...(r.error ? { error: r.error } : {}),
+            assertions: r.assertions.map((a) => ({ type: a.type, passed: a.passed, message: a.message, duration_ms: a.duration_ms })),
+        };
+    });
+    return JSON.stringify({ passed, failed, skipped, duration_ms, tests }, null, 2);
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/reporters/junit.js
+function esc(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+function renderJunit(results) {
+    const failures = results.filter((r) => r.status === 'failed' || r.status === 'error').length;
+    const totalS = (results.reduce((a, r) => a + r.duration_ms, 0) / 1000).toFixed(3);
+    const lines = ['<?xml version="1.0" encoding="UTF-8"?>'];
+    lines.push(`<testsuite name="agent-market-pipeline-tests" tests="${results.length}" failures="${failures}" time="${totalS}">`);
+    for (const r of results) {
+        const t = (r.duration_ms / 1000).toFixed(3);
+        const bad = r.status === 'failed' || r.status === 'error';
+        if (!bad) {
+            lines.push(`  <testcase name="${esc(r.name)}" time="${t}"/>`);
+        }
+        else {
+            lines.push(`  <testcase name="${esc(r.name)}" time="${t}">`);
+            const failedAs = r.assertions.filter((a) => !a.passed);
+            if (failedAs.length > 0) {
+                for (const a of failedAs) {
+                    lines.push(`    <failure type="${esc(a.type)}" message="${esc(a.message)}">${esc(`expected ${JSON.stringify(a.expected)}, got ${JSON.stringify(a.actual)}`)}</failure>`);
+                }
+            }
+            else {
+                lines.push(`    <failure type="error" message="${esc(r.error ?? 'unknown error')}">${esc(r.error ?? 'unknown error')}</failure>`);
+            }
+            lines.push('  </testcase>');
+        }
+    }
+    lines.push('</testsuite>');
+    return lines.join('\n');
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/coverage.js
+/**
+ * M9 — stage coverage report: which stages were exercised by a test suite.
+ */
+
+
+function computeCoverage(pipelineYamlText, results, pipelineLabel = 'pipeline') {
+    const spec = loadPipelineYaml(pipelineYamlText);
+    const stages = (spec.stages ?? []).map((s) => String(s.id ?? ''));
+    const coveredSet = new Set();
+    for (const r of results) {
+        const out = r.output;
+        if (!out || typeof out !== 'object')
+            continue;
+        for (const id of stages) {
+            if (id in out)
+                coveredSet.add(id);
+        }
+    }
+    const covered = stages.filter((s) => coveredSet.has(s));
+    const uncovered = stages.filter((s) => !coveredSet.has(s));
+    return { pipeline: pipelineLabel, stages, covered, uncovered, coverage_pct: stages.length === 0 ? 100 : Math.round((covered.length / stages.length) * 100) };
+}
+function renderCoverageText(reports) {
+    const lines = ['Coverage:'];
+    for (const r of reports) {
+        lines.push(`  ${r.pipeline}: ${r.coverage_pct}% (${r.covered.length}/${r.stages.length} stages)`);
+        if (r.uncovered.length > 0)
+            lines.push(`    uncovered: ${r.uncovered.join(', ')}`);
+    }
+    return lines.join('\n');
+}
+function loadCoverageForPipeline(pipelinePath, results) {
+    const raw = external_node_fs_.readFileSync(pipelinePath, 'utf8');
+    return computeCoverage(raw, results, pipelinePath);
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/conformance.js
+/**
+ * M9 — conformance test runner (thin wrapper over runTestSuite).
+ */
+
+
+
+
+async function discoverTestFiles(dir) {
+    const entries = external_node_fs_.readdirSync(dir, { withFileTypes: true });
+    const out = [];
+    for (const e of entries) {
+        const full = external_node_path_.join(dir, e.name);
+        if (e.isDirectory())
+            out.push(...(await discoverTestFiles(full)));
+        else if (e.isFile() && e.name.endsWith('.test.yaml'))
+            out.push(full);
+    }
+    return out.sort();
+}
+async function runConformanceDir(dir, opts = {}) {
+    const files = await discoverTestFiles(dir);
+    const specs = files.map((f) => {
+        const raw = external_node_fs_.readFileSync(f, 'utf8');
+        const spec = parseTestSpec(raw);
+        return { spec, file: f };
+    });
+    return runTestSuite(specs.map((s) => s.spec), { ...opts, baseDir: opts.baseDir ?? dir });
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/index.js
+
+
+
+
+
+
+
+
+
+
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/index.js
 /**
  * @agentsmarket/pipeline-runtime — multi-stage AI workflow executor.
@@ -44347,6 +53039,22 @@ async function runPipelineV2(opts) {
  * Public API: providers (MiniMax, OpenRouter), stage executor (executeStage,
  * runPipelineV2), pricing (PricingResolver), model resolver.
  */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -44402,6 +53110,9 @@ async function runPipeline(spec, inputs, opts) {
     }
     return outputs;
 }
+
+
+
 
 
 /***/ })
@@ -44595,18 +53306,23 @@ const executor_deps_js_1 = __nccwpck_require__(920);
 const run_js_1 = __nccwpck_require__(795);
 exports.actionName = 'pipeline-action';
 async function main() {
-    const inputs = (0, inputs_js_1.readInputs)();
-    const params = await (0, pipeline_source_js_1.resolvePipelineSource)(inputs);
-    params.inputs = inputs;
-    const deps = await (0, executor_deps_js_1.buildExecutorDeps)(params);
-    const exitCode = await (0, run_js_1.run)({ params, deps });
-    process.exit(exitCode);
+    let inputs = null;
+    try {
+        inputs = (0, inputs_js_1.readInputs)();
+        const params = await (0, pipeline_source_js_1.resolvePipelineSource)(inputs);
+        params.inputs = inputs;
+        const deps = await (0, executor_deps_js_1.buildExecutorDeps)(params);
+        const exitCode = await (0, run_js_1.run)({ params, deps });
+        process.exit(exitCode);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
+        const ctx = inputs !== null ? ` [provider=${inputs.provider} model=${inputs.model}]` : '';
+        console.error(`::error::pipeline-action v${run_js_1.ACTION_VERSION} crashed${ctx}: ${msg}`);
+        process.exit(1);
+    }
 }
-main().catch((err) => {
-    const msg = err instanceof Error ? (err.stack ?? err.message) : String(err);
-    console.error(`::error::pipeline-action crashed: ${msg}`);
-    process.exit(1);
-});
+main();
 
 })();
 

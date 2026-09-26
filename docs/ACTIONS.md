@@ -40,7 +40,8 @@ That's it. Push, open a PR, watch the action run.
 
 | Input | Required | Default | Description |
 |---|---|---|---|
-| `api_key` | no (yes if not mock) | — | LLM provider API key. Falls back to `MINIMAX_API_KEY` env var. |
+| `api_key` | no (yes if not mock) | — | LLM provider API key. Falls back to the provider env var (see below). |
+| `provider` | no | `minimax` | LLM provider: `minimax` \| `openai` \| `anthropic` \| `openrouter`. |
 | `pipeline_file` | yes* | — | Path to `pipeline.yaml` (relative to `$GITHUB_WORKSPACE` or absolute). |
 | `pipeline_yaml` | yes* | — | Inline pipeline YAML string. Mutually exclusive with `pipeline_file`. |
 | `model` | no | `MiniMax-M3` | Default model identifier. |
@@ -87,19 +88,30 @@ stages:
 ## Real LLM call (production)
 
 1. **Remove `mock: 'true'`** from the workflow.
-2. **Add API key** to repo/org secrets:
-   - `MINIMAX_API_KEY` (default provider) — repo/org Settings → Secrets
-3. **Wire API key into the action:**
+2. **Add API key** to repo/org secrets (repo/org Settings → Secrets).
+   Pick the secret for your provider:
+
+   | Provider | Secret | Example models |
+   |---|---|---|
+   | `minimax` (default) | `MINIMAX_API_KEY` | `MiniMax-M3`, `MiniMax-M2.7` |
+   | `openai` | `OPENAI_API_KEY` | `gpt-4`, `gpt-4-turbo`, `gpt-3.5-turbo` |
+   | `anthropic` | `ANTHROPIC_API_KEY` | `claude-3-opus-20240229`, `claude-3-sonnet-20240229` |
+   | `openrouter` | `OPENROUTER_API_KEY` | `openai/gpt-4o`, `anthropic/claude-3.5-sonnet` |
+
+3. **Wire provider + API key into the action:**
    ```yaml
    - uses: agents-market/pipeline-action@v1
      with:
-       api_key: ${{ secrets.MINIMAX_API_KEY }}
+       provider: openai
+       model: gpt-4-turbo
+       api_key: ${{ secrets.OPENAI_API_KEY }}
        pipeline_file: .github/pipelines/my-pipeline.yaml
    ```
 
-The action picks the provider by model name:
-- `claude`, `gpt`, `mistral`, `llama` → OpenRouter
-- anything else → MiniMax
+The `provider` input is the source of truth — a model that does not
+belong to the selected provider fails fast naming supported models.
+A mismatched key (e.g. `provider: openai` with only `MINIMAX_API_KEY`
+set) errors naming the missing `OPENAI_API_KEY` secret.
 
 ---
 

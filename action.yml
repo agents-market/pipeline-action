@@ -1,11 +1,15 @@
 name: agentsmarket pipeline action
-description: Run an agentsmarket pipeline.yaml inside a step. Streams each stage as a GH log group, sets action outputs with stage results, total cost, wall-clock.
+description: Run an agentsmarket pipeline.yaml inside a step (provider: minimax|openai|anthropic|openrouter). Streams each stage as a GH log group, sets action outputs with stage results, total cost, wall-clock.
 author: agentsmarket.world
 
 inputs:
   api_key:
-    description: 'LLM provider API key (falls back to MINIMAX_API_KEY env var).'
+    description: 'LLM provider API key (falls back to MINIMAX_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY depending on provider).'
     required: false
+  provider:
+    description: 'LLM provider: minimax|openai|anthropic|openrouter (default: minimax).'
+    required: false
+    default: 'minimax'
   pipeline_file:
     description: 'Path to pipeline.yaml (relative to $GITHUB_WORKSPACE or absolute). Mutually exclusive with pipeline_yaml.'
     required: false

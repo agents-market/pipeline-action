@@ -4,7 +4,7 @@ GitHub Action that runs an agentsmarket `pipeline.yaml` inside a step. Streams e
 
 ## Status
 
-v0.1.0 — R12.1 scaffold. LLM-only stages work; `uses:` skill stages surface "skill not found" (R12.2-R12.4 ship marketplace-fetched skills).
+v0.2.0 — provider selection (minimax/openai/anthropic/openrouter) + step-summary report. LLM-only stages work; `uses:` skill stages surface "skill not found" (R12.2-R12.4 ship marketplace-fetched skills).
 
 ## Usage
 
@@ -33,13 +33,44 @@ jobs:
 
 | Name | Required | Default | Description |
 |------|----------|---------|-------------|
-| `api_key` | no | — (uses `MINIMAX_API_KEY` env) | LLM provider API key |
+| `api_key` | no | — (uses provider env var, see below) | LLM provider API key |
+| `provider` | no | `minimax` | LLM provider: `minimax` \| `openai` \| `anthropic` \| `openrouter` |
 | `pipeline_file` | no | — | Path to `pipeline.yaml`. Mutually exclusive with `pipeline_yaml` |
 | `pipeline_yaml` | no | — | Inline YAML body. Mutually exclusive with `pipeline_file` |
-| `model` | no | `MiniMax-M3` | Default model identifier |
+| `model` | no | `MiniMax-M3` | Default model identifier (must be supported by `provider`) |
 | `inputs_json` | no | `{}` | JSON object passed to pipeline `inputs` |
 | `fail_fast` | no | `true` | Stop on first stage error |
 | `mock` | no | `false` | Use deterministic mock provider (no real API) |
+
+## Providers
+
+Supported providers: **MiniMax** (default), **OpenAI**, **Anthropic**, **OpenRouter** (multi-model gateway).
+
+The API key resolves from the `api_key` input first, then from the provider-specific env var:
+
+| Provider | Env var | Example models |
+|----------|---------|----------------|
+| `minimax` (default) | `MINIMAX_API_KEY` | `MiniMax-M3`, `MiniMax-M2.7` |
+| `openai` | `OPENAI_API_KEY` | `gpt-4`, `gpt-4-turbo`, `gpt-3.5-turbo` |
+| `anthropic` | `ANTHROPIC_API_KEY` | `claude-3-opus-20240229`, `claude-3-sonnet-20240229`, `claude-3-haiku-20240307` |
+| `openrouter` | `OPENROUTER_API_KEY` | `openai/gpt-4o`, `anthropic/claude-3.5-sonnet`, … |
+
+```yaml
+- uses: agents-market/pipeline-action@v1
+  with:
+    provider: openai
+    model: gpt-4-turbo
+    api_key: ${{ secrets.OPENAI_API_KEY }}
+    pipeline_yaml: |
+      name: pr-summary
+      stages:
+        - id: summarize
+          prompt: "Summarize this PR in 1 sentence."
+```
+
+A mismatched key fails fast with a debuggable message, e.g. `provider: openai` with only `MINIMAX_API_KEY` set errors naming the missing `OPENAI_API_KEY` secret. Every error names the provider + model in context.
+
+Each run appends a step-summary report (`$GITHUB_STEP_SUMMARY`) with pipeline name, provider, model, total cost, duration and stage count.
 
 ## Outputs
 
