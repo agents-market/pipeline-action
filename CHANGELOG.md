@@ -1,5 +1,15 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## v0.2.1 (2026-09-26) — YAML hotfix
+
+### Fixed
+- **Critical:** v0.2.0 `action.yml` line 2 had an unquoted YAML flow mapping
+  `(provider: minimax|openai|anthropic|openrouter)`. GitHub Actions rejected
+  every consumer at Set-up-job with
+  `Mapping values are not allowed here. Line 2, Col 71`. v0.2.0 was
+  completely unloadable. One-line quote wrap restores the action.yml
+  parser-validity for any consumer pinning `@v0.2.1`.
+
 ## v0.2.0 (2026-09-26)
 
 ### Added
