@@ -1,9 +1,9 @@
 "use strict";
-exports.id = 817;
-exports.ids = [817,300];
+exports.id = 767;
+exports.ids = [767,418];
 exports.modules = {
 
-/***/ 300:
+/***/ 418:
 /***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __webpack_require__) => {
 
 var node_child_process__WEBPACK_IMPORTED_MODULE_0___namespace_cache;
@@ -44,7 +44,7 @@ var node_util__WEBPACK_IMPORTED_MODULE_6___namespace_cache;
 
 /***/ }),
 
-/***/ 817:
+/***/ 767:
 /***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __webpack_require__) => {
 
 // ESM COMPAT FLAG
@@ -72,8 +72,8 @@ __webpack_require__.d(__webpack_exports__, {
   setupSkills: () => (/* reexport */ setupSkills)
 });
 
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/internal/tslib.mjs
-var tslib = __webpack_require__(448);
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/internal/tslib.mjs
+var tslib = __webpack_require__(490);
 // EXTERNAL MODULE: external "node:fs/promises"
 var promises_ = __webpack_require__(455);
 // EXTERNAL MODULE: external "node:fs"
@@ -86,15 +86,15 @@ var external_node_child_process_ = __webpack_require__(421);
 var external_node_crypto_ = __webpack_require__(598);
 // EXTERNAL MODULE: external "node:readline"
 var external_node_readline_ = __webpack_require__(481);
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/core/error.mjs
-var error = __webpack_require__(228);
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/lib/tools/ToolError.mjs
-var ToolError = __webpack_require__(470);
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/index.mjs + 102 modules
-var sdk = __webpack_require__(39);
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/internal/utils.mjs
-var utils = __webpack_require__(363);
-;// CONCATENATED MODULE: ../../node_modules/@anthropic-ai/sdk/lib/transform-json-schema.mjs
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/core/error.mjs
+var error = __webpack_require__(382);
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/lib/tools/ToolError.mjs
+var ToolError = __webpack_require__(212);
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/index.mjs + 102 modules
+var sdk = __webpack_require__(129);
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/internal/utils.mjs
+var utils = __webpack_require__(337);
+;// CONCATENATED MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/lib/transform-json-schema.mjs
 
 // Supported string formats
 const SUPPORTED_STRING_FORMATS = new Set([
@@ -206,7 +206,7 @@ function _transformJSONSchema(jsonSchema) {
     return strictSchema;
 }
 //# sourceMappingURL=transform-json-schema.mjs.map
-;// CONCATENATED MODULE: ../../node_modules/@anthropic-ai/sdk/helpers/beta/json-schema.mjs
+;// CONCATENATED MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/helpers/beta/json-schema.mjs
 
 
 /**
@@ -260,11 +260,11 @@ function betaJSONSchemaOutputFormat(jsonSchema, options) {
     };
 }
 //# sourceMappingURL=json-schema.mjs.map
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/internal/utils/promise.mjs
-var promise = __webpack_require__(477);
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/internal/node.mjs
-var node = __webpack_require__(300);
-;// CONCATENATED MODULE: ../../node_modules/@anthropic-ai/sdk/tools/agent-toolset/fs-util.mjs
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/internal/utils/promise.mjs
+var promise = __webpack_require__(819);
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/internal/node.mjs
+var node = __webpack_require__(418);
+;// CONCATENATED MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/tools/agent-toolset/fs-util.mjs
 /**
  * Shared, Node-only filesystem helpers for the agent toolset's file tools:
  * path confinement (symlink-aware), an atomic write, and language-independent
@@ -459,9 +459,9 @@ function fsErrorMessage(err, file) {
     }
 }
 //# sourceMappingURL=fs-util.mjs.map
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/internal/utils/log.mjs
-var utils_log = __webpack_require__(304);
-;// CONCATENATED MODULE: ../../node_modules/@anthropic-ai/sdk/tools/agent-toolset/skills.mjs
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/internal/utils/log.mjs
+var utils_log = __webpack_require__(210);
+;// CONCATENATED MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/tools/agent-toolset/skills.mjs
 /**
  * Node-only skill plumbing for the agent toolset: downloading a session
  * agent's skills into the workdir and extracting the archives. Kept in its own
@@ -782,11 +782,11 @@ async function readHead(file, n) {
     }
 }
 //# sourceMappingURL=skills.mjs.map
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/internal/utils/bytes.mjs
-var bytes = __webpack_require__(447);
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/internal/utils/backoff.mjs
-var backoff = __webpack_require__(654);
-;// CONCATENATED MODULE: ../../node_modules/@anthropic-ai/sdk/internal/file-store.mjs
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/internal/utils/bytes.mjs
+var bytes = __webpack_require__(665);
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/internal/utils/backoff.mjs
+var backoff = __webpack_require__(763);
+;// CONCATENATED MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/internal/file-store.mjs
 /**
  * `FileStore` — one confined folder; a relative path cannot escape it.
  *
@@ -1309,9 +1309,9 @@ if (asyncDispose) {
     });
 }
 //# sourceMappingURL=file-store.mjs.map
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/tools/agent-toolset/sync-interval.mjs
-var sync_interval = __webpack_require__(436);
-;// CONCATENATED MODULE: ../../node_modules/@anthropic-ai/sdk/tools/agent-toolset/memories.mjs
+// EXTERNAL MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/tools/agent-toolset/sync-interval.mjs
+var sync_interval = __webpack_require__(666);
+;// CONCATENATED MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/tools/agent-toolset/memories.mjs
 /**
  * Session-level memory-store download and sync.
  *
@@ -2208,7 +2208,7 @@ async function settledOrAborted(p, signal) {
     }
 }
 //# sourceMappingURL=memories.mjs.map
-;// CONCATENATED MODULE: ../../node_modules/@anthropic-ai/sdk/tools/agent-toolset/node.mjs
+;// CONCATENATED MODULE: ../../../../home/vladimirmyshkovski/Programs/AI/agent-market/node_modules/@anthropic-ai/sdk/tools/agent-toolset/node.mjs
 /**
  * Node implementation of the `agent_toolset_20260401` tools — `bash`, `read`,
  * `write`, `edit`, `glob`, `grep` — plus the workdir/skills
