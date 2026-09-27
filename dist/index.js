@@ -999,6 +999,338 @@ function parseInputJson(raw, where) {
 
 /***/ }),
 
+/***/ 750:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * Output formatting for PR-review style pipelines.
+ *
+ * Pipeline actions produce `Record<stage_id, string>` where each value is the
+ * raw stage output text (usually a JSON string per `output_format:
+ * structured_json`). Many of our wedges — `code-review-security-audit`,
+ * `code-review-vulnerability-detection`, `api-design-reviewer`,
+ * `style-review` — emit arrays of `findings` with severity, file/line,
+ * description, CWE, confidence, recommendation. This module:
+ *
+ *   1. Parses each stage output (JSON first, regex fallback for plain text).
+ *   2. Normalizes the various field-name conventions used by our wedges
+ *      (`path`/`file`, `description`/`message`, `cwe_id`/`cwe`,
+ *      `fix_suggestion`/`recommendation`) into a single canonical
+ *      `ReviewFinding` shape.
+ *   3. Merges findings across stages and deduplicates by
+ *      `(file, line, cwe)` — keep the highest-confidence occurrence.
+ *   4. Filters by severity threshold (`critical > high > medium > low`).
+ *
+ * Designed to be wired by `run.ts` after `runPipelineV2` returns. Agent B
+ * owns `run.ts`; this module is self-contained so the wiring is a one-line
+ * `formatFindings(result.outputs)` call when Agent B picks it up.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.EMPTY_FINDINGS_COUNT = void 0;
+exports.isSeverity = isSeverity;
+exports.isSeverityLevel = isSeverityLevel;
+exports.severityRank = severityRank;
+exports.readSeverityThresholdFromEnv = readSeverityThresholdFromEnv;
+exports.formatFindings = formatFindings;
+exports.normalizeFinding = normalizeFinding;
+exports.dedupeFindings = dedupeFindings;
+exports.filterBySeverity = filterBySeverity;
+exports.countFindings = countFindings;
+/** Empty counts — handy for tests and the no-findings path. */
+exports.EMPTY_FINDINGS_COUNT = {
+    critical: 0,
+    high: 0,
+    medium: 0,
+    low: 0,
+};
+/** Severity ordering — higher number = more severe. */
+const SEVERITY_RANK = {
+    critical: 4,
+    high: 3,
+    medium: 2,
+    low: 1,
+};
+const VALID_SEVERITIES = new Set([
+    'critical',
+    'high',
+    'medium',
+    'low',
+]);
+const VALID_SEVERITY_LEVELS = new Set([
+    'critical',
+    'high',
+    'medium',
+    'low',
+    'all',
+]);
+/** True for any of the four severity labels. `'all'` is the sentinel. */
+function isSeverity(value) {
+    return typeof value === 'string' && VALID_SEVERITIES.has(value);
+}
+/** True for any of the four severity labels OR `'all'`. */
+function isSeverityLevel(value) {
+    return typeof value === 'string' && VALID_SEVERITY_LEVELS.has(value);
+}
+/** Severity rank — `undefined` ranks below `low` (treated as unknown). */
+function severityRank(severity) {
+    if (severity === undefined)
+        return 0;
+    if (isSeverity(severity))
+        return SEVERITY_RANK[severity];
+    return 0;
+}
+/**
+ * Read the `severity_threshold` action input via the env var. Agent B owns
+ * `src/inputs.ts` and the typed `ActionInputs` interface — to avoid coupling,
+ * this module reads `process.env.INPUT_SEVERITY_THRESHOLD` directly.
+ * Default = `'low'` for backward compatibility (the existing summary has
+ * always shown all severities).
+ */
+function readSeverityThresholdFromEnv(env = process.env) {
+    const raw = env['INPUT_SEVERITY_THRESHOLD'];
+    if (!raw || raw.length === 0)
+        return 'low';
+    const normalized = raw.trim().toLowerCase();
+    if (isSeverityLevel(normalized))
+        return normalized;
+    return 'low';
+}
+/**
+ * Parse + merge + dedupe pipeline output into a flat `ReviewFinding[]`.
+ *
+ * Input shape: `Record<stage_id, string>` — the raw `result.outputs` from
+ * `runPipelineV2`. Each string may be:
+ *   - JSON object with `findings: ReviewFinding[]`
+ *   - JSON array of findings
+ *   - A single finding JSON object
+ *   - Plain text (regex best-effort fallback)
+ *
+ * Unknown / malformed inputs are skipped silently — never thrown. We want
+ * summary rendering to keep working even when a stage misbehaves.
+ */
+function formatFindings(rawOutput) {
+    if (rawOutput === null || rawOutput === undefined)
+        return [];
+    if (typeof rawOutput !== 'object')
+        return [];
+    const stageOutputs = rawOutput;
+    const merged = [];
+    for (const [stageId, value] of Object.entries(stageOutputs)) {
+        if (value === null || value === undefined)
+            continue;
+        const stageFindings = parseStageOutput(value, stageId);
+        merged.push(...stageFindings);
+    }
+    return dedupeFindings(merged);
+}
+/**
+ * Parse a single stage's output value into findings. `stageId` is used as
+ * the `file` fallback when the finding does not declare one (file-level
+ * findings or regex-extracted text without a path).
+ */
+function parseStageOutput(value, stageId) {
+    if (typeof value === 'string') {
+        return parseStringStageOutput(value, stageId);
+    }
+    if (Array.isArray(value)) {
+        return value
+            .map((entry) => normalizeFinding(entry, stageId))
+            .filter((f) => f !== null);
+    }
+    if (typeof value === 'object') {
+        const obj = value;
+        if (Array.isArray(obj['findings'])) {
+            return obj['findings']
+                .map((entry) => normalizeFinding(entry, stageId))
+                .filter((f) => f !== null);
+        }
+        const normalized = normalizeFinding(obj, stageId);
+        return normalized === null ? [] : [normalized];
+    }
+    return [];
+}
+/**
+ * Try to parse the string as JSON. On failure, fall back to regex
+ * best-effort extraction. The fallback is intentionally lossy — it catches
+ * obvious "severity word + filename + optional line number" patterns.
+ */
+function parseStringStageOutput(raw, stageId) {
+    const trimmed = raw.trim();
+    if (trimmed.length === 0)
+        return [];
+    // 1) Try JSON.
+    try {
+        const parsed = JSON.parse(trimmed);
+        return parseStageOutput(parsed, stageId);
+    }
+    catch {
+        // not JSON — fall through to regex
+    }
+    // 2) Regex fallback — best-effort, documented as lossy.
+    return extractFromText(trimmed, stageId);
+}
+/**
+ * Regex fallback for plain-text outputs (rare in our wedges, but the
+ * `code-review-vulnerability-detection` wedge and the `gh api` error
+ * envelopes occasionally produce text-only output).
+ *
+ * Patterns matched (case-insensitive):
+ *   `critical|high|medium|low ... in <path>[:<line>]` — file/line attached
+ *   `CWE-\d+` anywhere in the message line — captured as `cwe`
+ *
+ * Confidence is fixed at 0.5 for regex hits (lower than a structured parse
+ * so the dedupe keeps the structured version when both exist).
+ */
+function extractFromText(text, stageId) {
+    const findings = [];
+    const lines = text.split(/\r?\n/);
+    const sevRe = /\b(critical|high|medium|low)\b/i;
+    const locRe = /(?:in|at)\s+([^\s:;,)]+)(?::(\d+))?/i;
+    const cweRe = /CWE-\d+/i;
+    for (const line of lines) {
+        const sevMatch = line.match(sevRe);
+        if (!sevMatch)
+            continue;
+        const sevRaw = sevMatch[1];
+        if (!sevRaw || !isSeverity(sevRaw))
+            continue;
+        const locMatch = line.match(locRe);
+        const file = locMatch?.[1] ?? '';
+        const lineNumRaw = locMatch?.[2];
+        const lineNum = lineNumRaw !== undefined ? Number.parseInt(lineNumRaw, 10) : NaN;
+        const cweMatch = line.match(cweRe);
+        const cwe = cweMatch?.[0];
+        findings.push({
+            severity: sevRaw,
+            file: file.length > 0 ? file : stageId,
+            ...(Number.isFinite(lineNum) ? { line: lineNum } : {}),
+            message: line.trim().slice(0, 500),
+            ...(cwe !== undefined ? { cwe } : {}),
+            confidence: 0.5,
+        });
+    }
+    return findings;
+}
+/**
+ * Normalize a raw object into a `ReviewFinding`. Returns `null` when the
+ * input lacks the required `message`/`description` field — we cannot emit
+ * a finding with no description (every consumer expects a string).
+ */
+function normalizeFinding(raw, stageId) {
+    if (raw === null || raw === undefined)
+        return null;
+    if (typeof raw !== 'object')
+        return null;
+    const obj = raw;
+    const severityRaw = obj['severity'];
+    if (!isSeverity(severityRaw))
+        return null;
+    const message = stringOr(obj['message']) ??
+        stringOr(obj['description']) ??
+        stringOr(obj['detail']) ??
+        stringOr(obj['title']);
+    if (message === null)
+        return null;
+    const file = stringOr(obj['file']) ??
+        stringOr(obj['path']) ??
+        stringOr(obj['location']) ??
+        stageId;
+    const lineRaw = obj['line'] ?? obj['line_number'] ?? obj['lineNumber'];
+    let line;
+    if (typeof lineRaw === 'number' && Number.isFinite(lineRaw) && lineRaw > 0) {
+        line = Math.trunc(lineRaw);
+    }
+    const cweRaw = stringOr(obj['cwe']) ??
+        stringOr(obj['cwe_id']) ??
+        stringOr(obj['cweId']);
+    let cwe;
+    if (cweRaw !== null) {
+        const normalized = cweRaw.match(/CWE-\d+/i)?.[0];
+        if (normalized !== undefined)
+            cwe = normalized.toUpperCase();
+    }
+    let confidence = 0;
+    if (typeof obj['confidence'] === 'number' && Number.isFinite(obj['confidence'])) {
+        confidence = clamp01(obj['confidence']);
+    }
+    const recommendation = stringOr(obj['recommendation']) ??
+        stringOr(obj['fix_suggestion']) ??
+        stringOr(obj['fix']) ??
+        stringOr(obj['remediation']) ??
+        undefined;
+    const finding = {
+        severity: severityRaw,
+        file,
+        ...(line !== undefined ? { line } : {}),
+        message,
+        confidence,
+        ...(cwe !== undefined ? { cwe } : {}),
+        ...(recommendation !== null && recommendation !== undefined
+            ? { recommendation }
+            : {}),
+    };
+    return finding;
+}
+function stringOr(value) {
+    if (typeof value !== 'string')
+        return null;
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+}
+function clamp01(n) {
+    if (n < 0)
+        return 0;
+    if (n > 1)
+        return 1;
+    return n;
+}
+/**
+ * Dedupe findings by `(file, line, cwe)`. When two findings collide, keep
+ * the one with the higher confidence; on ties, keep the first seen.
+ */
+function dedupeFindings(findings) {
+    const byKey = new Map();
+    for (const finding of findings) {
+        const key = `${finding.file}::${finding.line ?? ''}::${finding.cwe ?? ''}`;
+        const existing = byKey.get(key);
+        if (existing === undefined || finding.confidence > existing.confidence) {
+            byKey.set(key, finding);
+        }
+    }
+    return Array.from(byKey.values());
+}
+/**
+ * Filter findings to those with severity at or above `threshold`.
+ *
+ * Severity ordering: `critical > high > medium > low`. `'all'` includes
+ * everything. Unknown thresholds fall back to `'low'` (backward-compatible
+ * default — same as the existing pre-filter summary that listed all).
+ */
+function filterBySeverity(findings, threshold) {
+    if (threshold === 'all')
+        return [...findings];
+    if (!isSeverity(threshold))
+        return [...findings];
+    const min = SEVERITY_RANK[threshold];
+    return findings.filter((f) => SEVERITY_RANK[f.severity] >= min);
+}
+/**
+ * Aggregate counts by severity. Useful for `findings_count_json` and the
+ * step-summary table.
+ */
+function countFindings(findings) {
+    const counts = { ...exports.EMPTY_FINDINGS_COUNT };
+    for (const f of findings) {
+        counts[f.severity] += 1;
+    }
+    return counts;
+}
+
+
+/***/ }),
+
 /***/ 862:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -1246,6 +1578,8 @@ const streaming_js_1 = __nccwpck_require__(834);
 const inputs_js_1 = __nccwpck_require__(601);
 const retry_js_1 = __nccwpck_require__(464);
 const source_cache_js_1 = __nccwpck_require__(682);
+const output_formatter_js_1 = __nccwpck_require__(750);
+const status_check_js_1 = __nccwpck_require__(420);
 exports.ACTION_VERSION = '0.3.0';
 async function run(args) {
     const { params, deps } = args;
@@ -1335,6 +1669,18 @@ async function run(args) {
     }
     const totalMs = Date.now() - startedAt;
     const totalCostUsdc = result.totalCostMicroUsdc / 1_000_000;
+    const findings = (0, output_formatter_js_1.formatFindings)(result.outputs);
+    const severityThreshold = (0, output_formatter_js_1.readSeverityThresholdFromEnv)();
+    const filteredFindings = (0, output_formatter_js_1.filterBySeverity)(findings, severityThreshold);
+    const findingsCount = (0, output_formatter_js_1.countFindings)(findings);
+    const failOn = (0, status_check_js_1.readFailOnFromEnv)();
+    const statusResult = (0, status_check_js_1.computeStatus)(findings, failOn);
+    (0, streaming_js_1.writeOutput)('findings_json', JSON.stringify(findings));
+    (0, streaming_js_1.writeOutput)('summary_only_findings_json', JSON.stringify(filteredFindings));
+    (0, streaming_js_1.writeOutput)('findings_count_json', JSON.stringify(findingsCount));
+    (0, streaming_js_1.writeOutput)('status', statusResult.status);
+    (0, streaming_js_1.writeOutput)('failed_count', String(statusResult.failed_count));
+    (0, streaming_js_1.writeOutput)('max_severity', statusResult.max_severity ?? '');
     (0, streaming_js_1.writeActionSummary)({
         pipelineName,
         provider: inputs.provider,
@@ -1343,6 +1689,9 @@ async function run(args) {
         totalMs,
         totalCostUsdc,
         outputs: result.outputs,
+        findingsCount,
+        filteredFindings,
+        status: statusResult,
     });
     (0, streaming_js_1.writeOutput)('result_json', JSON.stringify(result.outputs));
     (0, streaming_js_1.writeOutput)('total_ms', String(totalMs));
@@ -1526,6 +1875,92 @@ async function readCacheFile(file, opts = {}) {
 async function clearCache(opts = {}) {
     const cacheDir = opts.cacheDir ?? defaultCacheDir();
     await fs.rm(cacheDir, { recursive: true, force: true });
+}
+
+
+/***/ }),
+
+/***/ 420:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+/**
+ * GitHub Actions status-check computation.
+ *
+ * Given a flat `ReviewFinding[]` and a `failOn` severity level, derive a
+ * pass/fail decision + the highest severity seen + a count of findings
+ * that triggered the failure. Designed to feed three new action outputs:
+ *
+ *   - `status`            — `'passed' | 'failed'`
+ *   - `failed_count`      — number of findings with severity >= `failOn`
+ *   - `max_severity`      — highest severity seen (or `null` for none)
+ *
+ * The action does NOT call the GitHub API — callers (web3eco repos) read
+ * these outputs and post the status via `gh api` or
+ * `actions/github-script`. This module is pure: easy to unit test, easy
+ * to embed.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.computeStatus = computeStatus;
+exports.readFailOnFromEnv = readFailOnFromEnv;
+const output_formatter_js_1 = __nccwpck_require__(750);
+/**
+ * Compute the action's pass/fail decision.
+ *
+ * `failOn` semantics:
+ *   - `'critical'` — any critical finding fails the check (default).
+ *   - `'high'`     — critical OR high fails.
+ *   - `'medium'`   — critical/high/medium fails.
+ *   - `'low'`      — every finding fails.
+ *   - `'all'`      — same as `'low'` (any finding = fail).
+ *
+ * Unknown `failOn` falls back to `'critical'` (the safe default — never
+ * silently greenwash a critical finding).
+ */
+function computeStatus(findings, failOn = 'critical') {
+    const resolvedFailOn = (0, output_formatter_js_1.isSeverity)(failOn) || failOn === 'all' ? failOn : 'critical';
+    if (findings.length === 0) {
+        return { status: 'passed', failed_count: 0, max_severity: null };
+    }
+    let maxSeverity = null;
+    let maxRank = 0;
+    for (const f of findings) {
+        const rank = (0, output_formatter_js_1.severityRank)(f.severity);
+        if (rank > maxRank) {
+            maxRank = rank;
+            maxSeverity = f.severity;
+        }
+    }
+    const failOnRank = resolvedFailOn === 'all' ? 1 : (0, output_formatter_js_1.severityRank)(resolvedFailOn);
+    let failed = 0;
+    for (const f of findings) {
+        if ((0, output_formatter_js_1.severityRank)(f.severity) >= failOnRank)
+            failed += 1;
+    }
+    return {
+        status: failed > 0 ? 'failed' : 'passed',
+        failed_count: failed,
+        max_severity: maxSeverity,
+    };
+}
+/**
+ * Read the `fail_on` action input via the env var. Mirrors
+ * `readSeverityThresholdFromEnv` — bypasses `src/inputs.ts` (Agent B's
+ * territory) so this module is self-contained.
+ *
+ * Default = `'critical'` — any critical finding fails the check.
+ */
+function readFailOnFromEnv(env = process.env) {
+    const raw = env['INPUT_FAIL_ON'];
+    if (!raw || raw.length === 0)
+        return 'critical';
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === 'all')
+        return 'all';
+    if ((0, output_formatter_js_1.isSeverity)(normalized))
+        return normalized;
+    return 'critical';
 }
 
 

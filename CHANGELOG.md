@@ -1,8 +1,26 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
-## v0.3.0 (2026-09-27)
+## v0.3.1 (2026-09-27) — output wiring hotfix
 
-> Single v0.3.0 release consolidating the core plumbing (Agent B) and output layer (Agent C) work. All changes are additive; v0.2.1 consumers see zero behaviour change unless they opt into the new inputs.
+> **Critical hotfix.** v0.3.0's new outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) were **not wired to action boundaries** — `output-formatter.ts` and `status-check.ts` computed them, but `run.ts` never called `writeOutput()` for them and `action.yml` never declared them. Consumers reading `${{ steps.X.outputs.findings_json }}` got empty strings. **v0.3.0 should not be used.** Upgrade to v0.3.1.
+
+### Fixed
+- **PR-review output wiring** — `run.ts` now calls `formatFindings`, `filterBySeverity`, `countFindings`, `readSeverityThresholdFromEnv`, `readFailOnFromEnv`, `computeStatus` after each pipeline run, then emits:
+  - `findings_json` — full normalized `ReviewFinding[]` (severity, file, line, message, cwe, confidence, recommendation)
+  - `summary_only_findings_json` — filtered by `severity_threshold` action input
+  - `findings_count_json` — `{critical, high, medium, low}` counts
+  - `status` — `passed | failed` (driven by `fail_on` action input, default `critical`)
+  - `failed_count` — integer count of findings at or above `fail_on`
+  - `max_severity` — highest severity seen, or empty string when no findings
+- **Output declarations** — `action.yml` declares all 6 new outputs so GH Actions exposes them to consumer workflows (`${{ steps.X.outputs.findings_json }}` now returns real data).
+- **`writeActionSummary`** now receives `findingsCount` + `filteredFindings` + `status` so the step summary shows the status badge, findings count, and "Findings above threshold" section when callers supply them.
+
+### Compatibility
+- 100% additive. v0.2.1 / v0.3.0 consumers still work — the new outputs are present in v0.3.1 too but only have content when the pipeline emits structured findings. Existing `result_json` / `total_ms` / `total_cost_usdc` / `stage_count` outputs unchanged.
+
+## v0.3.0 (2026-09-27) — ⚠️ SUPERSEDED, DO NOT USE
+
+> Single v0.3.0 release consolidating the core plumbing (Agent B) and output layer (Agent C) work. All changes are additive; v0.2.1 consumers see zero behaviour change unless they opt into the new inputs. **This release is incomplete — see v0.3.1 above. The 6 new outputs advertised below were computed but never wired to `${{ steps.X.outputs.* }}`, so consumer workflows reading them always got empty strings. Upgrade to v0.3.1.**
 
 ### Added — Core plumbing (Agent B)
 

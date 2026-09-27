@@ -50,6 +50,18 @@ outputs:
     description: 'Per-stage wall-clock duration (set per stage).'
   stage_<id>_output:
     description: 'Per-stage output text (set per stage).'
+  findings_json:
+    description: 'Normalized review findings from structured_json stage outputs (severity, file, line, message, cwe, confidence, recommendation). Empty array when no findings.'
+  summary_only_findings_json:
+    description: 'Findings filtered by severity_threshold input. Empty array when none match.'
+  findings_count_json:
+    description: 'Aggregate counts by severity: {critical, high, medium, low}.'
+  status:
+    description: 'passed | failed — pass/fail decision based on fail_on input.'
+  failed_count:
+    description: 'Number of findings at or above fail_on threshold.'
+  max_severity:
+    description: 'Highest severity seen across all findings (critical|high|medium|low) or empty string when no findings.'
 
 runs:
   using: node20
