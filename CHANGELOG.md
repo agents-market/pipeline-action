@@ -1,5 +1,28 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## v0.4.2 (2026-09-27) — manifest contract fix (patch)
+
+> **Patch release.** Same cumulative feature surface as v0.4.1. Fixes a manifest-loading bug introduced in v0.3.0 that made every release from v0.3.0 through v0.4.1 silently non-runnable on the GH runner — discovered the moment a real consumer (web3eco/blockchain) bumped from `258891e` (v0.2.1, works) to `de0dbbf` (v0.3.1+, broken). The unit test suite and typecheck all passed against the broken manifest because the runner validates the contract AT LOAD TIME, after the JS bundle is shipped.
+
+### Fixed
+
+- **`runs.pre:` removed.** v0.3.0 introduced a pre-flight schema validation step in `runs.pre:`, but wrote it in YAML sequence form (composite-action step syntax). The runner rejects it at load time with `Unexpected type 'SequenceToken' encountered while reading 'pre'. The type 'StringToken' was expected.` and refuses to load the action at all. The pre-step's job ("don't let a malformed pipeline.yaml reach the LLM provider") was already done by `run.ts` (env expansion → YAML parse → `stages[]` shape check → exits non-zero before any provider call). The pre-step was marginal value at the cost of an unusable manifest, so it is gone.
+
+### Added (gate)
+
+- **`scripts/validate-action-manifest.mjs`** — JS manifest contract checker, no deps beyond `yaml`. Runs in `.husky/pre-commit` and as the new `action-manifest` job in `.github/workflows/ci.yml`. Catches the v0.3.0..v0.4.1 class and adjacent errors (composite-vs-JS confusion, bare `pre:`, unknown Feather icons, invalid hex, missing required fields, non-string `outputs.value`).
+
+### Migration
+
+- `v0.3.x` consumers: drop in the upgrade, no workflow changes required.
+- `v0.4.1` consumers (standalone tag): upgrade to `@v0.4.2` to actually load the manifest. v0.4.1 was published but unrunnable.
+
+### Migration note for `web3eco/blockchain` row 109
+
+The row-109 SHA bump from `@258891e` (v0.2.1) to `@de0dbbf` (v0.3.1) **fails** against `@v0.4.1` because v0.3.1+ is broken. It will succeed against `@v0.4.2` (manifest valid, same inline-comment + status-check features that the bump was meant to unlock).
+
+---
+
 ## v0.4.1 (2026-09-27) — consolidation hotfix
 
 > **Cumulative release.** v0.4.1 bundles all v0.3.2 → v0.4.0 features into a single release. Five parallel feature branches shipped in isolation while main never received their commits; downstream consumers installing `@v0.4.0` got an incomplete release missing v0.3.2/3/4 features. v0.4.1 restores the cumulative contract — every input/output from every merged feature is present in `action.yml`. **No breaking changes** — the union of features is additive on top of v0.3.1.
