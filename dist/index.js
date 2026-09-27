@@ -859,7 +859,7 @@ async function buildExecutorDeps(params) {
         ]
         : [zeroPricing];
     const pricing = new pipeline_runtime_1.CompositePricingResolver(resolvers);
-    return {
+    const deps = {
         provider,
         registry,
         pricing,
@@ -868,7 +868,9 @@ async function buildExecutorDeps(params) {
         getCurrentAgentId: () => '0xaction-runner',
         getPipelineAuthorId: () => '0xaction-runner',
         isLocal: false,
+        context_mode: params.inputs.context_mode,
     };
+    return deps;
 }
 
 
@@ -890,10 +892,15 @@ async function buildExecutorDeps(params) {
  * The API key resolves from the explicit `api_key` input first, then from
  * the provider-specific env var (MINIMAX_API_KEY / OPENAI_API_KEY /
  * ANTHROPIC_API_KEY / OPENROUTER_API_KEY).
+ *
+ * Context mode (v0.3.0 — TASKS row 90): the `context_mode` input declares how
+ * much code context the LLM sees beyond the PR diff. The actual fetching is
+ * pipeline-runtime's responsibility; we only plumb the declaration through.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.PROVIDER_ENV_VARS = exports.DEFAULT_PROVIDER = exports.SUPPORTED_PROVIDERS = void 0;
+exports.DEFAULT_CONTEXT_MODE = exports.SUPPORTED_CONTEXT_MODES = exports.PROVIDER_ENV_VARS = exports.DEFAULT_PROVIDER = exports.SUPPORTED_PROVIDERS = void 0;
 exports.normalizeProvider = normalizeProvider;
+exports.normalizeContextMode = normalizeContextMode;
 exports.resolveApiKeyForProvider = resolveApiKeyForProvider;
 exports.readInputs = readInputs;
 exports.parseInputJson = parseInputJson;
@@ -910,6 +917,13 @@ exports.PROVIDER_ENV_VARS = {
     anthropic: 'ANTHROPIC_API_KEY',
     openrouter: 'OPENROUTER_API_KEY',
 };
+exports.SUPPORTED_CONTEXT_MODES = [
+    'diff',
+    'imports',
+    'related',
+    'full',
+];
+exports.DEFAULT_CONTEXT_MODE = 'imports';
 const DEFAULT_MODEL = 'MiniMax-M3';
 function readEnvBool(name, fallback) {
     const raw = process.env[name];
@@ -932,6 +946,19 @@ function normalizeProvider(raw, model) {
         `Supported providers: ${exports.SUPPORTED_PROVIDERS.join(', ')}. ` +
         `Set 'provider' to one of these or drop the input (default '${exports.DEFAULT_PROVIDER}').`);
 }
+function normalizeContextMode(raw) {
+    if (raw === undefined || raw === null)
+        return exports.DEFAULT_CONTEXT_MODE;
+    const normalized = raw.trim().toLowerCase();
+    if (normalized === '')
+        return exports.DEFAULT_CONTEXT_MODE;
+    if (exports.SUPPORTED_CONTEXT_MODES.includes(normalized)) {
+        return normalized;
+    }
+    throw new Error(`Unsupported context_mode '${raw}'. ` +
+        `Supported values: ${exports.SUPPORTED_CONTEXT_MODES.join(', ')}. ` +
+        `Drop the input to use the default ('${exports.DEFAULT_CONTEXT_MODE}').`);
+}
 function resolveApiKeyForProvider(explicitKey, provider, env = process.env) {
     if (explicitKey && explicitKey.length > 0)
         return explicitKey;
@@ -950,6 +977,7 @@ function readInputs() {
         inputs_json: readEnvString('INPUT_INPUTS_JSON', null),
         fail_fast: readEnvBool('INPUT_FAIL_FAST', true),
         mock: readEnvBool('INPUT_MOCK', false),
+        context_mode: normalizeContextMode(process.env.INPUT_CONTEXT_MODE),
     };
 }
 function parseInputJson(raw, where) {
@@ -1069,6 +1097,126 @@ function parseInlineInputs(raw) {
 
 /***/ }),
 
+/***/ 464:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * v0.3.0 — Exponential backoff retry for LLM provider calls.
+ *
+ * Retries ONLY on transient errors:
+ *   - 429 (rate limit, including the Anthropic `Token Plan usage limit reached` literal)
+ *   - HTTP 5xx (server errors)
+ *   - SDK errors whose class name includes `RateLimit` (Anthropic SDK, OpenAI SDK, etc.)
+ *
+ * Does NOT retry on:
+ *   - 4xx other than 429 (bad request, auth, etc. — caller bug, retrying wastes money)
+ *   - Auth errors (401/403) — fix the key, don't retry
+ *   - Validation errors — fix the pipeline, don't retry
+ *
+ * Backoff formula: `min(baseDelayMs * 2^attempt, maxDelayMs)` with optional ±20% jitter.
+ * Attempt numbering starts at 0 for the first retry (so 3 retries = attempt 0, 1, 2).
+ *
+ * No `as any` / `@ts-ignore` — fully typed.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.RetryExhaustedError = void 0;
+exports.defaultRetryable = defaultRetryable;
+exports.computeBackoffMs = computeBackoffMs;
+exports.withRetry = withRetry;
+class RetryExhaustedError extends Error {
+    attempts;
+    lastError;
+    constructor(attempts, lastError) {
+        const msg = lastError instanceof Error ? lastError.message : String(lastError);
+        super(`Retry exhausted after ${attempts} attempts — last error: ${msg}`);
+        this.name = 'RETRY_EXHAUSTED';
+        this.attempts = attempts;
+        this.lastError = lastError;
+    }
+}
+exports.RetryExhaustedError = RetryExhaustedError;
+const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_BASE_DELAY_MS = 1000;
+const DEFAULT_MAX_DELAY_MS = 30_000;
+const DEFAULT_JITTER = true;
+function defaultRetryable(e) {
+    if (e === null || e === undefined)
+        return false;
+    const err = e;
+    const status = err.status ?? err.statusCode;
+    if (typeof status === 'number') {
+        if (status === 429)
+            return true;
+        if (status >= 500 && status <= 599)
+            return true;
+        return false;
+    }
+    if (typeof err.name === 'string' && err.name.toLowerCase().includes('ratelimit'))
+        return true;
+    if (typeof err.code === 'string' && err.code.toLowerCase().includes('ratelimit'))
+        return true;
+    if (typeof err.message === 'string') {
+        const lower = err.message.toLowerCase();
+        if (lower.includes('429'))
+            return true;
+        if (lower.includes('token plan usage limit reached'))
+            return true;
+        if (lower.includes('rate limit'))
+            return true;
+    }
+    return false;
+}
+function computeBackoffMs(attempt, baseDelayMs, maxDelayMs, jitter) {
+    if (attempt < 0)
+        attempt = 0;
+    const base = Math.min(baseDelayMs * Math.pow(2, attempt), maxDelayMs);
+    if (!jitter)
+        return base;
+    const jitterRange = base * 0.2;
+    const offset = (Math.random() * 2 - 1) * jitterRange;
+    return Math.max(0, Math.round(base + offset));
+}
+async function withRetry(fn, opts = {}) {
+    const maxRetries = opts.maxRetries ?? DEFAULT_MAX_RETRIES;
+    const baseDelayMs = opts.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
+    const maxDelayMs = opts.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+    const jitter = opts.jitter ?? DEFAULT_JITTER;
+    const isRetryable = opts.retryableErrors ?? defaultRetryable;
+    const onRetry = opts.onRetry;
+    const sleep = opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    let attempt = 0;
+    while (true) {
+        try {
+            return await fn();
+        }
+        catch (e) {
+            if (attempt >= maxRetries || !isRetryable(e)) {
+                if (attempt >= maxRetries && isRetryable(e)) {
+                    throw new RetryExhaustedError(attempt + 1, e);
+                }
+                throw e;
+            }
+            const delayMs = computeBackoffMs(attempt, baseDelayMs, maxDelayMs, jitter);
+            if (onRetry) {
+                onRetry({
+                    attempt,
+                    maxRetries,
+                    delayMs,
+                    errorMessage: e instanceof Error ? e.message : String(e),
+                    errorName: e instanceof Error && e.name ? e.name : 'Error',
+                });
+            }
+            await sleep(delayMs);
+            attempt += 1;
+        }
+    }
+}
+
+
+/***/ }),
+
 /***/ 795:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -1096,10 +1244,22 @@ exports.run = run;
 const pipeline_runtime_1 = __nccwpck_require__(676);
 const streaming_js_1 = __nccwpck_require__(834);
 const inputs_js_1 = __nccwpck_require__(601);
-exports.ACTION_VERSION = '0.2.0';
+const retry_js_1 = __nccwpck_require__(464);
+const source_cache_js_1 = __nccwpck_require__(682);
+exports.ACTION_VERSION = '0.3.0';
 async function run(args) {
     const { params, deps } = args;
     const inputs = params.inputs;
+    // Source cache (v0.3.0): when the pipeline came from a file, warm the
+    // per-job cache so re-runs within the same GH Actions job (matrix
+    // builds, multiple steps) skip the disk read. The fetcher returns the
+    // already-loaded content — no extra disk hit on a cold cache.
+    if (params.resolved_from === 'file' && inputs.pipeline_file) {
+        const cached = await (0, source_cache_js_1.getCachedPipelineSource)(inputs.pipeline_file, async () => params.pipeline_spec);
+        (0, streaming_js_1.notice)(cached.cacheHit
+            ? `↻ pipeline source cache hit: ${inputs.pipeline_file}`
+            : `↓ pipeline source cache populated: ${inputs.pipeline_file} (${cached.size} bytes)`);
+    }
     let resolvedSpec;
     try {
         resolvedSpec = (0, pipeline_runtime_1.expandPipelineText)(params.pipeline_spec, buildPipelineEnv(inputs));
@@ -1123,7 +1283,7 @@ async function run(args) {
     }
     const stageCount = spec.stages.length;
     const pipelineName = spec.name ?? 'unnamed';
-    const providerTag = `[provider=${inputs.provider} model=${inputs.model}]`;
+    const providerTag = `[provider=${inputs.provider} model=${inputs.model} context=${inputs.context_mode}]`;
     (0, streaming_js_1.notice)(`▶ pipeline-action v${exports.ACTION_VERSION} — ${pipelineName} (${stageCount} stage${stageCount === 1 ? '' : 's'}) ${providerTag}`);
     const stagesForRuntime = spec.stages.map((s) => ({
         id: s.id,
@@ -1142,7 +1302,7 @@ async function run(args) {
     const startedAt = Date.now();
     let result;
     try {
-        result = await (0, pipeline_runtime_1.runPipelineV2)({
+        result = await (0, retry_js_1.withRetry)(() => (0, pipeline_runtime_1.runPipelineV2)({
             spec: { stages: stagesForRuntime },
             inputs: params.pipeline_inputs,
             deps,
@@ -1157,6 +1317,15 @@ async function run(args) {
                     (0, streaming_js_1.writeOutput)(`stage_${stageId}_output`, output);
                     (0, streaming_js_1.notice)(`✓ stage ${stageId} completed in ${ms}ms (${output.length} chars)`);
                 },
+            },
+        }), {
+            maxRetries: 3,
+            baseDelayMs: 1000,
+            maxDelayMs: 30_000,
+            jitter: true,
+            onRetry: (info) => {
+                (0, streaming_js_1.notice)(`↻ retry ${info.attempt + 1}/${info.maxRetries} after ${info.delayMs}ms ` +
+                    `(${info.errorName}: ${info.errorMessage})`);
             },
         });
     }
@@ -1196,6 +1365,172 @@ function buildPipelineEnv(inputs) {
 
 /***/ }),
 
+/***/ 682:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+/**
+ * v0.3.0 — Per-job pipeline source cache.
+ *
+ * GitHub Actions wipes `$RUNNER_TEMP` between jobs, so we use it as a
+ * free per-job cache directory. A consumer workflow that runs the action
+ * multiple times in the same job (matrix builds, multiple steps in a
+ * single job) reuses the cached pipeline.yaml content + the mtime hash
+ * we record at fetch time.
+ *
+ * Cache key: SHA-256 of the absolute file path (deterministic, opaque).
+ * Cache value: JSON `{ content, mtimeMs, size }` written atomically via
+ * `{file}.{pid}.{ts}.tmp` rename so concurrent readers never see a
+ * partial file.
+ *
+ * Invalidation: on every read we re-stat the source file. If the mtime
+ * has changed since the cache was written, we treat it as a miss and
+ * re-fetch. Size mismatches are treated the same way (defense in depth
+ * against clock skew on some filesystems).
+ *
+ * Cache location: `$RUNNER_TEMP/pipeline-action-cache/` (per-job temp
+ * directory). Cleared between jobs automatically by GH Actions — no
+ * manual cleanup needed.
+ */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.getCachedPipelineSource = getCachedPipelineSource;
+exports.readCacheFile = readCacheFile;
+exports.clearCache = clearCache;
+const crypto = __importStar(__nccwpck_require__(598));
+const fs = __importStar(__nccwpck_require__(455));
+const os = __importStar(__nccwpck_require__(161));
+const path = __importStar(__nccwpck_require__(760));
+function hashKey(file) {
+    return crypto.createHash('sha256').update(path.resolve(file)).digest('hex').slice(0, 32);
+}
+function defaultCacheDir() {
+    const runnerTemp = process.env.RUNNER_TEMP;
+    if (runnerTemp && runnerTemp.length > 0)
+        return path.join(runnerTemp, 'pipeline-action-cache');
+    return path.join(os.tmpdir(), 'pipeline-action-cache');
+}
+async function ensureDir(dir) {
+    await fs.mkdir(dir, { recursive: true });
+}
+async function readJsonFile(file) {
+    try {
+        const raw = await fs.readFile(file, 'utf8');
+        return JSON.parse(raw);
+    }
+    catch (e) {
+        if (e.code === 'ENOENT')
+            return null;
+        throw e;
+    }
+}
+async function atomicWriteFile(file, contents) {
+    const unique = crypto.randomBytes(8).toString('hex');
+    const tmp = `${file}.${process.pid}.${Date.now()}.${unique}.tmp`;
+    await fs.writeFile(tmp, contents, 'utf8');
+    await fs.rename(tmp, file);
+}
+/**
+ * Fetch the pipeline source for `file`, caching the result on disk for
+ * subsequent calls in the same GH Actions job.
+ *
+ * Behavior:
+ *  - On first call (cache miss): runs `fetchFn()`, stores the result, returns.
+ *  - On subsequent calls (cache hit): returns the cached content without
+ *    invoking `fetchFn`, unless the source file's mtime/size has changed
+ *    since the cache was populated (in which case it's a miss and we re-fetch).
+ */
+async function getCachedPipelineSource(file, fetchFn, opts = {}) {
+    const cacheDir = opts.cacheDir ?? defaultCacheDir();
+    const statFn = opts.stat ??
+        (async (f) => {
+            const s = await fs.stat(f);
+            return { mtimeMs: s.mtimeMs, size: s.size };
+        });
+    await ensureDir(cacheDir);
+    const cacheFile = path.join(cacheDir, `${hashKey(file)}.json`);
+    let currentStat = null;
+    try {
+        currentStat = await statFn(file);
+    }
+    catch {
+        currentStat = null;
+    }
+    const cached = await readJsonFile(cacheFile);
+    if (cached !== null && currentStat !== null) {
+        if (cached.mtimeMs === currentStat.mtimeMs && cached.size === currentStat.size) {
+            return { content: cached.content, mtimeMs: cached.mtimeMs, size: cached.size, cacheHit: true };
+        }
+    }
+    const content = await fetchFn();
+    let mtimeMs = currentStat?.mtimeMs ?? 0;
+    let size = currentStat?.size ?? Buffer.byteLength(content, 'utf8');
+    if (currentStat === null) {
+        try {
+            const freshStat = await statFn(file);
+            mtimeMs = freshStat.mtimeMs;
+            size = freshStat.size;
+        }
+        catch {
+            mtimeMs = 0;
+            size = Buffer.byteLength(content, 'utf8');
+        }
+    }
+    const record = { content, mtimeMs, size };
+    await atomicWriteFile(cacheFile, JSON.stringify(record));
+    return { content, mtimeMs, size, cacheHit: false };
+}
+/** Test helper: read a cache file directly (returns null if absent). */
+async function readCacheFile(file, opts = {}) {
+    const cacheDir = opts.cacheDir ?? defaultCacheDir();
+    const cacheFile = path.join(cacheDir, `${hashKey(file)}.json`);
+    const cached = await readJsonFile(cacheFile);
+    if (cached === null)
+        return null;
+    return { ...cached, cacheHit: true };
+}
+/** Test helper: wipe the cache root. Not used in production. */
+async function clearCache(opts = {}) {
+    const cacheDir = opts.cacheDir ?? defaultCacheDir();
+    await fs.rm(cacheDir, { recursive: true, force: true });
+}
+
+
+/***/ }),
+
 /***/ 834:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -1213,6 +1548,11 @@ function buildPipelineEnv(inputs) {
  * $GITHUB_OUTPUT is the modern way to set action outputs (deprecated command is
  * ::set-output::). When tests run outside a GH Actions runner, the file pointer
  * is absent; callers should guard for that case.
+ *
+ * v0.3.0 additive: `ActionSummary` now optionally carries PR-review style
+ * `findingsCount`, `filteredFindings` (above threshold) and `status`. The
+ * renderer adds rows/sections for these when present — the v0.2.1 format
+ * is preserved when callers omit the new fields.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.group = group;
@@ -1265,6 +1605,10 @@ function appendSummary(markdown) {
  * pipeline name, provider, model, cost, duration and stage count, followed
  * by one collapsible-friendly section per stage. Markdown is appended raw
  * (no workflow-command escaping — summaries render as Markdown).
+ *
+ * v0.3.0 ADDITIVE: when the caller passes `findingsCount` / `filteredFindings` /
+ * `status`, two extra rows appear in the header table and an extra section
+ * lists the filtered findings. Existing rows/sections are untouched.
  */
 function writeActionSummary(summary) {
     const lines = [
@@ -1278,8 +1622,30 @@ function writeActionSummary(summary) {
         `| Wall-clock | ${summary.totalMs}ms |`,
         `| Est. cost | ~$${summary.totalCostUsdc.toFixed(6)} USDC |`,
     ];
+    // v0.3.0 ADDITIVE: status badge row (when caller computed one).
+    if (summary.status !== undefined) {
+        const badge = summary.status.status === 'passed' ? '✅ passed' : '❌ failed';
+        const maxSev = summary.status.max_severity ?? '—';
+        lines.push(`| Status | ${badge} · ${summary.status.failed_count} failing · max severity \`${maxSev}\` |`);
+    }
+    // v0.3.0 ADDITIVE: findings count row (when caller passed counts).
+    if (summary.findingsCount !== undefined) {
+        const c = summary.findingsCount;
+        const total = c.critical + c.high + c.medium + c.low;
+        lines.push(`| Findings | ${total} total · 🔴 ${c.critical} critical · 🟠 ${c.high} high · 🟡 ${c.medium} medium · ⚪ ${c.low} low |`);
+    }
     for (const [id, val] of Object.entries(summary.outputs)) {
         lines.push('', `### ${id}`, '', val.length > 0 ? val : '_skipped_');
+    }
+    // v0.3.0 ADDITIVE: findings-above-threshold section (PR-review UX).
+    if (summary.filteredFindings !== undefined &&
+        summary.filteredFindings.length > 0) {
+        lines.push('', '### Findings above threshold', '');
+        for (const f of summary.filteredFindings) {
+            const loc = f.line !== undefined ? `${f.file}:${f.line}` : f.file.length > 0 ? f.file : 'file-level';
+            const cwe = f.cwe !== undefined ? ` (${f.cwe})` : '';
+            lines.push(`- **${f.severity.toUpperCase()}** \`${loc}\`${cwe} — ${f.message} _(confidence ${f.confidence.toFixed(2)})_`);
+        }
     }
     appendSummary(lines.join('\n'));
 }

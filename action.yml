@@ -32,6 +32,10 @@ inputs:
     description: 'Use a deterministic mock provider (no real LLM API). Useful for dry-runs + tests.'
     required: false
     default: 'false'
+  context_mode:
+    description: "How much code context the LLM sees beyond the PR diff. 'diff' = PR diff only (cost ~1x). 'imports' (default) = diff + imported types (~3x). 'related' = diff + files importing changed files (~10x). 'full' = diff + all .ts/.py files in repo (~100x). Actual fetching is pipeline-runtime's responsibility; this input only declares the wiring."
+    required: false
+    default: 'imports'
 
 outputs:
   result_json:
@@ -50,6 +54,30 @@ outputs:
 runs:
   using: node20
   main: dist/index.js
+
+  # v0.3.0 — pre-step: pre-flight schema validation via @agentsmarket/cli
+  # (npm-distributed, v0.9.0+). Skips the main step on validation failure so
+  # a malformed pipeline.yaml never reaches the LLM provider. Inline
+  # pipeline_yaml specs are validated by the main step itself.
+  pre:
+    - name: agentsmarket validate (pre-flight schema check)
+      id: pre
+      shell: bash
+      env:
+        AGENTSMARKET_PIPELINE_FILE: ${{ inputs.pipeline_file }}
+      run: |
+        set -euo pipefail
+        if [ -z "${AGENTSMARKET_PIPELINE_FILE:-}" ]; then
+          echo "::notice::pre-step skipped: no pipeline_file (inline pipeline_yaml provided)"
+          echo "validation_status=skipped" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if ! npx --yes @agentsmarket/cli@^0.9.0 validate "${AGENTSMARKET_PIPELINE_FILE}"; then
+          echo "::error::pre-step failed: pipeline schema invalid — fix pipeline_file before re-running"
+          echo "validation_status=failed" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+        echo "validation_status=passed" >> "$GITHUB_OUTPUT"
 
 branding:
   icon: 'play'
