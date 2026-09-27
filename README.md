@@ -4,7 +4,7 @@ GitHub Action that runs an agentsmarket `pipeline.yaml` inside a step. Streams e
 
 ## Status
 
-**v0.3.1 — output wiring hotfix.** The v0.3.0 release advertised 6 new outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) but Agent C's implementation computed them in `output-formatter.ts` + `status-check.ts` without calling `writeOutput()` or declaring them in `action.yml` — consumers reading `${{ steps.X.outputs.findings_json }}` always got empty strings. **v0.3.0 should not be used.** v0.3.1 wires all 6 outputs to action boundaries: `run.ts` calls `formatFindings` + `filterBySeverity` + `countFindings` + `readSeverityThresholdFromEnv` + `computeStatus` + `readFailOnFromEnv` after each pipeline run, then emits them via `writeOutput()`; `action.yml` declares them; `writeActionSummary()` renders the step-summary badge + "Findings above threshold" section. All v0.3.0 features remain: `context_mode` input (`diff | imports | related | full`), exponential backoff retry for 429/5xx, per-job pipeline source cache, pre-step `agentsmarket validate` (catches malformed `pipeline.yaml` before any LLM call, saves $). Build on v0.2.1's provider selection. Pre-step requires `@agentsmarket/cli` (npm, v0.9.0+). LLM-only stages work; `uses:` skill stages surface "skill not found" (R12.2-R12.4 ship marketplace-fetched skills). **Consumer contract:** consumers wire v0.3.1 outputs to GH status checks + inline PR review comments via `actions/github-script`. See `examples/integrations/code-review-workflow.yml` for the canonical pattern (shipped in `web3eco/shared-actions/.github/workflows/ai-code-review.yml` via commit `de0dbbf`).
+**v0.3.3 — PR review deduplication.** v0.3.1 wired the 6 PR-review outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) to action boundaries; v0.3.2 added the `cost_usdc` + `timing_json` machine-readable outputs for downstream observability. v0.3.3 ships **PR Review deduplication** (TASKS row 102): a single PR Review per commit, edited on subsequent runs via GitHub's PR Review API (`octokit.rest.pulls.createReview` + `updateReview`) — instead of one new issue comment per pipeline run. The `use_dedup_reviews` input (default `true`) is the consumer switch. Backward-compat: set `use_dedup_reviews: false` to fall back to the v0.3.1 issue-comment behaviour. The new `src/post-review.ts` exports `postReview({ octokit, owner, repo, pull_number, commit_sha, findings, severity_threshold, fail_on })` for direct use in `actions/github-script` blocks. All v0.3.0/v0.3.1 features remain: `context_mode` input (`diff | imports | related | full`), exponential backoff retry for 429/5xx, per-job pipeline source cache, pre-step `agentsmarket validate` (catches malformed `pipeline.yaml` before any LLM call, saves $). Build on v0.2.1's provider selection. Pre-step requires `@agentsmarket/cli` (npm, v0.9.0+). LLM-only stages work; `uses:` skill stages surface "skill not found" (R12.2-R12.4 ship marketplace-fetched skills). **Consumer contract:** consumers wire v0.3.1 outputs to GH status checks + PR review threads via `actions/github-script` using the `postReview()` helper. See `examples/integrations/code-review-workflow.yml` for the canonical pattern (shipped in `web3eco/shared-actions/.github/workflows/ai-code-review.yml`).
 
 ## Usage
 
@@ -42,6 +42,7 @@ jobs:
 | `fail_fast` | no | `true` | Stop on first stage error |
 | `mock` | no | `false` | Use deterministic mock provider (no real API) |
 | `context_mode` | no | `imports` | How much code context the LLM sees beyond the PR diff. One of `diff` (PR diff only, ~1x cost), `imports` (diff + imported types, ~3x), `related` (diff + files importing changed files, ~10x), `full` (diff + all `.ts`/`.py` files, ~100x). The actual fetching is `pipeline-runtime`'s responsibility — see TASKS row 90. |
+| `use_dedup_reviews` | no | `true` | v0.3.3+ — when `true` (default), the bundled `postReview()` helper is the canonical posting path (single PR Review per commit, edited on update via the PR Review API). Set to `false` to opt out and fall back to the v0.3.1 issue-comment behaviour. See [PR Review Dedup (v0.3.3+)](#pr-review-dedup-v033). |
 
 ## Providers
 
@@ -79,7 +80,9 @@ Each run appends a step-summary report (`$GITHUB_STEP_SUMMARY`) with pipeline na
 |------|-------------|
 | `result_json` | JSON-stringified record of `stage_id -> output_text` |
 | `total_ms` | Wall-clock pipeline duration |
-| `total_cost_usdc` | Estimated cost with 6 decimals |
+| `total_cost_usdc` | Estimated cost with 6 decimals (e.g. `"0.001234"`). v0.3.0+. |
+| `cost_usdc` | (v0.3.2+) Machine-readable USDC cost (same value as `total_cost_usdc`; the new name standardizes on the convention used by the MiniMax x402 micropayment pipeline). For dashboards / billing / runaway-PR detection. |
+| `timing_json` | (v0.3.2+) Per-stage wall-clock as JSON: `{"validate_ms":12,"fetch_source_ms":89,"run_pipeline_ms":1240,"format_output_ms":23}`. Stages never measured default to 0 ms. |
 | `stage_count` | Number of stages declared |
 | `stage_<id>_ms` | Per-stage wall-clock |
 | `stage_<id>_output` | Per-stage output text |
@@ -89,6 +92,70 @@ Each run appends a step-summary report (`$GITHUB_STEP_SUMMARY`) with pipeline na
 | `status` | (PR-review only) `'passed'` or `'failed'` — based on `computeStatus(findings, fail_on)`. Default fail-on = `critical`. |
 | `failed_count` | (PR-review only) integer — number of findings with severity at or above `fail_on`. |
 | `max_severity` | (PR-review only) highest severity seen (`'critical' \| 'high' \| 'medium' \| 'low'`) or empty string when no findings. |
+
+## PR Review Dedup (v0.3.3+)
+
+> **TL;DR** A single PR Review per commit, edited on subsequent runs — instead of one new issue comment per commit. Anchored to a session marker so the edit path is deterministic.
+
+### What it does
+
+Before v0.3.3, consumer workflows (e.g. `web3eco/shared-actions/.github/workflows/ai-code-review.yml`) used `octokit.rest.issues.createComment` to post a fresh comment on every AI re-run. Every push to the PR produced a new top-level comment → timeline noise.
+
+v0.3.3 introduces `src/post-review.ts` with the `postReview({ octokit, owner, repo, pull_number, commit_sha, findings, severity_threshold, fail_on })` function. It uses the **PR Review API** (`octokit.rest.pulls.createReview` + `pulls.updateReview`) instead of issue comments. The run sequence:
+
+1. **First run on a fresh PR** → `octokit.rest.pulls.listReviews({ per_page: 100 })` finds no review carrying the session marker `<!-- ai-review-session:{commit_sha} -->`. Posts a fresh review via `octokit.rest.pulls.createReview({ commit_id, event: 'COMMENT', body, comments })`. The body is anchored to the commit SHA via the marker + embeds the current findings as a fenced JSON snapshot. Inline review comments are attached for every finding with `file + line`.
+2. **Subsequent runs on a new commit** → finds the existing review by marker, **edits it** via `octokit.rest.pulls.updateReview({ review_id, body })`. The new body carries an explicit diff row (new / resolved / changed-severity) computed from the previous JSON snapshot. No duplicate review is ever posted.
+
+### Session marker contract
+
+The marker is the contract between runs:
+
+```
+<!-- ai-review-session:{commit_sha} -->
+```
+
+Where `{commit_sha}` is a 40-character lowercase hex SHA. Changing the format requires a major version bump — older reviews would be orphaned (treated as "no marker found"), left in place.
+
+### Why the PR Review API (not the issue comment API)
+
+- `pulls.updateReview` is **editable** (PATCH body). `issues.updateComment` works too, but the review form anchors to a specific commit and groups inline comments under a single review — the natural unit for "an AI's review of commit X".
+- PR Reviews are a first-class GitHub concept with their own permissions and threading — maintainers can dismiss them, request changes, etc.
+- A single review record per PR is easier to reason about than N issue comments.
+
+### Inline comment handling
+
+- On **CREATE**: every finding with a `file + line` becomes an inline review comment (scoped to the review).
+- On **UPDATE**: the GitHub REST API does not allow replacing inline comments in bulk via `updateReview`. The new body carries the full diff so maintainers see the changes without scrolling inline threads. Inline comment editing via `updateReviewComment` is tracked as v0.3.4 follow-up work.
+
+### Inputs that drive dedup behaviour
+
+| Name | Required | Default | Description |
+|------|----------|---------|-------------|
+| `use_dedup_reviews` | no | `true` | When `true` (default), the bundled `postReview()` helper is the canonical posting path. Set to `false` to opt out and fall back to the v0.3.1 issue-comment behaviour. |
+
+### Integration example
+
+Inside `actions/github-script@v7`:
+
+```javascript
+const findings = JSON.parse(process.env.FINDINGS_JSON || '[]');
+const { owner, repo } = context.repo;
+const prNumber = context.issue.number;
+const commitSha = context.payload.pull_request.head.sha;
+
+const { review_id, action } = await postReview({
+  octokit: github,
+  owner, repo,
+  pull_number: prNumber,
+  commit_sha: commitSha,
+  findings,
+  severity_threshold: 'low',
+  fail_on: 'critical',
+});
+core.info(`PR review ${action} (id=${review_id})`);
+```
+
+The `postReview()` function is also exported from `dist/index.js` after `pnpm build` — it's available to any consumer that wants to call the same helper directly.
 
 ## PR-review consumer contract
 

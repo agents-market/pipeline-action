@@ -36,6 +36,10 @@ inputs:
     description: "How much code context the LLM sees beyond the PR diff. 'diff' = PR diff only (cost ~1x). 'imports' (default) = diff + imported types (~3x). 'related' = diff + files importing changed files (~10x). 'full' = diff + all .ts/.py files in repo (~100x). Actual fetching is pipeline-runtime's responsibility; this input only declares the wiring."
     required: false
     default: 'imports'
+  use_dedup_reviews:
+    description: 'v0.3.3+ — When true (default), the bundled `postReview()` helper posts a single PR Review per commit and edits it on subsequent runs via the PR Review API (anchored to a session marker). When false, falls back to the v0.3.1 behaviour of posting a new issue-style comment per pipeline run (no dedup). Set to false if a consumer wants the legacy behaviour for any reason.'
+    required: false
+    default: 'true'
 
 outputs:
   result_json:
@@ -44,6 +48,10 @@ outputs:
     description: 'Wall-clock pipeline duration in milliseconds.'
   total_cost_usdc:
     description: 'Estimated cost in USDC with 6 decimals (e.g. "0.001234").'
+  cost_usdc:
+    description: 'Estimated API cost in USDC (x402 micropayment to MiniMax). Same value as total_cost_usdc; added in v0.3.2 for dashboards / billing / runaway-PR detection.'
+  timing_json:
+    description: 'Per-stage duration in milliseconds, JSON: {validate_ms, fetch_source_ms, run_pipeline_ms, format_output_ms}. Stages that were never measured default to 0 ms.'
   stage_count:
     description: 'Number of stages declared in the pipeline.'
   stage_<id>_ms:

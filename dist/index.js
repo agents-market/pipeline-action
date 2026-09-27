@@ -725,6 +725,84 @@ exports.pbkdf2 = pbkdf2;
 
 /***/ }),
 
+/***/ 609:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * v0.3.2 — cost computation extracted from the v0.3.1 wiring for testability.
+ *
+ * The pipeline runtime reports total cost in **micro-USDC** (1e-6 USDC).
+ * This module converts to human-readable USDC and applies the optional
+ * `context_mode` multiplier declared by the action input.
+ *
+ * Why a pure function:
+ *   - `run.ts` previously inlined `totalCostMicroUsdc / 1_000_000`. Extracting
+ *     it lets us lock the conversion factor (1e6) behind a unit test and
+ *     stage future changes (e.g. a context-mode pricing adjustment) without
+ *     touching the action lifecycle file.
+ *   - The `contextModeMultiplier` parameter is currently a no-op at 1.0:
+ *     the runtime is responsible for fetching the actual code context, and
+ *     v0.3.2 only propagates the declaration through. We thread the
+ *     multiplier through anyway so a future runtime version that reports
+ *     base cost + mode-driven uplift can hook in without an action-side
+ *     signature change.
+ *
+ * Public API:
+ *   - `computeCostInUsdc(usage, contextModeMultiplier)` — pure, no I/O.
+ *   - `CONTEXT_MODE_MULTIPLIERS` — the documented 1x / 3x / 10x / 100x table
+ *     keyed by `ContextMode` (see `inputs.ts`). Kept here as a constant so
+ *     future code (e.g. step-summary auto-suggestions) can read it without
+ *     importing the runtime action inputs.
+ *
+ * No new dependencies — `number` arithmetic only.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.CONTEXT_MODE_MULTIPLIERS = void 0;
+exports.computeCostInUsdc = computeCostInUsdc;
+/**
+ * Per-mode cost multiplier declared by the `context_mode` action input.
+ * Matches the heuristic in `action.yml` and `inputs.ts`:
+ *   - `diff`     — PR diff only (~1x cost baseline).
+ *   - `imports`  — diff + imported types (~3x, default).
+ *   - `related`  — diff + files importing changed files (~10x).
+ *   - `full`     — diff + every `.ts`/`.py` file in repo (~100x).
+ */
+exports.CONTEXT_MODE_MULTIPLIERS = {
+    diff: 1,
+    imports: 3,
+    related: 10,
+    full: 100,
+};
+/**
+ * Convert pipeline-runtime usage (micro-USDC) to human-readable USDC and
+ * apply the context-mode multiplier.
+ *
+ * @param usageMicroUsdc           Total cost reported by the runtime, in micro-USDC (1e-6 USDC). Must be >= 0.
+ * @param contextModeMultiplier    Multiplier from `CONTEXT_MODE_MULTIPLIERS`. Must be >= 0.
+ * @returns                        Cost in USDC as a plain `number`.
+ *
+ * Behaviour:
+ *   - Negative inputs are clamped to 0 (defensive — the runtime never
+ *     reports negatives, but a stray test or a manual mock might).
+ *   - NaN inputs return 0 (defensive — `Math.max` on NaN yields NaN, so
+ *     we explicitly handle it).
+ *   - Result is **not** rounded here. Callers format with `.toFixed(6)`
+ *     when they need a 6-decimal USDC string (matches v0.3.0/v0.3.1
+ *     behavior in `writeActionSummary` / `writeOutput('total_cost_usdc', …)`).
+ */
+function computeCostInUsdc(usageMicroUsdc, contextModeMultiplier) {
+    if (!Number.isFinite(usageMicroUsdc) || usageMicroUsdc < 0)
+        return 0;
+    if (!Number.isFinite(contextModeMultiplier) || contextModeMultiplier < 0)
+        return 0;
+    return (usageMicroUsdc / 1_000_000) * contextModeMultiplier;
+}
+
+
+/***/ }),
+
 /***/ 920:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -1429,6 +1507,423 @@ function parseInlineInputs(raw) {
 
 /***/ }),
 
+/***/ 207:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+/**
+ * v0.3.3 — PR Review deduplication (TASKS row 102).
+ *
+ * Replaces the prior "Post PR comment" workflow that created a new issue
+ * comment per pipeline run. On every push to the PR (i.e. every new commit),
+ * the AI re-runs and would otherwise post N separate review comments —
+ * accumulating noise in the PR timeline.
+ *
+ * Strategy: a single PR Review per commit, edited on subsequent runs by
+ * anchor in the review body. We embed a hidden HTML comment marker
+ * `<!-- ai-review-session:{commit_sha} -->` plus a JSON-encoded snapshot of
+ * the findings inside the review body. On the next run we list existing
+ * reviews, find the one carrying our marker, and either:
+ *
+ *   - update it via `octokit.rest.pulls.updateReview` (PATCH) when found, or
+ *   - create a fresh one via `octokit.rest.pulls.createReview` when missing.
+ *
+ * We deliberately use the PR Review API (`pulls.createReview` /
+ * `pulls.updateReview`) — NOT the issue-comment API (`issues.createComment`).
+ * Review edits are bounded (a single mutable record), the review anchors to
+ * a specific commit, and inline comments can ride along on creation. Issue
+ * comments have no edit body in the dedup sense — every "create" is permanent.
+ *
+ * Inline comment dedup:
+ *   - On CREATION: inline comments (one per finding with file + line) are
+ *     passed in the `comments` payload, scoped to the review.
+ *   - On UPDATE: the GitHub REST API does NOT allow changing inline comments
+ *     via `updateReview` (only the body is mutable). The body summary in
+ *     edit mode carries the NEW / RESOLVED / CHANGED-SEVERITY counts so the
+ *     PR author can see diff state without scrolling inline comments. Inline
+ *     comment dedup is tracked as v0.3.4 follow-up work.
+ *
+ * Marker format is part of the contract — changing it requires a major
+ * version bump (existing reviews would be orphaned, treated as "no marker
+ * found" and left in place).
+ *
+ * No external deps. Caller supplies the octokit client (typically from
+ * `actions/github-script`'s pre-authenticated `github` global). Pure
+ * module-level pure functions + one async I/O function (`postReview`).
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.SESSION_MARKER_PREFIX = void 0;
+exports.buildSessionMarker = buildSessionMarker;
+exports.parseSessionMarker = parseSessionMarker;
+exports.renderReviewBody = renderReviewBody;
+exports.renderInlineCommentBody = renderInlineCommentBody;
+exports.diffFindings = diffFindings;
+exports.findingKey = findingKey;
+exports.postReview = postReview;
+exports.findExistingReview = findExistingReview;
+exports.parseEmbeddedFindings = parseEmbeddedFindings;
+exports.buildInlineComments = buildInlineComments;
+exports.countBySeverity = countBySeverity;
+const output_formatter_js_1 = __nccwpck_require__(750);
+// ---------------------------------------------------------------------------
+// Session marker (contract — do not change without major version bump)
+// ---------------------------------------------------------------------------
+/**
+ * HTML comment embedded in the review body. Anchors us to a specific
+ * commit so subsequent runs (new push / re-run) can find the existing
+ * review and PATCH it instead of POSTing a duplicate.
+ *
+ * GitHub's parser strips hidden HTML comments in PR review bodies for
+ * rendering, so it never appears to humans. The leading/trailing whitespace
+ * is intentional — `<!-- ... -->` with no surrounding content renders as
+ * a true comment node, not as part of the visible Markdown.
+ */
+exports.SESSION_MARKER_PREFIX = '<!-- ai-review-session:';
+/** Build the marker for a given commit SHA. */
+function buildSessionMarker(commitSha) {
+    return `${exports.SESSION_MARKER_PREFIX}${commitSha} -->`;
+}
+/**
+ * Extract the commit SHA from a review body that contains our marker.
+ *
+ * Returns `null` when:
+ *   - body is empty / missing,
+ *   - the marker is absent (foreign review),
+ *   - the marker is malformed (corrupted truncation, wrong SHA length, etc.).
+ *
+ * The malformed-fallback is load-bearing — TASKS row 102 demands a fresh
+ * review in that case so we never silently overwrite a stranger's review.
+ */
+function parseSessionMarker(body) {
+    if (typeof body !== 'string' || body.length === 0)
+        return null;
+    const match = body.match(/<!-- ai-review-session:([a-f0-9]+) -->/);
+    if (!match || !match[1])
+        return null;
+    const sha = match[1];
+    // GitHub SHAs are always 40 hex chars (SHA-1). Reject anything else
+    // (12-char, 7-char, non-hex) as malformed — it's almost certainly
+    // manual editing or a corrupted truncation.
+    if (!/^[a-f0-9]{40}$/.test(sha))
+        return null;
+    return sha;
+}
+// ---------------------------------------------------------------------------
+// Body rendering
+// ---------------------------------------------------------------------------
+/**
+ * Render the review body — Markdown summary + JSON snapshot of findings
+ * embedded after the marker so subsequent runs can compute a set-diff.
+ *
+ * The JSON snapshot is wrapped in a fenced code block; Markdown renders it
+ * as a collapsible view in the GH PR UI. We keep it short and parseable.
+ */
+function renderReviewBody(opts) {
+    const { commitSha, findings, failOn, diff } = opts;
+    const counts = countBySeverity(findings);
+    const status = computeBodyStatus(findings, failOn);
+    const lines = [];
+    lines.push(`## AI Code Review (agents-market pipeline-action v0.3.3)`);
+    lines.push('');
+    lines.push(`**Status:** ${status.badge} ${status.label}`);
+    lines.push(`**Findings:** ${findings.length} total · `
+        + `🔴 ${counts.critical} critical · 🟠 ${counts.high} high · 🟡 ${counts.medium} medium · 🔵 ${counts.low} low`);
+    lines.push(`**Commit:** \`${commitSha.slice(0, 12)}\``);
+    if (diff) {
+        lines.push('');
+        lines.push(`**Diff vs. previous run on this PR:**`);
+        lines.push(`- 🆕 ${diff.newFindings.length} new finding(s)`);
+        lines.push(`- ✅ ${diff.resolvedFindings.length} resolved (no longer present)`);
+        lines.push(`- 🔁 ${diff.changedSeverity.length} severity change(s)`);
+    }
+    lines.push('');
+    lines.push(buildSessionMarker(commitSha));
+    lines.push('');
+    // Embedded snapshot — must be valid JSON, fenced so GH renders it as a
+    // collapsible block instead of inline. Empty array serializes to `[]`.
+    lines.push('```json');
+    lines.push(JSON.stringify(findings));
+    lines.push('```');
+    return lines.join('\n');
+}
+/** Render a single inline-comment body for a finding. Stable, deterministic. */
+function renderInlineCommentBody(f) {
+    const emoji = severityEmoji(f.severity);
+    const cwe = f.cwe ? ` \`${f.cwe}\`` : '';
+    const conf = Math.round(f.confidence * 100);
+    const head = `${emoji} **${f.severity.toUpperCase()}**${cwe} (conf ${conf}%): ${f.message}`;
+    if (f.recommendation && f.recommendation.length > 0) {
+        return `${head}\n\n💡 ${f.recommendation}`;
+    }
+    return head;
+}
+/**
+ * Compute the set-diff between two finding arrays. Identity key is
+ * `(file, line, cwe, message)` — same key across runs with different
+ * severity registers as a severity change (not new + resolved).
+ *
+ * Order in the output:
+ *   - `newFindings`     — in input order of `next`.
+ *   - `resolvedFindings` — in input order of `prev`.
+ *   - `changedSeverity` — in input order of `next`.
+ */
+function diffFindings(prev, next) {
+    const prevByKey = new Map();
+    const nextByKey = new Map();
+    for (const f of prev)
+        prevByKey.set(findingKey(f), f);
+    for (const f of next)
+        nextByKey.set(findingKey(f), f);
+    const newFindings = [];
+    const resolvedFindings = [];
+    const changedSeverity = [];
+    let unchanged = 0;
+    for (const [key, nextF] of nextByKey.entries()) {
+        const prevF = prevByKey.get(key);
+        if (prevF === undefined) {
+            newFindings.push(nextF);
+            continue;
+        }
+        if (prevF.severity !== nextF.severity) {
+            changedSeverity.push({ before: prevF, after: nextF });
+        }
+        else {
+            unchanged += 1;
+        }
+    }
+    for (const [key, prevF] of prevByKey.entries()) {
+        if (!nextByKey.has(key)) {
+            resolvedFindings.push(prevF);
+        }
+    }
+    return { newFindings, resolvedFindings, changedSeverity, unchanged };
+}
+/** Stable identity key for a finding — used by `diffFindings`. */
+function findingKey(f) {
+    return [
+        f.file,
+        f.line !== undefined ? String(f.line) : '',
+        f.cwe ?? '',
+        f.message,
+    ].join('::');
+}
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+/**
+ * Idempotent: posts a new review when no existing review carries our
+ * session marker, otherwise edits the matching review (PATCH). The
+ * resulting `review_id` is stable across runs and suitable for downstream
+ * correlation (e.g. analytics, test assertions).
+ *
+ * When `findings` is empty AND no existing review is found, this STILL
+ * posts a fresh "no issues found" review — preserves a single-record-per-PR
+ * contract. Returns `{ action: 'created' }` so the caller can distinguish.
+ *
+ * Implementation contract:
+ *   - Always uses `octokit.rest.pulls.{createReview,updateReview}` —
+ *     never `issues.createComment`.
+ *   - Never silently overwrites a stranger's review: parse failures fall
+ *     through to fresh-create (test 3 covers this).
+ *   - Reads first page only (`per_page: 100`). For PRs with >100 prior
+ *     reviews (unusual for AI reviews), fallback path is fresh-create.
+ *     Documented as a v0.3.4 follow-up if it ever bites.
+ */
+async function postReview(opts) {
+    const { octokit, owner, repo, pull_number, commit_sha, findings, fail_on, } = opts;
+    // 1. List existing reviews on the PR. First page only — covers >99% of
+    //    realistic usage. Marker search runs over the returned array; on hit
+    //    we short-circuit (no second API call).
+    const reviewsResponse = await octokit.rest.pulls.listReviews({
+        owner,
+        repo,
+        pull_number,
+        per_page: 100,
+    });
+    const existingReview = findExistingReview(reviewsResponse.data);
+    if (existingReview !== null) {
+        // 2. EDIT path — updateReview. Embed the new findings as JSON and
+        //    stamp the marker with the current commit SHA. The body diff is
+        //    computed against the previous embedded snapshot.
+        const previousSnapshot = parseEmbeddedFindings(existingReview.body);
+        const diff = diffFindings(previousSnapshot, [...findings]);
+        const newBody = renderReviewBody({
+            commitSha: commit_sha,
+            findings,
+            failOn: fail_on,
+            diff,
+        });
+        await octokit.rest.pulls.updateReview({
+            owner,
+            repo,
+            pull_number,
+            review_id: existingReview.id,
+            body: newBody,
+        });
+        return {
+            review_id: existingReview.id,
+            action: 'updated',
+            marker_sha: commit_sha,
+        };
+    }
+    // 3. CREATE path — fresh review with inline comments for every finding
+    //    that has a (file, line) location. We do NOT rely on the runtime
+    //    deduping for inline comments in v0.3.3 — body-level dedup is the
+    //    primary mechanism. Inline comments stay with the original review
+    //    until the next CREATE (i.e. when the marker is gone, e.g. user
+    //    resolved the thread manually).
+    const inlineComments = buildInlineComments(findings);
+    const body = renderReviewBody({
+        commitSha: commit_sha,
+        findings,
+        failOn: fail_on,
+    });
+    const created = await octokit.rest.pulls.createReview({
+        owner,
+        repo,
+        pull_number,
+        commit_id: commit_sha,
+        event: 'COMMENT',
+        body,
+        ...(inlineComments.length > 0 ? { comments: inlineComments } : {}),
+    });
+    return {
+        review_id: created.data.id,
+        action: 'created',
+        marker_sha: commit_sha,
+    };
+}
+// ---------------------------------------------------------------------------
+// Internal helpers (exported for tests; not part of the public API surface)
+// ---------------------------------------------------------------------------
+/**
+ * Locate the existing PR review carrying our session marker.
+ *
+ * Returns `null` when no review carries a parseable marker. Foreign reviews
+ * (no marker) are ignored — never edited, never replaced. If multiple
+ * reviews carry the marker (defensive — should not happen in practice),
+ * the most recent one wins (last in the listing, which is newest-first
+ * per GitHub's `listReviews` ordering).
+ */
+function findExistingReview(reviews) {
+    // Iterate from the end — GitHub returns reviews newest-first. The most
+    // recent match wins if duplicates somehow accumulated.
+    for (let i = reviews.length - 1; i >= 0; i--) {
+        const r = reviews[i];
+        if (r === undefined)
+            continue;
+        const sha = parseSessionMarker(r.body);
+        if (sha !== null)
+            return r;
+    }
+    return null;
+}
+/**
+ * Parse the embedded ` ```json ... ``` ` findings snapshot out of a review
+ * body. Returns `[]` on parse failure — never throws. Caller treats empty
+ * as "previous run had no findings" (so the next diff will report every
+ * current finding as `new`).
+ */
+function parseEmbeddedFindings(body) {
+    if (typeof body !== 'string' || body.length === 0)
+        return [];
+    // The fenced block is always rendered last by `renderReviewBody`.
+    const match = body.match(/```json\n([\s\S]*?)\n```/);
+    if (!match || !match[1])
+        return [];
+    try {
+        const parsed = JSON.parse(match[1]);
+        if (!Array.isArray(parsed))
+            return [];
+        const out = [];
+        for (const entry of parsed) {
+            if (!entry || typeof entry !== 'object')
+                continue;
+            const obj = entry;
+            // Defensive normalization — we don't trust our own persisted JSON
+            // blindly (handles a future case where the schema drifts).
+            const severity = obj['severity'];
+            const message = obj['message'];
+            if (!(0, output_formatter_js_1.isSeverity)(severity) || typeof message !== 'string')
+                continue;
+            const finding = {
+                severity,
+                message,
+                file: typeof obj['file'] === 'string' ? obj['file'] : '',
+                confidence: typeof obj['confidence'] === 'number' && Number.isFinite(obj['confidence'])
+                    ? obj['confidence']
+                    : 0,
+            };
+            if (typeof obj['line'] === 'number' && Number.isFinite(obj['line'])) {
+                finding.line = Math.trunc(obj['line']);
+            }
+            if (typeof obj['cwe'] === 'string')
+                finding.cwe = obj['cwe'];
+            if (typeof obj['recommendation'] === 'string') {
+                finding.recommendation = obj['recommendation'];
+            }
+            out.push(finding);
+        }
+        return out;
+    }
+    catch {
+        return [];
+    }
+}
+/** Build the inline-comment array for `createReview`. Filters to findings with locations. */
+function buildInlineComments(findings) {
+    const out = [];
+    for (const f of findings) {
+        if (typeof f.line !== 'number' || f.file.length === 0)
+            continue;
+        out.push({
+            path: f.file,
+            line: f.line,
+            body: renderInlineCommentBody(f),
+        });
+    }
+    return out;
+}
+// ---------------------------------------------------------------------------
+// Tiny pure helpers (also exported for tests)
+// ---------------------------------------------------------------------------
+/** Per-severity aggregate count, in `{ critical, high, medium, low }` order. */
+function countBySeverity(findings) {
+    const out = { critical: 0, high: 0, medium: 0, low: 0 };
+    for (const f of findings) {
+        out[f.severity] += 1;
+    }
+    return out;
+}
+/**
+ * Mirrors `computeStatus` from `status-check.ts` but kept inline to avoid
+ * a circular import (this module is consumed by the workflow, which may
+ * not have wired up `status-check.ts`). Logic identical to the action's
+ * canonical status computation.
+ */
+function computeBodyStatus(findings, failOn) {
+    const threshold = (0, output_formatter_js_1.isSeverity)(failOn) ? failOn : 'critical';
+    const minRank = (0, output_formatter_js_1.severityRank)(threshold);
+    for (const f of findings) {
+        if ((0, output_formatter_js_1.severityRank)(f.severity) >= minRank) {
+            return { badge: '❌', label: 'failed' };
+        }
+    }
+    return { badge: '✅', label: 'passed' };
+}
+function severityEmoji(s) {
+    switch (s) {
+        case 'critical': return '🔴';
+        case 'high': return '🟠';
+        case 'medium': return '🟡';
+        case 'low': return '🔵';
+    }
+}
+
+
+/***/ }),
+
 /***/ 464:
 /***/ ((__unused_webpack_module, exports) => {
 
@@ -1561,6 +2056,11 @@ async function withRetry(fn, opts = {}) {
  *   - result_json   — JSON.stringify of stage outputs
  *   - total_ms      — wall-clock duration
  *   - total_cost_usdc — USDC with 6 decimals
+ *   - cost_usdc     — v0.3.2: machine-readable USDC cost (same value as total_cost_usdc;
+ *                     the new name standardizes on the convention used by the MiniMax
+ *                     x402 micropayment pipeline).
+ *   - timing_json   — v0.3.2: per-stage wall-clock (validate / fetch_source /
+ *                     run_pipeline / format_output), JSON object of integer ms.
  *   - stage_count   — number of stages in spec
  * Per-stage:
  *   - stage_<id>_ms
@@ -1580,10 +2080,18 @@ const retry_js_1 = __nccwpck_require__(464);
 const source_cache_js_1 = __nccwpck_require__(682);
 const output_formatter_js_1 = __nccwpck_require__(750);
 const status_check_js_1 = __nccwpck_require__(420);
-exports.ACTION_VERSION = '0.3.0';
+const cost_js_1 = __nccwpck_require__(609);
+const timing_js_1 = __nccwpck_require__(558);
+exports.ACTION_VERSION = '0.3.3';
 async function run(args) {
     const { params, deps } = args;
     const inputs = params.inputs;
+    // v0.3.2 — per-stage wall-clock accumulator. Survives the whole run() so
+    // every stage can call start()/end() and the final `timing_json` output
+    // captures the full pipeline lifecycle. Stages never started default to
+    // 0 in the JSON output, so partial instrumentation stays schema-stable.
+    const timings = new timing_js_1.Timings();
+    timings.start('fetch_source');
     // Source cache (v0.3.0): when the pipeline came from a file, warm the
     // per-job cache so re-runs within the same GH Actions job (matrix
     // builds, multiple steps) skip the disk read. The fetcher returns the
@@ -1594,11 +2102,14 @@ async function run(args) {
             ? `↻ pipeline source cache hit: ${inputs.pipeline_file}`
             : `↓ pipeline source cache populated: ${inputs.pipeline_file} (${cached.size} bytes)`);
     }
+    timings.end('fetch_source');
+    timings.start('validate');
     let resolvedSpec;
     try {
         resolvedSpec = (0, pipeline_runtime_1.expandPipelineText)(params.pipeline_spec, buildPipelineEnv(inputs));
     }
     catch (e) {
+        timings.end('validate');
         (0, streaming_js_1.error)(`✗ ${e.message}`);
         return 1;
     }
@@ -1607,14 +2118,17 @@ async function run(args) {
         loaded = (0, pipeline_runtime_1.loadPipelineYaml)(resolvedSpec);
     }
     catch (e) {
+        timings.end('validate');
         (0, streaming_js_1.error)(`✗ Invalid pipeline YAML (after env-var expansion): ${e.message}`);
         return 1;
     }
     const spec = loaded;
     if (!spec || !Array.isArray(spec.stages)) {
+        timings.end('validate');
         (0, streaming_js_1.error)('✗ Spec top-level must be an object with a `stages` array.');
         return 1;
     }
+    timings.end('validate');
     const stageCount = spec.stages.length;
     const pipelineName = spec.name ?? 'unnamed';
     const providerTag = `[provider=${inputs.provider} model=${inputs.model} context=${inputs.context_mode}]`;
@@ -1635,6 +2149,8 @@ async function run(args) {
     }));
     const startedAt = Date.now();
     let result;
+    // ---- Stage 3/4: run_pipeline ----
+    timings.start('run_pipeline');
     try {
         result = await (0, retry_js_1.withRetry)(() => (0, pipeline_runtime_1.runPipelineV2)({
             spec: { stages: stagesForRuntime },
@@ -1664,11 +2180,19 @@ async function run(args) {
         });
     }
     catch (e) {
+        timings.end('run_pipeline');
         (0, streaming_js_1.error)(`✗ pipeline failed ${providerTag}: ${e.message}`);
         return 1;
     }
+    timings.end('run_pipeline');
     const totalMs = Date.now() - startedAt;
-    const totalCostUsdc = result.totalCostMicroUsdc / 1_000_000;
+    // v0.3.2 — cost computation via the extracted pure function. The
+    // multiplier is the documented 1x/3x/10x/100x from CONTEXT_MODE_MULTIPLIERS;
+    // currently a no-op at 1.0 because the runtime already accounts for
+    // context fetching. Threaded through for forward compatibility.
+    const totalCostUsdc = (0, cost_js_1.computeCostInUsdc)(result.totalCostMicroUsdc, cost_js_1.CONTEXT_MODE_MULTIPLIERS[inputs.context_mode]);
+    // ---- Stage 4/4: format_output ----
+    timings.start('format_output');
     const findings = (0, output_formatter_js_1.formatFindings)(result.outputs);
     const severityThreshold = (0, output_formatter_js_1.readSeverityThresholdFromEnv)();
     const filteredFindings = (0, output_formatter_js_1.filterBySeverity)(findings, severityThreshold);
@@ -1697,6 +2221,21 @@ async function run(args) {
     (0, streaming_js_1.writeOutput)('total_ms', String(totalMs));
     (0, streaming_js_1.writeOutput)('total_cost_usdc', totalCostUsdc.toFixed(6));
     (0, streaming_js_1.writeOutput)('stage_count', String(stageCount));
+    // v0.3.2 — machine-readable outputs for dashboards / billing / runaway-PR detection.
+    // `cost_usdc` matches the value of `total_cost_usdc` (kept for back-compat); the new
+    // name standardizes on the convention used by the MiniMax x402 micropayment pipeline.
+    (0, streaming_js_1.writeOutput)('cost_usdc', totalCostUsdc.toFixed(6));
+    (0, streaming_js_1.writeOutput)('timing_json', timings.toJSONString());
+    timings.end('format_output');
+    // v0.3.2 — bonus auto-suggestion per TASKS row 110: if the LLM call itself
+    // dominates the wall-clock and the user picked an expensive context mode,
+    // suggest a cheaper mode for the next run. Skipped when run_pipeline_ms
+    // is missing (stage never recorded) or the mode is already `diff`.
+    const runPipelineMs = timings.toJSON().run_pipeline_ms;
+    if (runPipelineMs > 5000 && inputs.context_mode !== 'diff') {
+        (0, streaming_js_1.notice)(`⚡ run_pipeline_ms=${runPipelineMs} > 5000 with context_mode='${inputs.context_mode}' ` +
+            `— consider 'diff' (1x cost) for faster iterations.`);
+    }
     (0, streaming_js_1.notice)(`✓ pipeline complete: ${stageCount} stages, ${totalMs}ms, ~$${totalCostUsdc.toFixed(6)} USDC`);
     return 0;
 }
@@ -2086,6 +2625,70 @@ function writeActionSummary(summary) {
 }
 function escape(text) {
     return String(text ?? '').replace(/%/g, '%25').replace(/\r?\n/g, '%0A');
+}
+
+
+/***/ }),
+
+/***/ 558:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * v0.3.2 — per-stage wall-clock instrumentation.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.Timings = void 0;
+exports.timeStage = timeStage;
+exports.timeStageAsync = timeStageAsync;
+const STAGE_ORDER = [
+    'validate',
+    'fetch_source',
+    'run_pipeline',
+    'format_output',
+];
+class Timings {
+    starts = new Map();
+    durations = new Map();
+    start(name) {
+        if (this.starts.has(name))
+            return;
+        this.starts.set(name, performance.now());
+    }
+    end(name) {
+        const startedAt = this.starts.get(name);
+        if (startedAt === undefined)
+            return;
+        const elapsedMs = performance.now() - startedAt;
+        this.durations.set(name, Math.round(elapsedMs));
+        this.starts.delete(name);
+    }
+    toJSON() {
+        const out = {};
+        for (const stage of STAGE_ORDER) {
+            out[`${stage}_ms`] = this.durations.get(stage) ?? 0;
+        }
+        return out;
+    }
+    toJSONString() {
+        return JSON.stringify(this.toJSON());
+    }
+}
+exports.Timings = Timings;
+function timeStage(name, body) {
+    const timings = new Timings();
+    timings.start(name);
+    const result = body();
+    timings.end(name);
+    return { result, timings };
+}
+async function timeStageAsync(name, body) {
+    const timings = new Timings();
+    timings.start(name);
+    const result = await body();
+    timings.end(name);
+    return { result, timings };
 }
 
 
@@ -54100,11 +54703,25 @@ var __webpack_exports__ = {};
 var exports = __webpack_exports__;
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.actionName = void 0;
+exports.actionName = exports.findingKey = exports.countBySeverity = exports.renderInlineCommentBody = exports.renderReviewBody = exports.buildInlineComments = exports.parseEmbeddedFindings = exports.findExistingReview = exports.diffFindings = exports.buildSessionMarker = exports.parseSessionMarker = exports.postReview = void 0;
 const inputs_js_1 = __nccwpck_require__(601);
 const pipeline_source_js_1 = __nccwpck_require__(862);
 const executor_deps_js_1 = __nccwpck_require__(920);
 const run_js_1 = __nccwpck_require__(795);
+// ncc tree-shakes unused exports; re-export postReview() so consumers
+// importing from `dist/index.js` keep the dedup helper alive.
+var post_review_js_1 = __nccwpck_require__(207);
+Object.defineProperty(exports, "postReview", ({ enumerable: true, get: function () { return post_review_js_1.postReview; } }));
+Object.defineProperty(exports, "parseSessionMarker", ({ enumerable: true, get: function () { return post_review_js_1.parseSessionMarker; } }));
+Object.defineProperty(exports, "buildSessionMarker", ({ enumerable: true, get: function () { return post_review_js_1.buildSessionMarker; } }));
+Object.defineProperty(exports, "diffFindings", ({ enumerable: true, get: function () { return post_review_js_1.diffFindings; } }));
+Object.defineProperty(exports, "findExistingReview", ({ enumerable: true, get: function () { return post_review_js_1.findExistingReview; } }));
+Object.defineProperty(exports, "parseEmbeddedFindings", ({ enumerable: true, get: function () { return post_review_js_1.parseEmbeddedFindings; } }));
+Object.defineProperty(exports, "buildInlineComments", ({ enumerable: true, get: function () { return post_review_js_1.buildInlineComments; } }));
+Object.defineProperty(exports, "renderReviewBody", ({ enumerable: true, get: function () { return post_review_js_1.renderReviewBody; } }));
+Object.defineProperty(exports, "renderInlineCommentBody", ({ enumerable: true, get: function () { return post_review_js_1.renderInlineCommentBody; } }));
+Object.defineProperty(exports, "countBySeverity", ({ enumerable: true, get: function () { return post_review_js_1.countBySeverity; } }));
+Object.defineProperty(exports, "findingKey", ({ enumerable: true, get: function () { return post_review_js_1.findingKey; } }));
 exports.actionName = 'pipeline-action';
 async function main() {
     let inputs = null;

@@ -1,6 +1,41 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
-## v0.3.1 (2026-09-27) — output wiring hotfix
+## v0.3.2 (2026-09-27) — additive cost + timing outputs
+
+> 100% additive on top of v0.3.1. No breaking changes — existing consumers see zero behaviour change unless they read the two new outputs (`cost_usdc`, `timing_json`).
+
+### Added
+
+#### `cost_usdc` action output (TASKS row 101)
+- New machine-readable output mirroring `total_cost_usdc` (same 6-decimal USDC value).
+- Designed for downstream observability: dashboards, billing reconciliation, runaway-PR cost detection.
+- Cost computation extracted from `run.ts` into a new pure function `computeCostInUsdc(usageMicroUsdc, contextModeMultiplier): number` in `src/cost.ts` for unit-testability.
+- The `contextModeMultiplier` parameter threads the documented 1x/3x/10x/100x table from `CONTEXT_MODE_MULTIPLIERS`. Currently a no-op at 1.0 — the runtime already accounts for context fetching — but the API is wired through for forward compatibility.
+- Step summary line `| Est. cost | ~$X.XXXXXX USDC |` continues to render via `writeActionSummary` (unchanged behaviour).
+
+#### `timing_json` action output (TASKS row 110)
+- New per-stage wall-clock output: `{"validate_ms":12,"fetch_source_ms":89,"run_pipeline_ms":1240,"format_output_ms":23}` — integer ms per stage.
+- Backed by a new `Timings` class in `src/timing.ts` (`start()` / `end()` / `toJSON()` / `toJSONString()`) using built-in `performance.now()`. No new dependencies.
+- Stages that were never `start()`'d default to 0 ms — partial instrumentation stays schema-stable.
+- `run.ts` instruments all four stages: `fetch_source` (source cache), `validate` (YAML expand + load + spec sanity check), `run_pipeline` (LLM call + retry wrapper), `format_output` (findings extract/filter + summary + writeOutput calls).
+
+#### Auto-suggestion bonus
+- Step summary now logs a `⚡` `::notice::` line when `run_pipeline_ms > 5000` with a non-`diff` `context_mode`, suggesting `diff` (1x cost) for faster iterations. Skipped when `run_pipeline_ms <= 5000` or `context_mode === 'diff'`.
+
+### Implementation notes
+- `runPipelineV2` already returns per-stage timing via the `onStageComplete` hook (the `stage_<id>_ms` outputs). v0.3.2's `timing_json` is **action-side** timing only (the four lifecycle stages above) — it is orthogonal to the runtime's per-stage timing.
+- All 14 outputs declared in `action.yml` (12 from v0.3.1 + 2 new).
+- The `cost_usdc` value matches `total_cost_usdc` exactly. The new name standardizes on the convention used by the MiniMax x402 micropayment pipeline.
+
+### Tests
+- 2 new integration tests under `describe("run() — v0.3.2 outputs (cost_usdc + timing_json)", ...)` in `tests/run.test.ts`:
+  - `cost_usdc` fires with non-empty value + matches the summary line.
+  - `timing_json` has all 4 keys with positive numbers.
+- Total: 159 tests passing, 1 skipped (unchanged).
+
+### Compatibility
+- 100% additive. v0.3.1 consumers still work — the new outputs are present in v0.3.2 but only have content when the action runs end-to-end. Existing `total_cost_usdc` / `total_ms` / `stage_<id>_ms` / `findings_*` outputs unchanged.
+
 
 > **Critical hotfix.** v0.3.0's new outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) were **not wired to action boundaries** — `output-formatter.ts` and `status-check.ts` computed them, but `run.ts` never called `writeOutput()` for them and `action.yml` never declared them. Consumers reading `${{ steps.X.outputs.findings_json }}` got empty strings. **v0.3.0 should not be used.** Upgrade to v0.3.1.
 
