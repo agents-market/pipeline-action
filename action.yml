@@ -48,10 +48,6 @@ outputs:
     description: 'Wall-clock pipeline duration in milliseconds.'
   total_cost_usdc:
     description: 'Estimated cost in USDC with 6 decimals (e.g. "0.001234").'
-  cost_usdc:
-    description: 'Estimated API cost in USDC (x402 micropayment to MiniMax). Same value as total_cost_usdc; added in v0.3.2 for dashboards / billing / runaway-PR detection.'
-  timing_json:
-    description: 'Per-stage duration in milliseconds, JSON: {validate_ms, fetch_source_ms, run_pipeline_ms, format_output_ms}. Stages that were never measured default to 0 ms.'
   stage_count:
     description: 'Number of stages declared in the pipeline.'
   stage_<id>_ms:

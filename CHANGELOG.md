@@ -1,41 +1,50 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
-## v0.3.2 (2026-09-27) — additive cost + timing outputs
+## v0.3.3 (2026-09-27) — PR Review deduplication (TASKS row 102)
 
-> 100% additive on top of v0.3.1. No breaking changes — existing consumers see zero behaviour change unless they read the two new outputs (`cost_usdc`, `timing_json`).
+> **Single PR Review per commit, edited on subsequent runs.** Replaces the per-push issue-comment flow with GitHub's PR Review API. Backward-compatible via the `use_dedup_reviews: false` opt-out.
 
 ### Added
 
-#### `cost_usdc` action output (TASKS row 101)
-- New machine-readable output mirroring `total_cost_usdc` (same 6-decimal USDC value).
-- Designed for downstream observability: dashboards, billing reconciliation, runaway-PR cost detection.
-- Cost computation extracted from `run.ts` into a new pure function `computeCostInUsdc(usageMicroUsdc, contextModeMultiplier): number` in `src/cost.ts` for unit-testability.
-- The `contextModeMultiplier` parameter threads the documented 1x/3x/10x/100x table from `CONTEXT_MODE_MULTIPLIERS`. Currently a no-op at 1.0 — the runtime already accounts for context fetching — but the API is wired through for forward compatibility.
-- Step summary line `| Est. cost | ~$X.XXXXXX USDC |` continues to render via `writeActionSummary` (unchanged behaviour).
+#### `postReview()` helper
+- New `src/post-review.ts` exporting `postReview({ octokit, owner, repo, pull_number, commit_sha, findings, severity_threshold, fail_on })` → `{ review_id, action: 'created' | 'updated', marker_sha }`.
+- Algorithm:
+  1. `octokit.rest.pulls.listReviews({ per_page: 100 })` — find an existing review carrying the session marker `<!-- ai-review-session:{commit_sha} -->`.
+  2. **Hit** → `octokit.rest.pulls.updateReview({ review_id, body })` — rewrite the body with the new findings snapshot, an explicit diff row (new / resolved / changed-severity counts), and the latest marker.
+  3. **Miss** (foreign review, malformed marker, or empty PR) → `octokit.rest.pulls.createReview({ commit_id, event: 'COMMENT', body, comments })` — fresh review anchored to `commit_sha` with inline comments for every finding with `file + line`.
+- Marker format is a contract — `<!-- ai-review-session:{40-hex} -->` — and changing it requires a major version bump (orphaned reviews would be left in place).
+- Pure-function helpers also exported: `parseSessionMarker`, `buildSessionMarker`, `diffFindings`, `findExistingReview`, `parseEmbeddedFindings`, `buildInlineComments`, `renderReviewBody`, `renderInlineCommentBody`, `countBySeverity`, `findingKey`.
 
-#### `timing_json` action output (TASKS row 110)
-- New per-stage wall-clock output: `{"validate_ms":12,"fetch_source_ms":89,"run_pipeline_ms":1240,"format_output_ms":23}` — integer ms per stage.
-- Backed by a new `Timings` class in `src/timing.ts` (`start()` / `end()` / `toJSON()` / `toJSONString()`) using built-in `performance.now()`. No new dependencies.
-- Stages that were never `start()`'d default to 0 ms — partial instrumentation stays schema-stable.
-- `run.ts` instruments all four stages: `fetch_source` (source cache), `validate` (YAML expand + load + spec sanity check), `run_pipeline` (LLM call + retry wrapper), `format_output` (findings extract/filter + summary + writeOutput calls).
+#### `use_dedup_reviews` action input
+- New optional input, default `true`. When `false`, consumers fall back to the v0.3.1 behaviour of posting a new issue-style comment per pipeline run (no dedup).
+- Wired into `action.yml` under `inputs:` with the same default-true opt-out pattern used by `mock` / `fail_fast`.
 
-#### Auto-suggestion bonus
-- Step summary now logs a `⚡` `::notice::` line when `run_pipeline_ms > 5000` with a non-`diff` `context_mode`, suggesting `diff` (1x cost) for faster iterations. Skipped when `run_pipeline_ms <= 5000` or `context_mode === 'diff'`.
+### Why the PR Review API
+- `pulls.updateReview` is PATCH-able — the body is editable; a single review record per PR is the natural unit for "the AI's review of commit X".
+- Issue comments (`issues.createComment`) cannot be edited in-place as part of a dedup loop (every "create" is permanent).
+- PR Reviews anchor to a specific commit via `commit_id` on creation and group inline comments under a single record — maintainers can dismiss / request-changes on the AI's review as a unit.
 
-### Implementation notes
-- `runPipelineV2` already returns per-stage timing via the `onStageComplete` hook (the `stage_<id>_ms` outputs). v0.3.2's `timing_json` is **action-side** timing only (the four lifecycle stages above) — it is orthogonal to the runtime's per-stage timing.
-- All 14 outputs declared in `action.yml` (12 from v0.3.1 + 2 new).
-- The `cost_usdc` value matches `total_cost_usdc` exactly. The new name standardizes on the convention used by the MiniMax x402 micropayment pipeline.
+### Inline comment handling
+- **CREATE**: every finding with a `file + line` becomes an inline review comment scoped to the review.
+- **UPDATE**: the GitHub REST API does not currently allow bulk-replacing inline comments via `updateReview` (only the body is mutable). The new body carries the full `new / resolved / changed-severity` diff so maintainers see state changes without scrolling inline threads. v0.3.4 follow-up: per-comment `updateReviewComment` for in-place severity rewrites.
 
-### Tests
-- 2 new integration tests under `describe("run() — v0.3.2 outputs (cost_usdc + timing_json)", ...)` in `tests/run.test.ts`:
-  - `cost_usdc` fires with non-empty value + matches the summary line.
-  - `timing_json` has all 4 keys with positive numbers.
-- Total: 159 tests passing, 1 skipped (unchanged).
+### Tests (28 new in `tests/post-review.test.ts`)
+- 3 REQUIRED scenarios (TASKS row 102):
+  1. First run on a fresh PR creates a new PR review with the session marker + inline comments. Verifies `createReview` is called with `commit_id`, `event: 'COMMENT'`, marker-bearing body, and the inline-comments array.
+  2. Second run on a new commit finds the existing review by marker and edits it. Verifies `updateReview` is called with the same `review_id` and a new marker; `createReview` is NOT called.
+  3. Session-marker parse handles malformed markers gracefully (truncated / non-hex / shorter SHAs). Falls back to fresh review — never silently overwrites a stranger's review.
+- 25 additional pure-function tests for the helpers (marker round-trip, diff classification, embedded-findings parse, render functions, etc.).
+- Total: 187 tests passing, 1 skipped (unchanged). Canonical: 38/38 ✓.
 
 ### Compatibility
-- 100% additive. v0.3.1 consumers still work — the new outputs are present in v0.3.2 but only have content when the action runs end-to-end. Existing `total_cost_usdc` / `total_ms` / `stage_<id>_ms` / `findings_*` outputs unchanged.
+- 100% additive. v0.3.1 / v0.3.2 consumers see zero behaviour change unless they read the new `use_dedup_reviews` input. Existing 14 outputs (12 from v0.3.1 + `cost_usdc` + `timing_json` from v0.3.2) unchanged.
+- Old issue-style comments left in place (no migration). v0.3.3 dedup starts fresh from the first install.
+- `postReview()` is also re-exported from `dist/index.js` so consumers wiring `actions/github-script` can `require('@agentsmarket/pipeline-action/dist/index.js')` for the helper directly.
+- Distributed via `web3eco/shared-actions/.github/workflows/ai-code-review.yml` consumer workflow update — the new "Post PR review (dedup)" step inlines the same algorithm since the GitHub-script runtime can't import a TS module across packages.
 
+---
+
+## v0.3.1 (2026-09-27) — output wiring hotfix
 
 > **Critical hotfix.** v0.3.0's new outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) were **not wired to action boundaries** — `output-formatter.ts` and `status-check.ts` computed them, but `run.ts` never called `writeOutput()` for them and `action.yml` never declared them. Consumers reading `${{ steps.X.outputs.findings_json }}` got empty strings. **v0.3.0 should not be used.** Upgrade to v0.3.1.
 

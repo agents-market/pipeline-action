@@ -4,7 +4,7 @@ GitHub Action that runs an agentsmarket `pipeline.yaml` inside a step. Streams e
 
 ## Status
 
-**v0.3.3 — PR review deduplication.** v0.3.1 wired the 6 PR-review outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) to action boundaries; v0.3.2 added the `cost_usdc` + `timing_json` machine-readable outputs for downstream observability. v0.3.3 ships **PR Review deduplication** (TASKS row 102): a single PR Review per commit, edited on subsequent runs via GitHub's PR Review API (`octokit.rest.pulls.createReview` + `updateReview`) — instead of one new issue comment per pipeline run. The `use_dedup_reviews` input (default `true`) is the consumer switch. Backward-compat: set `use_dedup_reviews: false` to fall back to the v0.3.1 issue-comment behaviour. The new `src/post-review.ts` exports `postReview({ octokit, owner, repo, pull_number, commit_sha, findings, severity_threshold, fail_on })` for direct use in `actions/github-script` blocks. All v0.3.0/v0.3.1 features remain: `context_mode` input (`diff | imports | related | full`), exponential backoff retry for 429/5xx, per-job pipeline source cache, pre-step `agentsmarket validate` (catches malformed `pipeline.yaml` before any LLM call, saves $). Build on v0.2.1's provider selection. Pre-step requires `@agentsmarket/cli` (npm, v0.9.0+). LLM-only stages work; `uses:` skill stages surface "skill not found" (R12.2-R12.4 ship marketplace-fetched skills). **Consumer contract:** consumers wire v0.3.1 outputs to GH status checks + PR review threads via `actions/github-script` using the `postReview()` helper. See `examples/integrations/code-review-workflow.yml` for the canonical pattern (shipped in `web3eco/shared-actions/.github/workflows/ai-code-review.yml`).
+**v0.3.3 — PR review deduplication (TASKS row 102).** v0.3.1 wired the 6 PR-review outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) to action boundaries; v0.3.2 will add `cost_usdc` + `timing_json` for downstream observability. v0.3.3 ships **PR Review deduplication**: a single PR Review per commit, edited on subsequent runs via GitHub's PR Review API (`octokit.rest.pulls.createReview` + `updateReview`) — instead of one new issue comment per pipeline run. The `use_dedup_reviews` input (default `true`) is the consumer switch. Backward-compat: set `use_dedup_reviews: false` to fall back to the v0.3.1 issue-comment behaviour. The new `src/post-review.ts` exports `postReview({ octokit, owner, repo, pull_number, commit_sha, findings, severity_threshold, fail_on })` for direct use in `actions/github-script` blocks. All v0.3.0/v0.3.1 features remain: `context_mode` input (`diff | imports | related | full`), exponential backoff retry for 429/5xx, per-job pipeline source cache, pre-step `agentsmarket validate` (catches malformed `pipeline.yaml` before any LLM call, saves $). Build on v0.2.1's provider selection. Pre-step requires `@agentsmarket/cli` (npm, v0.9.0+). LLM-only stages work; `uses:` skill stages surface "skill not found" (R12.2-R12.4 ship marketplace-fetched skills). **Consumer contract:** consumers wire v0.3.1 outputs to GH status checks + PR review threads via `actions/github-script` using the `postReview()` helper. See `examples/integrations/code-review-workflow.yml` for the canonical pattern (shipped in `web3eco/shared-actions/.github/workflows/ai-code-review.yml`).
 
 ## Usage
 
@@ -80,9 +80,7 @@ Each run appends a step-summary report (`$GITHUB_STEP_SUMMARY`) with pipeline na
 |------|-------------|
 | `result_json` | JSON-stringified record of `stage_id -> output_text` |
 | `total_ms` | Wall-clock pipeline duration |
-| `total_cost_usdc` | Estimated cost with 6 decimals (e.g. `"0.001234"`). v0.3.0+. |
-| `cost_usdc` | (v0.3.2+) Machine-readable USDC cost (same value as `total_cost_usdc`; the new name standardizes on the convention used by the MiniMax x402 micropayment pipeline). For dashboards / billing / runaway-PR detection. |
-| `timing_json` | (v0.3.2+) Per-stage wall-clock as JSON: `{"validate_ms":12,"fetch_source_ms":89,"run_pipeline_ms":1240,"format_output_ms":23}`. Stages never measured default to 0 ms. |
+| `total_cost_usdc` | Estimated cost with 6 decimals |
 | `stage_count` | Number of stages declared |
 | `stage_<id>_ms` | Per-stage wall-clock |
 | `stage_<id>_output` | Per-stage output text |
@@ -118,7 +116,7 @@ Where `{commit_sha}` is a 40-character lowercase hex SHA. Changing the format re
 
 ### Why the PR Review API (not the issue comment API)
 
-- `pulls.updateReview` is **editable** (PATCH body). `issues.updateComment` works too, but the review form anchors to a specific commit and groups inline comments under a single review — the natural unit for "an AI's review of commit X".
+- `pulls.updateReview` is **editable** (PATCH body). `issues.createComment` would also work for body edits but the review form anchors to a specific commit and groups inline comments under a single review — the natural unit for "an AI's review of commit X".
 - PR Reviews are a first-class GitHub concept with their own permissions and threading — maintainers can dismiss them, request changes, etc.
 - A single review record per PR is easier to reason about than N issue comments.
 
