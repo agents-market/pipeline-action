@@ -4,7 +4,7 @@ GitHub Action that runs an agentsmarket `pipeline.yaml` inside a step. Streams e
 
 ## Status
 
-**v0.4.0 — provider fallback (resilience).** v0.3.3 ships PR Review deduplication; v0.3.2 added the `cost_usdc` + `timing_json` machine-readable outputs; v0.3.1 wired the 6 PR-review outputs to action boundaries. **v0.4.0 adds automatic fallback from the primary LLM provider to a secondary one** (TASKS row 105). When the primary returns a transient error — HTTP 429 (rate-limit), HTTP 408 / connection timeout, or HTTP 5xx — the same prompt is retried on the configured fallback provider (default `openai`/`gpt-4o-mini`). New inputs `primary_provider`, `primary_model`, `fallback_provider`, `fallback_model`, `fallback_on_error` (all optional, defaults preserve v0.3.x behaviour: fallback is silently disabled when the matching API key is unset). New outputs: `provider_used`, `cost_primary_usdc`, `cost_fallback_usdc`, `provider_primary_error`. All v0.3.x features remain: `context_mode` input, exponential backoff retry for 429/5xx (orthogonal to the fallback wrapper), per-job pipeline source cache, pre-step `agentsmarket validate`. Pre-step requires `@agentsmarket/cli` (npm, v0.9.0+). LLM-only stages work; `uses:` skill stages surface "skill not found" (R12.2-R12.4 ship marketplace-fetched skills). **Consumer contract:** consumers wire v0.3.x outputs to GH status checks + PR review threads via `actions/github-script` using the `postReview()` helper. See `examples/integrations/code-review-workflow.yml` for the canonical pattern.
+**v0.3.3 — PR review deduplication.** v0.3.1 wired the 6 PR-review outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) to action boundaries; v0.3.2 added the `cost_usdc` + `timing_json` machine-readable outputs for downstream observability. v0.3.3 ships **PR Review deduplication** (TASKS row 102): a single PR Review per commit, edited on subsequent runs via GitHub's PR Review API (`octokit.rest.pulls.createReview` + `updateReview`) — instead of one new issue comment per pipeline run. The `use_dedup_reviews` input (default `true`) is the consumer switch. Backward-compat: set `use_dedup_reviews: false` to fall back to the v0.3.1 issue-comment behaviour. The new `src/post-review.ts` exports `postReview({ octokit, owner, repo, pull_number, commit_sha, findings, severity_threshold, fail_on })` for direct use in `actions/github-script` blocks. All v0.3.0/v0.3.1 features remain: `context_mode` input (`diff | imports | related | full`), exponential backoff retry for 429/5xx, per-job pipeline source cache, pre-step `agentsmarket validate` (catches malformed `pipeline.yaml` before any LLM call, saves $). Build on v0.2.1's provider selection. Pre-step requires `@agentsmarket/cli` (npm, v0.9.0+). LLM-only stages work; `uses:` skill stages surface "skill not found" (R12.2-R12.4 ship marketplace-fetched skills). **Consumer contract:** consumers wire v0.3.1 outputs to GH status checks + PR review threads via `actions/github-script` using the `postReview()` helper. See `examples/integrations/code-review-workflow.yml` for the canonical pattern (shipped in `web3eco/shared-actions/.github/workflows/ai-code-review.yml`).
 
 ## Usage
 
@@ -43,11 +43,6 @@ jobs:
 | `mock` | no | `false` | Use deterministic mock provider (no real API) |
 | `context_mode` | no | `imports` | How much code context the LLM sees beyond the PR diff. One of `diff` (PR diff only, ~1x cost), `imports` (diff + imported types, ~3x), `related` (diff + files importing changed files, ~10x), `full` (diff + all `.ts`/`.py` files, ~100x). The actual fetching is `pipeline-runtime`'s responsibility — see TASKS row 90. |
 | `use_dedup_reviews` | no | `true` | v0.3.3+ — when `true` (default), the bundled `postReview()` helper is the canonical posting path (single PR Review per commit, edited on update via the PR Review API). Set to `false` to opt out and fall back to the v0.3.1 issue-comment behaviour. See [PR Review Dedup (v0.3.3+)](#pr-review-dedup-v033). |
-| `primary_provider` | no | `minimax` | v0.4.0+ — explicit primary provider override. Defaults to the `provider` input when unset. |
-| `primary_model` | no | `MiniMax-M3` | v0.4.0+ — explicit primary model override. Defaults to the `model` input when unset. |
-| `fallback_provider` | no | `openai` | v0.4.0+ — secondary provider that catches transient primary failures (HTTP 429, 408/timeout, 5xx). One of `minimax \| openai \| anthropic`. **Silently disabled** when the matching API key (`OPENAI_API_KEY`, etc.) is unset — v0.3.x consumers see zero change. |
-| `fallback_model` | no | `gpt-4o-mini` | v0.4.0+ — model on the fallback provider. Ignored when fallback is disabled. |
-| `fallback_on_error` | no | `any` | v0.4.0+ — which primary error classes trigger the fallback attempt. One of `rate_limit \| timeout \| server_error \| any`. |
 
 ## Providers
 
@@ -97,10 +92,118 @@ Each run appends a step-summary report (`$GITHUB_STEP_SUMMARY`) with pipeline na
 | `status` | (PR-review only) `'passed'` or `'failed'` — based on `computeStatus(findings, fail_on)`. Default fail-on = `critical`. |
 | `failed_count` | (PR-review only) integer — number of findings with severity at or above `fail_on`. |
 | `max_severity` | (PR-review only) highest severity seen (`'critical' \| 'high' \| 'medium' \| 'low'`) or empty string when no findings. |
-| `provider_used` | (v0.4.0+) `'primary' \| 'fallback'` — which provider actually served the last LLM call. Always `'primary'` when fallback is disabled (no API key configured for the fallback provider). |
-| `cost_primary_usdc` | (v0.4.0+) USDC attributable to primary-provider calls (sum across all stages). When fallback is disabled this equals `total_cost_usdc`. |
-| `cost_fallback_usdc` | (v0.4.0+) USDC attributable to fallback-provider calls. Always `0.000000` when fallback never fired. |
-| `provider_primary_error` | (v0.4.0+) Message of the most recent primary-provider error that triggered a fallback attempt. Empty string when fallback never fired or fallback is disabled. |
+| `webhook_status` | (v0.3.4+) Outcome of the optional webhook notification: `sent` (2xx response), `skipped` (`webhook_url` empty — the default), or `failed` (non-2xx / timeout / network error). Non-fatal — pipeline exit code is unaffected. |
+
+## Webhook Notifications (v0.3.4+)
+
+> **TL;DR** Post the run summary + findings to a Slack / Discord / Teams incoming-webhook after every successful pipeline run. Set `webhook_url` to opt in; leave it empty to keep the existing behaviour.
+
+### What it does
+
+After all v0.3.1 / v0.3.2 outputs have been written, the action calls `notify()` from `src/notifier.ts`. The function:
+
+1. **Auto-detects** the payload format from the URL hostname (override with `webhook_format`):
+   - `hooks.slack.com` → **Slack Block Kit** (`blocks` array, `mrkdwn` text, severity emoji + `toUpperCase()`).
+   - `discord.com/api/webhooks` (and `*.discord.com` subdomains) → **Discord embeds** (`embeds` array, severity-coloured side bar with hex `color`, `title`, `description`).
+   - `outlook.office.com/webhook` and `outlook.office365.com/webhook` → **Microsoft Teams MessageCard** (`@type: MessageCard`, `summary` + `sections` with facts + per-finding blocks, `themeColor`).
+   - Anything else → `custom` (plain JSON envelope with `{ source, summary, pr, findings }`).
+2. **POSTs** with Node 18+ builtin `fetch` and an `AbortController` timeout of **5 seconds**.
+3. **Writes** the `webhook_status` output (`sent` / `skipped` / `failed`) so downstream steps can branch on the outcome.
+
+### Inputs
+
+| Name | Required | Default | Description |
+|------|----------|---------|-------------|
+| `webhook_url` | no | *(empty)* | Incoming-webhook URL. Empty disables the feature. The URL embeds the signing secret — no extra auth header is sent. |
+| `webhook_format` | no | `auto` | Force a payload format (`slack` / `discord` / `teams`) or sniff from the URL hostname (`auto`). |
+
+### Auth model
+
+Webhooks are self-authenticated: Slack/Discord/Teams embed the signing token in the URL path (`https://hooks.slack.com/services/T0000/B0000/secret`). The action does **not** send an `Authorization` header and does **not** read `MINIMAX_API_KEY`. These are unrelated concerns — the LLM provider API key is for calling the model; the webhook URL is for posting the result.
+
+### Output
+
+| Name | Values | Description |
+|------|--------|-------------|
+| `webhook_status` | `sent` \| `skipped` \| `failed` | Outcome of the notification. `skipped` when `webhook_url` is empty (the default — the action never touches the network). `sent` on any 2xx response. `failed` on non-2xx / timeout / network error. The pipeline exit code is **unaffected** by failures — `webhook_status` is the signal for downstream branching. |
+
+### Examples
+
+#### Slack
+
+1. In Slack: **Apps → Incoming Webhooks → Add to Slack → Select channel → Copy webhook URL**.
+2. Store it as a GitHub Actions secret (e.g. `SLACK_WEBHOOK_URL`).
+3. Wire it into the step:
+
+```yaml
+- uses: agents-market/pipeline-action@v0.3.4
+  with:
+    pipeline_file: .github/pipelines/ai-review.yaml
+    webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+    webhook_format: slack   # or omit for auto-detect
+```
+
+The channel receives a Slack message:
+
+```
+pipeline-action — failed
+🚨 pipeline failed — 3 findings (1234ms, ~$0.012345 USDC)
+PR: <https://github.com/acme/widget/pull/7|acme/widget#7>
+————————————————————
+:rotating_light: CRITICAL — src/auth.ts:42 `CWE-89` (conf 95%) — SQL injection via unsanitized input
+:warning: HIGH — src/api/users.ts:17 (conf 80%) — Missing auth check on /me endpoint
+:large_orange_diamond: MEDIUM — src/utils/log.ts (conf 60%) — Logging PII (email) at info level
+```
+
+#### Discord
+
+1. In Discord: **Server Settings → Integrations → Webhooks → New Webhook → Copy URL**.
+2. Store it as a GitHub Actions secret (e.g. `DISCORD_WEBHOOK_URL`).
+3. Wire it into the step:
+
+```yaml
+- uses: agents-market/pipeline-action@v0.3.4
+  with:
+    pipeline_file: .github/pipelines/ai-review.yaml
+    webhook_url: ${{ secrets.DISCORD_WEBHOOK_URL }}
+    webhook_format: discord
+```
+
+The channel receives a Discord embed with a red side bar (critical findings) and a `description` listing each finding.
+
+#### Microsoft Teams
+
+1. In Teams: **Channel → ⋯ → Connectors → Incoming Webhook → Configure → Copy URL**.
+2. Store it as a GitHub Actions secret (e.g. `TEAMS_WEBHOOK_URL`).
+3. Wire it into the step:
+
+```yaml
+- uses: agents-market/pipeline-action@v0.3.4
+  with:
+    pipeline_file: .github/pipelines/ai-review.yaml
+    webhook_url: ${{ secrets.TEAMS_WEBHOOK_URL }}
+    webhook_format: teams
+```
+
+The channel receives a Teams MessageCard with facts (Status / Total findings / Max severity / Duration / Cost / PR) and one section per finding (capped at 10 — remaining count is summarised).
+
+### Error handling
+
+- **Empty URL** → `notify()` returns `{ status: 'skipped' }` without touching `fetch`. No allocation, no network.
+- **Timeout** (> 5s) → `notify()` returns `{ status: 'failed', error: 'timeout after 5000ms: ...' }`. A `::notice::` line logs the failure but the pipeline exit code is unchanged.
+- **Non-2xx** → `{ status: 'failed', http_status, error }`. Same non-fatal behaviour.
+
+Use `webhook_status` in a downstream step if you want to branch on the outcome (e.g. create a Jira issue when the webhook fails):
+
+```yaml
+- id: notify
+  uses: agents-market/pipeline-action@v0.3.4
+  with:
+    webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+- if: steps.notify.outputs.webhook_status == 'failed'
+  run: echo "webhook delivery failed — investigating"
+```
 
 ## PR Review Dedup (v0.3.3+)
 
@@ -165,74 +268,6 @@ core.info(`PR review ${action} (id=${review_id})`);
 ```
 
 The `postReview()` function is also exported from `dist/index.js` after `pnpm build` — it's available to any consumer that wants to call the same helper directly.
-
-## Provider Fallback (v0.4.0+)
-
-> **TL;DR** If the primary LLM provider returns a transient error (HTTP 429 rate-limit, HTTP 408 / connection timeout, HTTP 5xx server error), the action retries the same prompt on the configured fallback provider (default `openai`/`gpt-4o-mini`). Resilience: the pipeline finishes even when one provider is having a bad day.
-
-### Rationale
-
-LLM providers occasionally have outages, rate-limit spikes, or capacity issues. Without a fallback, the pipeline fails the entire action run — wasted minutes of wall-clock time, lost context-mode cost uplift, and a noisy red ❌ on the PR. With fallback, the degraded path is invisible: the consumer sees the same outputs, the step summary notes `↻ provider fallback fired N/M calls`, and the new outputs surface which provider actually served each call.
-
-### Example: primary MiniMax + fallback OpenAI
-
-```yaml
-- uses: agents-market/pipeline-action@v1
-  with:
-    provider: minimax                          # primary
-    primary_model: MiniMax-M3
-    model: MiniMax-M3                          # legacy alias (still works)
-    fallback_provider: openai                  # secondary — fires on 429/timeout/5xx
-    fallback_model: gpt-4o-mini
-    fallback_on_error: any                     # rate_limit | timeout | server_error | any
-    api_key: ${{ secrets.MINIMAX_API_KEY }}
-    openai_api_key: ${{ secrets.OPENAI_API_KEY }}   # fallback key — required to enable
-    pipeline_file: ./pipelines/review.yaml
-```
-
-When `OPENAI_API_KEY` is unset, the fallback is **silently disabled** and the action behaves exactly like v0.3.x — no errors, no warnings, just primary-only. Set both keys (or use `secrets.OPENAI_API_KEY`) to opt in.
-
-### Cost trade-off
-
-The fallback provider may be **10–30% pricier** than the primary per call. Documented examples:
-
-| Primary | Fallback | Trade-off |
-|---------|----------|-----------|
-| MiniMax-M3 | OpenAI gpt-4o-mini | OpenAI is ~10× pricier per input token than MiniMax — fallback adds noticeable cost when it fires |
-| MiniMax-M3 | Anthropic claude-3-haiku | Similar to OpenAI — fallback is a cost-premium safety net, not a free upgrade |
-| OpenAI gpt-4-turbo | Anthropic claude-3-sonnet | Comparable pricing — fallback is roughly cost-neutral |
-
-When fallback fires, the action exposes the split via `cost_primary_usdc` (0 when the primary call failed) and `cost_fallback_usdc` (the actual fallback cost). `total_cost_usdc` is the truthful sum.
-
-### Behaviour matrix
-
-| `fallback_on_error` | Triggers on | Skips on |
-|---------------------|-------------|----------|
-| `rate_limit` | HTTP 429, SDK `RateLimitError` class, message literal "rate limit" / "429" / "token plan usage limit reached" | 5xx, timeouts, 4xx other than 429 |
-| `timeout` | HTTP 408, ETIMEDOUT, ECONNRESET, ENOTFOUND, EAI_AGAIN, message literal "timeout" / "timed out" | 429, 5xx, 4xx |
-| `server_error` | HTTP 500/502/503/504, SDK server-error class, message literal "server error" / "bad gateway" / "service unavailable" / "gateway timeout" | 429, timeouts, 4xx |
-| `any` (default) | All of the above + any unclassified error | 4xx other than 408/429 (auth, validation, schema) |
-
-Non-retryable errors (4xx other than 408/429) **never** trigger fallback — retrying a malformed request wastes money. The pipeline fails immediately with the primary's error message, just like v0.3.x.
-
-### Step summary surface
-
-When fallback fires during a run, the `$GITHUB_STEP_SUMMARY` gains a single notice line:
-
-```
-↻ provider fallback fired 2/5 calls (primary → fallback due to 'any' error class)
-```
-
-The notice is intentionally terse — it tells the operator "we degraded gracefully" without burying the actual outputs.
-
-### Backward compatibility
-
-v0.3.x → v0.4.0 is a **non-breaking upgrade for existing consumers**:
-
-- All v0.3.x inputs (`provider`, `model`, etc.) still work and produce identical behaviour when the new inputs are unset.
-- The 5 new inputs (`primary_provider`, `primary_model`, `fallback_provider`, `fallback_model`, `fallback_on_error`) are optional with safe defaults.
-- The 4 new outputs (`provider_used`, `cost_primary_usdc`, `cost_fallback_usdc`, `provider_primary_error`) are emitted unconditionally — consumers that ignore them are unaffected.
-- The `FallbackProvider` wrapper is transparent when fallback is disabled: `deps.provider.name` continues to mirror the primary (e.g. `minimax`) so existing assertions in test suites still pass.
 
 ## PR-review consumer contract
 

@@ -7,7 +7,7 @@ inputs:
     description: 'LLM provider API key (falls back to MINIMAX_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY depending on provider).'
     required: false
   provider:
-    description: 'LLM provider: minimax|openai|anthropic|openrouter (default: minimax). Used as the primary provider unless `primary_provider` is explicitly set.'
+    description: 'LLM provider: minimax|openai|anthropic|openrouter (default: minimax).'
     required: false
     default: 'minimax'
   pipeline_file:
@@ -17,7 +17,7 @@ inputs:
     description: 'Inline pipeline YAML string. Mutually exclusive with pipeline_file.'
     required: false
   model:
-    description: 'Default model identifier. Used as the primary model unless `primary_model` is explicitly set.'
+    description: 'Default model identifier.'
     required: false
     default: 'MiniMax-M3'
   inputs_json:
@@ -36,28 +36,13 @@ inputs:
     description: "How much code context the LLM sees beyond the PR diff. 'diff' = PR diff only (cost ~1x). 'imports' (default) = diff + imported types (~3x). 'related' = diff + files importing changed files (~10x). 'full' = diff + all .ts/.py files in repo (~100x). Actual fetching is pipeline-runtime's responsibility; this input only declares the wiring."
     required: false
     default: 'imports'
-
-  # ---- v0.4.0 ADDITIVE: provider-fallback inputs (TASKS row 105) ----
-  primary_provider:
-    description: "v0.4.0+ — Override for the primary provider. Defaults to the `provider` input when unset."
+  webhook_url:
+    description: 'v0.3.4 — Slack / Discord / Teams incoming-webhook URL. When set, posts the run summary + findings to the webhook after each successful run (Slack Block Kit, Discord embeds, or Teams MessageCard depending on the URL host or `webhook_format`). Leave empty to disable. The URL embeds the signing secret — no extra auth header is sent.'
     required: false
-    default: 'minimax'
-  primary_model:
-    description: "v0.4.0+ — Override for the primary model. Defaults to the `model` input when unset."
+  webhook_format:
+    description: 'v0.3.4 — Force a specific payload format: `slack` (Block Kit), `discord` (embeds), `teams` (MessageCard), or `auto` (default — sniff from `webhook_url` hostname). Use `auto` unless the webhook lives behind a custom domain that proxies to one of the supported providers.'
     required: false
-    default: 'MiniMax-M3'
-  fallback_provider:
-    description: "v0.4.0+ — Secondary provider that catches transient primary failures (429 rate-limit, 408/timeout, 5xx server error). One of `minimax | openai | anthropic`. Default `openai`, but when the matching API key is unset the fallback is silently disabled so v0.3.x consumers see no behaviour change."
-    required: false
-    default: 'openai'
-  fallback_model:
-    description: "v0.4.0+ — Model to use on the fallback provider. Default `gpt-4o-mini` (when fallback_provider is `openai`). Ignored when fallback is disabled."
-    required: false
-    default: 'gpt-4o-mini'
-  fallback_on_error:
-    description: "v0.4.0+ — Which primary error classes trigger the fallback attempt. `rate_limit` (only HTTP 429), `timeout` (408 + ETIMEDOUT/ECONNRESET), `server_error` (5xx), or `any` (all three + unknowns). Default `any`."
-    required: false
-    default: 'any'
+    default: 'auto'
 
 outputs:
   result_json:
@@ -88,21 +73,17 @@ outputs:
     description: 'Number of findings at or above fail_on threshold.'
   max_severity:
     description: 'Highest severity seen across all findings (critical|high|medium|low) or empty string when no findings.'
-
-  # ---- v0.4.0 ADDITIVE: provider-fallback observability outputs ----
-  provider_used:
-    description: "v0.4.0+ — Which provider actually served the last LLM call. `primary` when the primary succeeded (or when fallback is disabled). `fallback` when the fallback caught a retryable primary error. Empty string when the pipeline produced no LLM calls."
-  cost_primary_usdc:
-    description: "v0.4.0+ — USDC attributable to primary-provider calls (sum across all stages). When fallback is disabled this equals `total_cost_usdc`; when fallback fired it reflects only the primary-attempted cost."
-  cost_fallback_usdc:
-    description: "v0.4.0+ — USDC attributable to fallback-provider calls. Always `0.000000` when fallback never fired."
-  provider_primary_error:
-    description: "v0.4.0+ — Message of the most recent primary-provider error that triggered a fallback attempt. Empty string when fallback never fired or when fallback is disabled."
+  webhook_status:
+    description: 'v0.3.4 — Result of the optional webhook notification: `sent` when the POST succeeded (200/2xx), `skipped` when `webhook_url` is empty, or `failed` when the webhook returned a non-2xx status or the request errored (timeout, network, etc).'
 
 runs:
   using: node20
   main: dist/index.js
 
+  # v0.3.0 — pre-step: pre-flight schema validation via @agentsmarket/cli
+  # (npm-distributed, v0.9.0+). Skips the main step on validation failure so
+  # a malformed pipeline.yaml never reaches the LLM provider. Inline
+  # pipeline_yaml specs are validated by the main step itself.
   pre:
     - name: agentsmarket validate (pre-flight schema check)
       id: pre

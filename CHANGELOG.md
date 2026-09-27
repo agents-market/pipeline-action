@@ -1,41 +1,45 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
-## v0.4.0 (2026-09-27) — provider fallback (resilience)
+## v0.3.4 (2026-09-27) — webhook notifications (Slack / Discord / Teams)
 
-> **Resilience release.** v0.4.0 introduces automatic fallback from the primary LLM provider to a secondary one when the primary returns a transient error (HTTP 429 rate-limit, HTTP 408 / connection timeout, HTTP 5xx server error). Defaults preserve v0.3.x behaviour exactly: when the fallback provider's API key is missing the wrapper is silently skipped — opt in by setting `OPENAI_API_KEY` (or any other provider key) and `fallback_provider` resolves automatically.
+> 100% additive on top of v0.3.2. No breaking changes — existing consumers see zero behaviour change unless they opt in via the two new inputs (`webhook_url`, `webhook_format`) and read the new `webhook_status` output. Closes TASKS row 108.
 
 ### Added
 
-#### Provider fallback (TASKS row 105)
-- **New action inputs** (all optional, with defaults that preserve v0.3.x):
-  - `primary_provider` (enum `minimax | openai | anthropic`, default `minimax`) — explicit override; falls back to the legacy `provider` input when unset.
-  - `primary_model` (string, default `MiniMax-M3`) — explicit override; falls back to the legacy `model` input when unset.
-  - `fallback_provider` (enum, default `openai`) — secondary provider that catches transient primary failures. **Silently disabled** when the matching API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) is unset, so existing v0.3.x consumers that have never configured a fallback key see zero behaviour change.
-  - `fallback_model` (string, default `gpt-4o-mini`) — model on the fallback provider.
-  - `fallback_on_error` (enum `rate_limit | timeout | server_error | any`, default `any`) — which primary error classes trigger the fallback attempt.
-- **New `src/fallback.ts`** exporting `FallbackProvider` (implements `LLMProvider` from `@agentsmarket/pipeline-runtime`), `classifyError`, `isRetryableError`, `BothProvidersFailedError`, `createFallbackProvider`, `MicroUsdcPricer`. Transparent passthrough when fallback is disabled (the wrapper's `name` mirrors the primary so existing `deps.provider.name === 'minimax'` assertions still pass).
-- **`callProviderWithFallback(prompt, opts)`** — public entry point returning `{ result, provider_used: 'primary' | 'fallback', primary_error?: Error }`. Tries primary first; on a retryable error, switches to fallback; when both fail, throws `BothProvidersFailedError` with the primary error in `.primary` and the fallback error in `.fallback` (and chained via `Error.cause`).
-- **Per-provider cost tracking** — `FallbackProvider.cost_primary_micro_usdc` and `cost_fallback_micro_usdc` accumulate micro-USDC per actual served call (model + token usage resolved via a `MicroUsdcPricer` injected at construction). `run.ts` overrides the runtime's `totalCostMicroUsdc` with the wrapper's total so the cost outputs reflect the actual served provider, not the stage-declared model.
-- **New action outputs**:
-  - `provider_used` — `'primary' | 'fallback'` (always `'primary'` when fallback is disabled).
-  - `cost_primary_usdc` — micro-USDC attributable to primary calls.
-  - `cost_fallback_usdc` — micro-USDC attributable to fallback calls (always `0.000000` when fallback never fired).
-  - `provider_primary_error` — message of the most recent primary error that triggered a fallback attempt (empty when fallback never fired).
-- **Step summary notice** — when fallback fires, `run.ts` emits `↻ provider fallback fired N/M calls (primary → fallback due to '<mode>' error class)` so the run summary tells operators the action degraded gracefully.
+#### Webhook notifications (TASKS row 108)
+- New optional inputs:
+  - `webhook_url` (string, no default) — incoming-webhook URL from Slack / Discord / Teams. Leave empty to disable. The URL embeds the signing secret — no extra auth header is sent.
+  - `webhook_format` (enum `slack` | `discord` | `teams` | `auto`, default `auto`) — force a specific payload format, or auto-detect from the URL hostname (`hooks.slack.com` → slack, `discord.com/api/webhooks` → discord, `outlook.office.com/webhook` → teams, else `custom`).
+- New output `webhook_status` (`sent` | `skipped` | `failed`) — outcome of the notification. `skipped` when `webhook_url` is empty (the default), `sent` on a 2xx response, `failed` on non-2xx / timeout / network error. Failures are non-fatal — the pipeline result is unaffected.
+- New module `src/notifier.ts` with the public surface:
+  - `notify(opts: { url, format, findings, summary, prContext }): Promise<NotifyResult>` — POST wrapper with `AbortController` timeout (5s).
+  - `detectFormatFromUrl(url): WebhookFormat` — hostname sniffing for the `auto` mode.
+  - `buildSlackPayload(findings, summary, prContext)` — Slack Block Kit (`blocks` array, mrkdwn, severity emoji + `toUpperCase()`).
+  - `buildDiscordPayload(findings, summary, prContext)` — Discord embeds (`embeds` array, severity-coloured side bar, hex `color` per dominant severity).
+  - `buildTeamsPayload(findings, summary, prContext)` — Microsoft Teams MessageCard (`@type: MessageCard`, `summary` + `sections` with facts + per-finding blocks, theme color).
+  - `buildCustomPayload(findings, summary, prContext)` — minimal plain-JSON envelope for unknown webhook URLs.
+- Uses Node 18+ builtin `fetch` — no new dependencies.
 
-### Notes (semver)
-- v0.4.0 is technically a "breaking change" semver-wise because the action input schema gains 5 new entries. **Existing consumers see zero behaviour change**: the new inputs all carry safe defaults, and `fallback_provider` is silently disabled when its API key is absent. Migration path for v0.3.x → v0.4.0: drop in the upgrade, no workflow changes required.
-- Cost trade-off documented in `README.md`: fallback may add 10–30% per call when primary is more expensive (e.g. OpenAI gpt-4o-mini is ~10× pricier than MiniMax per input token). Configure `fallback_provider` deliberately.
+#### PR context resolution
+- New `readPullRequestContextFromEnv()` helper in `src/run.ts` reads `GITHUB_REPOSITORY` + `GITHUB_EVENT_PATH` to populate `owner`, `repo`, `pull_number`, and `url` for the webhook payload. Falls back to empty fields for non-`pull_request` events (push, schedule, manual dispatch).
 
-### Tests (177 passing, 1 skipped — +18 from v0.3.x)
-- `tests/provider-fallback.test.ts` (NEW) — 18 tests covering `classifyError`, `isRetryableError` × 4 modes, `FallbackProvider` × 6 integration scenarios (Test 1–6 per the task spec), and 2 `run()`-level wiring tests for the action outputs.
-- Existing test helpers in `tests/{provider,run,provider-integration,pipeline-source}.test.ts` updated to include the 5 new `ActionInputs` fields + a "primary mirrors provider/model when unset" compatibility shim so the legacy test contracts (provider=openai selects OpenAIChatProvider, etc.) still hold.
+#### Wiring
+- `run.ts` calls `notify()` after all v0.3.1/v0.3.2 outputs are written. The webhook call is the very last thing before the `✓ pipeline complete` notice, so summary / cost / timing / findings are all flushed to `$GITHUB_OUTPUT` before the optional network call.
+- A failed webhook posts a `::notice::` line but does not change the pipeline exit code.
+
+### Tests
+- 5 new integration tests under `describe("notifier()", ...)` in `tests/notifier.test.ts`:
+  - Slack Block Kit payload (blocks array, mrkdwn, severity fields) + auto-detect from `hooks.slack.com`.
+  - Discord embeds payload (color hex per severity, title) + auto-detect from `discord.com/api/webhooks` (including `*.discord.com` subdomains).
+  - Teams MessageCard payload (`summary` + `sections` with facts + per-finding blocks) + auto-detect from `outlook.office.com` and `outlook.office365.com`.
+  - Empty / whitespace-only URL → `skipped` (no fetch).
+  - Mock fetch returning HTTP 500 → `failed` with `http_status: 500`.
+- Total: 164 tests passing, 1 skipped (159 baseline + 5 new).
 
 ### Compatibility
-- 100% additive on the wire. All v0.3.2 inputs/outputs unchanged.
-- `FallbackProvider` is transparent when `fallback_provider=null` (default after `resolveFallback` auto-disables on missing key): `deps.provider.name === primary.name` and the wrapper is a no-op passthrough.
-- Error classification is independent of the existing `retry.ts` `defaultRetryable` predicate — the fallback wrapper uses its own focused classifier tailored to the `fallback_on_error` filter (e.g. `rate_limit` mode does NOT trigger on 5xx, where `defaultRetryable` would).
-- `BothProvidersFailedError` carries both errors on the `cause` chain so a single `try/catch` at the action boundary can render full diagnostics.
+- 100% additive. v0.3.2 consumers still work — the new inputs default to "disabled" so `notify()` returns `skipped` and never touches the network unless a webhook URL is provided.
+
+---
 
 ## v0.3.2 (2026-09-27) — additive cost + timing outputs
 
