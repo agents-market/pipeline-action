@@ -99,6 +99,8 @@ outputs:
     description: 'Findings filtered by severity_threshold input. Empty array when none match.'
   findings_count_json:
     description: 'Aggregate counts by severity: {critical, high, medium, low}.'
+  findings_skipped_no_metadata:
+    description: 'v0.4.2+ — Count of findings dropped because they lacked a real `file` field (LLM emitted region/line_range instead of file/line). These would otherwise be pushed to the GitHub PR comments API as `path: <stage_id>` and rejected with HTTP 422 "could not be resolved". When non-zero, the prompt for the producing stage needs updating. See TASKS row 113.'
   status:
     description: 'passed | failed — pass/fail decision based on fail_on input.'
   failed_count:

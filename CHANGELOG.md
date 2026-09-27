@@ -1,5 +1,31 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## v0.4.3 (2026-09-27) — raw-JSON findings fix + observability (patch)
+
+> **Patch release.** Fixes a high-severity operator-facing bug in style-review pipelines where findings lacking a `file` field were pushed to the GitHub PR Comments API with `path: "analyze_style"`, which the API rejected with HTTP 422 (`pull_request_review_thread.path "could not be resolved"`). Also adds first-class observability for the bug class — a new action output counter + warning notice — so operators see the issue directly instead of silently missing findings.
+
+### Fixed
+
+- **Findings with `file` defaulted to stageId are no longer pushed to the PR Comments API.** When the LLM emitted findings without a `file` field (typical for style-review prompts asking for `region`/`line_range` instead of `file`/`line`), the action's `formatFindings()` normalized the missing `file` to the stageId (e.g., `"analyze_style"`). The wrapper's inline-comment filter accepted these (both `f.line` and `f.file` truthy) and passed `path: "analyze_style"` to the GitHub PR Comments API, which rejected it with `422 pull_request_review_thread.path "could not be resolved"`. The action now drops these findings with `formatFindingsWithStats()` (new function), which preserves the back-compat `formatFindings()` signature. File-level findings without a `line` field still surface in the summary — only findings with a `line` and a missing real `file` are dropped, since those are the ones the API would reject.
+
+### Added
+
+- **`findings_skipped_no_metadata`** action output — integer count of findings dropped because their `file` defaulted to the stageId. Non-zero value is a clear signal that the stage prompt needs updating (LLM is emitting `region`/`line_range` style metadata instead of `file`/`line`). See TASKS row 113 for context.
+- **`formatFindingsWithStats(rawOutput) → { findings, stats }`** — new exported TypeScript function alongside the back-compat `formatFindings(rawOutput) → ReviewFinding[]`. Same `findings` shape; adds `stats.no_file` counter for observability.
+- **`FormatStats` / `FormatResult` interfaces** — new exported types alongside the existing `ReviewFinding` / `Severity` types.
+- **`humanizeStageId(id)`** — new exported utility Title-Casing snake_case stage IDs in the Actions summary headings (`### profile_style` → `### Profile Style`).
+- **Warning notice in CI logs when `stats.no_file > 0`** — points the operator at the exact prompt field that's missing and references the prompt update needed for the fix to be complete.
+
+### Required companion fix (consumer workflows)
+
+This fix is complete only when the consumer's style-review prompts also require `file` explicitly. See [`web3eco/shared-actions` companion PR](https://github.com/web3eco/shared-actions/pull/29) for the prompt updates to `analyze_style` + `aggregate_style` stages. Without those, the LLM continues emitting `region`/`line_range` and the action correctly drops the findings (with the new warning notice). With the prompt update, findings flow through to inline PR comments as expected.
+
+### Migration
+
+No action required. All changes are additive and the `formatFindings()` signature is preserved. `v0.4.1` consumers MUST upgrade to `@v0.4.2` or `@v0.4.3` — see the v0.4.2 entry below for the manifest-loading bug fix that v0.4.1 shipped with.
+
+---
+
 ## v0.4.2 (2026-09-27) — manifest contract fix (patch)
 
 > **Patch release.** Same cumulative feature surface as v0.4.1. Fixes a manifest-loading bug introduced in v0.3.0 that made every release from v0.3.0 through v0.4.1 silently non-runnable on the GH runner — discovered the moment a real consumer (web3eco/blockchain) bumped from `258891e` (v0.2.1, works) to `de0dbbf` (v0.3.1+, broken). The unit test suite and typecheck all passed against the broken manifest because the runner validates the contract AT LOAD TIME, after the JS bundle is shipped.
