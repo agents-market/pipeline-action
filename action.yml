@@ -7,7 +7,7 @@ inputs:
     description: 'LLM provider API key (falls back to MINIMAX_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY depending on provider).'
     required: false
   provider:
-    description: 'LLM provider: minimax|openai|anthropic|openrouter (default: minimax).'
+    description: 'LLM provider: minimax|openai|anthropic|openrouter (default: minimax). Used as the primary provider unless `primary_provider` is explicitly set.'
     required: false
     default: 'minimax'
   pipeline_file:
@@ -17,7 +17,7 @@ inputs:
     description: 'Inline pipeline YAML string. Mutually exclusive with pipeline_file.'
     required: false
   model:
-    description: 'Default model identifier.'
+    description: 'Default model identifier. Used as the primary model unless `primary_model` is explicitly set.'
     required: false
     default: 'MiniMax-M3'
   inputs_json:
@@ -36,10 +36,28 @@ inputs:
     description: "How much code context the LLM sees beyond the PR diff. 'diff' = PR diff only (cost ~1x). 'imports' (default) = diff + imported types (~3x). 'related' = diff + files importing changed files (~10x). 'full' = diff + all .ts/.py files in repo (~100x). Actual fetching is pipeline-runtime's responsibility; this input only declares the wiring."
     required: false
     default: 'imports'
-  output_format:
-    description: "v0.4.0 — Format for downstream findings emission. `summary` (default) keeps v0.3.x behaviour: only the `findings_json` + `summary_only_findings_json` outputs. `sarif` additionally emits `findings_sarif` (SARIF 2.1.0 JSON) for upload to GitHub Code Scanning via `github/codeql-action/upload-sarif@v3`. Pure additive — the summary outputs ALWAYS fire regardless of this input."
+
+  # ---- v0.4.0 ADDITIVE: provider-fallback inputs (TASKS row 105) ----
+  primary_provider:
+    description: "v0.4.0+ — Override for the primary provider. Defaults to the `provider` input when unset."
     required: false
-    default: 'summary'
+    default: 'minimax'
+  primary_model:
+    description: "v0.4.0+ — Override for the primary model. Defaults to the `model` input when unset."
+    required: false
+    default: 'MiniMax-M3'
+  fallback_provider:
+    description: "v0.4.0+ — Secondary provider that catches transient primary failures (429 rate-limit, 408/timeout, 5xx server error). One of `minimax | openai | anthropic`. Default `openai`, but when the matching API key is unset the fallback is silently disabled so v0.3.x consumers see no behaviour change."
+    required: false
+    default: 'openai'
+  fallback_model:
+    description: "v0.4.0+ — Model to use on the fallback provider. Default `gpt-4o-mini` (when fallback_provider is `openai`). Ignored when fallback is disabled."
+    required: false
+    default: 'gpt-4o-mini'
+  fallback_on_error:
+    description: "v0.4.0+ — Which primary error classes trigger the fallback attempt. `rate_limit` (only HTTP 429), `timeout` (408 + ETIMEDOUT/ECONNRESET), `server_error` (5xx), or `any` (all three + unknowns). Default `any`."
+    required: false
+    default: 'any'
 
 outputs:
   result_json:
@@ -48,6 +66,10 @@ outputs:
     description: 'Wall-clock pipeline duration in milliseconds.'
   total_cost_usdc:
     description: 'Estimated cost in USDC with 6 decimals (e.g. "0.001234").'
+  cost_usdc:
+    description: 'Estimated API cost in USDC (x402 micropayment to MiniMax). Same value as total_cost_usdc; added in v0.3.2 for dashboards / billing / runaway-PR detection.'
+  timing_json:
+    description: 'Per-stage duration in milliseconds, JSON: {validate_ms, fetch_source_ms, run_pipeline_ms, format_output_ms}. Stages that were never measured default to 0 ms.'
   stage_count:
     description: 'Number of stages declared in the pipeline.'
   stage_<id>_ms:
@@ -66,17 +88,21 @@ outputs:
     description: 'Number of findings at or above fail_on threshold.'
   max_severity:
     description: 'Highest severity seen across all findings (critical|high|medium|low) or empty string when no findings.'
-  findings_sarif:
-    description: 'v0.4.0 — SARIF 2.1.0 JSON document of findings (only emitted when `output_format` is `sarif`). Upload to GitHub Code Scanning via `github/codeql-action/upload-sarif@v3` to surface review results in the PR Security tab. Same findings as `findings_json`, remapped to SARIF shape with `ruleId` (CWE), `level` (error/warning/note), `locations`, `partialFingerprints` for dedup, and severity/confidence/recommendation in `properties`.'
+
+  # ---- v0.4.0 ADDITIVE: provider-fallback observability outputs ----
+  provider_used:
+    description: "v0.4.0+ — Which provider actually served the last LLM call. `primary` when the primary succeeded (or when fallback is disabled). `fallback` when the fallback caught a retryable primary error. Empty string when the pipeline produced no LLM calls."
+  cost_primary_usdc:
+    description: "v0.4.0+ — USDC attributable to primary-provider calls (sum across all stages). When fallback is disabled this equals `total_cost_usdc`; when fallback fired it reflects only the primary-attempted cost."
+  cost_fallback_usdc:
+    description: "v0.4.0+ — USDC attributable to fallback-provider calls. Always `0.000000` when fallback never fired."
+  provider_primary_error:
+    description: "v0.4.0+ — Message of the most recent primary-provider error that triggered a fallback attempt. Empty string when fallback never fired or when fallback is disabled."
 
 runs:
   using: node20
   main: dist/index.js
 
-  # v0.3.0 — pre-step: pre-flight schema validation via @agentsmarket/cli
-  # (npm-distributed, v0.9.0+). Skips the main step on validation failure so
-  # a malformed pipeline.yaml never reaches the LLM provider. Inline
-  # pipeline_yaml specs are validated by the main step itself.
   pre:
     - name: agentsmarket validate (pre-flight schema check)
       id: pre

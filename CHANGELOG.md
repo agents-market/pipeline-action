@@ -1,48 +1,78 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
-## v0.4.0 (2026-09-27) — provider fallback + SARIF output
+## v0.4.0 (2026-09-27) — provider fallback (resilience)
 
-> 100% additive on top of v0.3.1. Existing v0.3.x consumers see zero behaviour change unless they explicitly opt into new inputs (`fallback_provider` for the resilience wrapper; `output_format='sarif'` for the new SARIF output). All v0.3.1 outputs preserved.
+> **Resilience release.** v0.4.0 introduces automatic fallback from the primary LLM provider to a secondary one when the primary returns a transient error (HTTP 429 rate-limit, HTTP 408 / connection timeout, HTTP 5xx server error). Defaults preserve v0.3.x behaviour exactly: when the fallback provider's API key is missing the wrapper is silently skipped — opt in by setting `OPENAI_API_KEY` (or any other provider key) and `fallback_provider` resolves automatically.
 
-### Added — Provider fallback (TASKS row 105)
+### Added
 
-- **Resilience wrapper** — when `fallback_provider` is configured AND its API key is available, the primary provider is wrapped in a `FallbackProvider` that catches transient errors (HTTP 429 rate-limit, HTTP 408 / connection timeout, HTTP 5xx) and retries the same prompt on the fallback. Classified via `classifyError()` (focused predicate, not a copy of `defaultRetryable` from `retry.ts`). When both providers fail, throws `BothProvidersFailedError` carrying both original errors so a single boundary catch surfaces full diagnostics.
-- **New outputs** (always written so consumers can read `provider_used='primary'` regardless of whether the fallback wrapper was active):
-  - `provider_used` — `'primary' | 'fallback'` (which provider ultimately served the call)
-  - `cost_primary_usdc` — micro-USDC cost of successful primary calls (6 decimals)
-  - `cost_fallback_usdc` — micro-USDC cost of fallback calls (6 decimals)
-  - `provider_primary_error` — last primary error message (empty when primary succeeded or fallback is disabled)
-- **Wrapper cost semantics** — `cost_usdc == total_cost_usdc` regardless of fallback path. When fallback fires, the runtime's `totalCostMicroUsdc` is inaccurate (prices against the stage's declared model, not the fallback's actual model), so `run.ts` uses the wrapper's per-provider totals for the cost outputs.
-- **Backward compat** — when `fallback_provider` is empty OR its API key is missing, the primary is used directly. `buildExecutorDeps` returns the same shape v0.3.x consumers expect; `deps.provider.name === 'minimax'` (and equivalents) continues to pass.
+#### Provider fallback (TASKS row 105)
+- **New action inputs** (all optional, with defaults that preserve v0.3.x):
+  - `primary_provider` (enum `minimax | openai | anthropic`, default `minimax`) — explicit override; falls back to the legacy `provider` input when unset.
+  - `primary_model` (string, default `MiniMax-M3`) — explicit override; falls back to the legacy `model` input when unset.
+  - `fallback_provider` (enum, default `openai`) — secondary provider that catches transient primary failures. **Silently disabled** when the matching API key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) is unset, so existing v0.3.x consumers that have never configured a fallback key see zero behaviour change.
+  - `fallback_model` (string, default `gpt-4o-mini`) — model on the fallback provider.
+  - `fallback_on_error` (enum `rate_limit | timeout | server_error | any`, default `any`) — which primary error classes trigger the fallback attempt.
+- **New `src/fallback.ts`** exporting `FallbackProvider` (implements `LLMProvider` from `@agentsmarket/pipeline-runtime`), `classifyError`, `isRetryableError`, `BothProvidersFailedError`, `createFallbackProvider`, `MicroUsdcPricer`. Transparent passthrough when fallback is disabled (the wrapper's `name` mirrors the primary so existing `deps.provider.name === 'minimax'` assertions still pass).
+- **`callProviderWithFallback(prompt, opts)`** — public entry point returning `{ result, provider_used: 'primary' | 'fallback', primary_error?: Error }`. Tries primary first; on a retryable error, switches to fallback; when both fail, throws `BothProvidersFailedError` with the primary error in `.primary` and the fallback error in `.fallback` (and chained via `Error.cause`).
+- **Per-provider cost tracking** — `FallbackProvider.cost_primary_micro_usdc` and `cost_fallback_micro_usdc` accumulate micro-USDC per actual served call (model + token usage resolved via a `MicroUsdcPricer` injected at construction). `run.ts` overrides the runtime's `totalCostMicroUsdc` with the wrapper's total so the cost outputs reflect the actual served provider, not the stage-declared model.
+- **New action outputs**:
+  - `provider_used` — `'primary' | 'fallback'` (always `'primary'` when fallback is disabled).
+  - `cost_primary_usdc` — micro-USDC attributable to primary calls.
+  - `cost_fallback_usdc` — micro-USDC attributable to fallback calls (always `0.000000` when fallback never fired).
+  - `provider_primary_error` — message of the most recent primary error that triggered a fallback attempt (empty when fallback never fired).
+- **Step summary notice** — when fallback fires, `run.ts` emits `↻ provider fallback fired N/M calls (primary → fallback due to '<mode>' error class)` so the run summary tells operators the action degraded gracefully.
 
-### Added — SARIF 2.1.0 output format (TASKS row 106)
+### Notes (semver)
+- v0.4.0 is technically a "breaking change" semver-wise because the action input schema gains 5 new entries. **Existing consumers see zero behaviour change**: the new inputs all carry safe defaults, and `fallback_provider` is silently disabled when its API key is absent. Migration path for v0.3.x → v0.4.0: drop in the upgrade, no workflow changes required.
+- Cost trade-off documented in `README.md`: fallback may add 10–30% per call when primary is more expensive (e.g. OpenAI gpt-4o-mini is ~10× pricier than MiniMax per input token). Configure `fallback_provider` deliberately.
 
-- **New `output_format` input** — enum `summary` (default) \| `sarif`. Default preserves v0.3.x behaviour. Opt-in to `sarif` for SARIF 2.1.0 emission on the `findings_sarif` output.
-- **New `src/formatters/sarif.ts`** — exports `formatFindingsAsSarif(findings, context)` returning a SARIF 2.1.0-compliant JSON document. Top-level shape: `{ $schema, version: "2.1.0", runs: [...] }`. Each run has `tool.driver` (name `agentsmarket-pipeline-action`, version `0.4.0`, rules) + `results` (one per finding).
-- **Severity → SARIF `level` mapping** per GitHub Code Scanning guidance: `critical → error`, `high → error`, `medium → warning`, `low → note`. Anything else falls back to `note` (never emits an invalid level).
-- **`ruleId`** — CWE when present (the only stable cross-scanner identifier Code Scanning recognizes), otherwise `REVIEW-<hash>` derived from a stable FNV-1a 32-bit hash of `(file, line, cwe, message)`.
-- **`partialFingerprints.agentsmarketPipelineActionV1`** — same FNV-1a hash for dedup across runs (8 lowercase hex chars).
-- **`versionControlProvenance`** — populated when `GITHUB_REPOSITORY` + `GITHUB_SHA` are set (typical for `pull_request` events). Anchors alerts to commits + branch in Code Scanning. Optional — omitted when context is empty.
-- **`properties`** extension fields — surfaces `severity`, `confidence`, `recommendation`, `cwe` so the Code Scanning alert carries the full review context.
-- **New `findings_sarif` output** — only written when `output_format='sarif'`. Backward compat: summary outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) ALWAYS fire regardless of `output_format`. SARIF is built from the same `findings` array as `findings_json` to guarantee the two outputs are consistent (same source, different shape).
-- **Consumer pattern** — upload via `github/codeql-action/upload-sarif@v3` with `category: agentsmarket-pipeline-action` to surface alerts in the PR Security tab. Example workflow in README §"SARIF Output".
-
-### Tests
-- 4 new integration tests under `describe("run() — SARIF output wiring (v0.4.0, integration)", ...)` in `tests/sarif-formatter.test.ts`:
-  1. Emits `findings_sarif` when `output_format=sarif` with non-empty findings — verifies ruleId/level/location/message
-  2. Does NOT emit `findings_sarif` when `output_format=summary` (default, backward compat)
-  3. Emits empty SARIF log (`results=[]`, `rules=[]`) when pipeline has no findings (still valid SARIF)
-  4. Produces SARIF JSON matching schema version 2.1.0 (parseable, `$schema` + `version` pinned, tool name + version set)
-- 7 pure-function unit tests in the same file cover the formatter internals (severity mapping, fingerprint determinism, ruleId selection, multi-finding shape, versionControlProvenance conditional).
+### Tests (177 passing, 1 skipped — +18 from v0.3.x)
+- `tests/provider-fallback.test.ts` (NEW) — 18 tests covering `classifyError`, `isRetryableError` × 4 modes, `FallbackProvider` × 6 integration scenarios (Test 1–6 per the task spec), and 2 `run()`-level wiring tests for the action outputs.
+- Existing test helpers in `tests/{provider,run,provider-integration,pipeline-source}.test.ts` updated to include the 5 new `ActionInputs` fields + a "primary mirrors provider/model when unset" compatibility shim so the legacy test contracts (provider=openai selects OpenAIChatProvider, etc.) still hold.
 
 ### Compatibility
-- 100% additive. v0.3.x consumers see no behaviour change. New inputs default to no-op values. New outputs always emit (default empty string for `provider_used='primary'`, zero for the cost splits, empty for the error message).
+- 100% additive on the wire. All v0.3.2 inputs/outputs unchanged.
+- `FallbackProvider` is transparent when `fallback_provider=null` (default after `resolveFallback` auto-disables on missing key): `deps.provider.name === primary.name` and the wrapper is a no-op passthrough.
+- Error classification is independent of the existing `retry.ts` `defaultRetryable` predicate — the fallback wrapper uses its own focused classifier tailored to the `fallback_on_error` filter (e.g. `rate_limit` mode does NOT trigger on 5xx, where `defaultRetryable` would).
+- `BothProvidersFailedError` carries both errors on the `cause` chain so a single `try/catch` at the action boundary can render full diagnostics.
 
-### Files
-- New: `src/formatters/sarif.ts` (~330 LOC), `tests/sarif-formatter.test.ts` (~280 LOC).
-- Modified: `src/inputs.ts` (`OutputFormat` type + `normalizeOutputFormat` + `output_format` field on `ActionInputs`), `src/run.ts` (conditional emit + `buildSarifContext` helper + version bump to `0.4.0`), `action.yml` (`output_format` input + `findings_sarif` output), `README.md` (new "SARIF Output (v0.4.0)" section), `CHANGELOG.md` (this entry).
+## v0.3.2 (2026-09-27) — additive cost + timing outputs
 
-## v0.3.1 (2026-09-27) — output wiring hotfix
+> 100% additive on top of v0.3.1. No breaking changes — existing consumers see zero behaviour change unless they read the two new outputs (`cost_usdc`, `timing_json`).
+
+### Added
+
+#### `cost_usdc` action output (TASKS row 101)
+- New machine-readable output mirroring `total_cost_usdc` (same 6-decimal USDC value).
+- Designed for downstream observability: dashboards, billing reconciliation, runaway-PR cost detection.
+- Cost computation extracted from `run.ts` into a new pure function `computeCostInUsdc(usageMicroUsdc, contextModeMultiplier): number` in `src/cost.ts` for unit-testability.
+- The `contextModeMultiplier` parameter threads the documented 1x/3x/10x/100x table from `CONTEXT_MODE_MULTIPLIERS`. Currently a no-op at 1.0 — the runtime already accounts for context fetching — but the API is wired through for forward compatibility.
+- Step summary line `| Est. cost | ~$X.XXXXXX USDC |` continues to render via `writeActionSummary` (unchanged behaviour).
+
+#### `timing_json` action output (TASKS row 110)
+- New per-stage wall-clock output: `{"validate_ms":12,"fetch_source_ms":89,"run_pipeline_ms":1240,"format_output_ms":23}` — integer ms per stage.
+- Backed by a new `Timings` class in `src/timing.ts` (`start()` / `end()` / `toJSON()` / `toJSONString()`) using built-in `performance.now()`. No new dependencies.
+- Stages that were never `start()`'d default to 0 ms — partial instrumentation stays schema-stable.
+- `run.ts` instruments all four stages: `fetch_source` (source cache), `validate` (YAML expand + load + spec sanity check), `run_pipeline` (LLM call + retry wrapper), `format_output` (findings extract/filter + summary + writeOutput calls).
+
+#### Auto-suggestion bonus
+- Step summary now logs a `⚡` `::notice::` line when `run_pipeline_ms > 5000` with a non-`diff` `context_mode`, suggesting `diff` (1x cost) for faster iterations. Skipped when `run_pipeline_ms <= 5000` or `context_mode === 'diff'`.
+
+### Implementation notes
+- `runPipelineV2` already returns per-stage timing via the `onStageComplete` hook (the `stage_<id>_ms` outputs). v0.3.2's `timing_json` is **action-side** timing only (the four lifecycle stages above) — it is orthogonal to the runtime's per-stage timing.
+- All 14 outputs declared in `action.yml` (12 from v0.3.1 + 2 new).
+- The `cost_usdc` value matches `total_cost_usdc` exactly. The new name standardizes on the convention used by the MiniMax x402 micropayment pipeline.
+
+### Tests
+- 2 new integration tests under `describe("run() — v0.3.2 outputs (cost_usdc + timing_json)", ...)` in `tests/run.test.ts`:
+  - `cost_usdc` fires with non-empty value + matches the summary line.
+  - `timing_json` has all 4 keys with positive numbers.
+- Total: 159 tests passing, 1 skipped (unchanged).
+
+### Compatibility
+- 100% additive. v0.3.1 consumers still work — the new outputs are present in v0.3.2 but only have content when the action runs end-to-end. Existing `total_cost_usdc` / `total_ms` / `stage_<id>_ms` / `findings_*` outputs unchanged.
+
 
 > **Critical hotfix.** v0.3.0's new outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) were **not wired to action boundaries** — `output-formatter.ts` and `status-check.ts` computed them, but `run.ts` never called `writeOutput()` for them and `action.yml` never declared them. Consumers reading `${{ steps.X.outputs.findings_json }}` got empty strings. **v0.3.0 should not be used.** Upgrade to v0.3.1.
 
