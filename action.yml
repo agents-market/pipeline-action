@@ -36,10 +36,10 @@ inputs:
     description: "How much code context the LLM sees beyond the PR diff. 'diff' = PR diff only (cost ~1x). 'imports' (default) = diff + imported types (~3x). 'related' = diff + files importing changed files (~10x). 'full' = diff + all .ts/.py files in repo (~100x). Actual fetching is pipeline-runtime's responsibility; this input only declares the wiring."
     required: false
     default: 'imports'
-  use_dedup_reviews:
-    description: 'v0.3.3+ — When true (default), the bundled `postReview()` helper posts a single PR Review per commit and edits it on subsequent runs via the PR Review API (anchored to a session marker). When false, falls back to the v0.3.1 behaviour of posting a new issue-style comment per pipeline run (no dedup). Set to false if a consumer wants the legacy behaviour for any reason.'
+  output_format:
+    description: "v0.4.0 — Format for downstream findings emission. `summary` (default) keeps v0.3.x behaviour: only the `findings_json` + `summary_only_findings_json` outputs. `sarif` additionally emits `findings_sarif` (SARIF 2.1.0 JSON) for upload to GitHub Code Scanning via `github/codeql-action/upload-sarif@v3`. Pure additive — the summary outputs ALWAYS fire regardless of this input."
     required: false
-    default: 'true'
+    default: 'summary'
 
 outputs:
   result_json:
@@ -66,6 +66,8 @@ outputs:
     description: 'Number of findings at or above fail_on threshold.'
   max_severity:
     description: 'Highest severity seen across all findings (critical|high|medium|low) or empty string when no findings.'
+  findings_sarif:
+    description: 'v0.4.0 — SARIF 2.1.0 JSON document of findings (only emitted when `output_format` is `sarif`). Upload to GitHub Code Scanning via `github/codeql-action/upload-sarif@v3` to surface review results in the PR Security tab. Same findings as `findings_json`, remapped to SARIF shape with `ruleId` (CWE), `level` (error/warning/note), `locations`, `partialFingerprints` for dedup, and severity/confidence/recommendation in `properties`.'
 
 runs:
   using: node20

@@ -1,48 +1,46 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
-## v0.3.3 (2026-09-27) — PR Review deduplication (TASKS row 102)
+## v0.4.0 (2026-09-27) — provider fallback + SARIF output
 
-> **Single PR Review per commit, edited on subsequent runs.** Replaces the per-push issue-comment flow with GitHub's PR Review API. Backward-compatible via the `use_dedup_reviews: false` opt-out.
+> 100% additive on top of v0.3.1. Existing v0.3.x consumers see zero behaviour change unless they explicitly opt into new inputs (`fallback_provider` for the resilience wrapper; `output_format='sarif'` for the new SARIF output). All v0.3.1 outputs preserved.
 
-### Added
+### Added — Provider fallback (TASKS row 105)
 
-#### `postReview()` helper
-- New `src/post-review.ts` exporting `postReview({ octokit, owner, repo, pull_number, commit_sha, findings, severity_threshold, fail_on })` → `{ review_id, action: 'created' | 'updated', marker_sha }`.
-- Algorithm:
-  1. `octokit.rest.pulls.listReviews({ per_page: 100 })` — find an existing review carrying the session marker `<!-- ai-review-session:{commit_sha} -->`.
-  2. **Hit** → `octokit.rest.pulls.updateReview({ review_id, body })` — rewrite the body with the new findings snapshot, an explicit diff row (new / resolved / changed-severity counts), and the latest marker.
-  3. **Miss** (foreign review, malformed marker, or empty PR) → `octokit.rest.pulls.createReview({ commit_id, event: 'COMMENT', body, comments })` — fresh review anchored to `commit_sha` with inline comments for every finding with `file + line`.
-- Marker format is a contract — `<!-- ai-review-session:{40-hex} -->` — and changing it requires a major version bump (orphaned reviews would be left in place).
-- Pure-function helpers also exported: `parseSessionMarker`, `buildSessionMarker`, `diffFindings`, `findExistingReview`, `parseEmbeddedFindings`, `buildInlineComments`, `renderReviewBody`, `renderInlineCommentBody`, `countBySeverity`, `findingKey`.
+- **Resilience wrapper** — when `fallback_provider` is configured AND its API key is available, the primary provider is wrapped in a `FallbackProvider` that catches transient errors (HTTP 429 rate-limit, HTTP 408 / connection timeout, HTTP 5xx) and retries the same prompt on the fallback. Classified via `classifyError()` (focused predicate, not a copy of `defaultRetryable` from `retry.ts`). When both providers fail, throws `BothProvidersFailedError` carrying both original errors so a single boundary catch surfaces full diagnostics.
+- **New outputs** (always written so consumers can read `provider_used='primary'` regardless of whether the fallback wrapper was active):
+  - `provider_used` — `'primary' | 'fallback'` (which provider ultimately served the call)
+  - `cost_primary_usdc` — micro-USDC cost of successful primary calls (6 decimals)
+  - `cost_fallback_usdc` — micro-USDC cost of fallback calls (6 decimals)
+  - `provider_primary_error` — last primary error message (empty when primary succeeded or fallback is disabled)
+- **Wrapper cost semantics** — `cost_usdc == total_cost_usdc` regardless of fallback path. When fallback fires, the runtime's `totalCostMicroUsdc` is inaccurate (prices against the stage's declared model, not the fallback's actual model), so `run.ts` uses the wrapper's per-provider totals for the cost outputs.
+- **Backward compat** — when `fallback_provider` is empty OR its API key is missing, the primary is used directly. `buildExecutorDeps` returns the same shape v0.3.x consumers expect; `deps.provider.name === 'minimax'` (and equivalents) continues to pass.
 
-#### `use_dedup_reviews` action input
-- New optional input, default `true`. When `false`, consumers fall back to the v0.3.1 behaviour of posting a new issue-style comment per pipeline run (no dedup).
-- Wired into `action.yml` under `inputs:` with the same default-true opt-out pattern used by `mock` / `fail_fast`.
+### Added — SARIF 2.1.0 output format (TASKS row 106)
 
-### Why the PR Review API
-- `pulls.updateReview` is PATCH-able — the body is editable; a single review record per PR is the natural unit for "the AI's review of commit X".
-- Issue comments (`issues.createComment`) cannot be edited in-place as part of a dedup loop (every "create" is permanent).
-- PR Reviews anchor to a specific commit via `commit_id` on creation and group inline comments under a single record — maintainers can dismiss / request-changes on the AI's review as a unit.
+- **New `output_format` input** — enum `summary` (default) \| `sarif`. Default preserves v0.3.x behaviour. Opt-in to `sarif` for SARIF 2.1.0 emission on the `findings_sarif` output.
+- **New `src/formatters/sarif.ts`** — exports `formatFindingsAsSarif(findings, context)` returning a SARIF 2.1.0-compliant JSON document. Top-level shape: `{ $schema, version: "2.1.0", runs: [...] }`. Each run has `tool.driver` (name `agentsmarket-pipeline-action`, version `0.4.0`, rules) + `results` (one per finding).
+- **Severity → SARIF `level` mapping** per GitHub Code Scanning guidance: `critical → error`, `high → error`, `medium → warning`, `low → note`. Anything else falls back to `note` (never emits an invalid level).
+- **`ruleId`** — CWE when present (the only stable cross-scanner identifier Code Scanning recognizes), otherwise `REVIEW-<hash>` derived from a stable FNV-1a 32-bit hash of `(file, line, cwe, message)`.
+- **`partialFingerprints.agentsmarketPipelineActionV1`** — same FNV-1a hash for dedup across runs (8 lowercase hex chars).
+- **`versionControlProvenance`** — populated when `GITHUB_REPOSITORY` + `GITHUB_SHA` are set (typical for `pull_request` events). Anchors alerts to commits + branch in Code Scanning. Optional — omitted when context is empty.
+- **`properties`** extension fields — surfaces `severity`, `confidence`, `recommendation`, `cwe` so the Code Scanning alert carries the full review context.
+- **New `findings_sarif` output** — only written when `output_format='sarif'`. Backward compat: summary outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) ALWAYS fire regardless of `output_format`. SARIF is built from the same `findings` array as `findings_json` to guarantee the two outputs are consistent (same source, different shape).
+- **Consumer pattern** — upload via `github/codeql-action/upload-sarif@v3` with `category: agentsmarket-pipeline-action` to surface alerts in the PR Security tab. Example workflow in README §"SARIF Output".
 
-### Inline comment handling
-- **CREATE**: every finding with a `file + line` becomes an inline review comment scoped to the review.
-- **UPDATE**: the GitHub REST API does not currently allow bulk-replacing inline comments via `updateReview` (only the body is mutable). The new body carries the full `new / resolved / changed-severity` diff so maintainers see state changes without scrolling inline threads. v0.3.4 follow-up: per-comment `updateReviewComment` for in-place severity rewrites.
-
-### Tests (28 new in `tests/post-review.test.ts`)
-- 3 REQUIRED scenarios (TASKS row 102):
-  1. First run on a fresh PR creates a new PR review with the session marker + inline comments. Verifies `createReview` is called with `commit_id`, `event: 'COMMENT'`, marker-bearing body, and the inline-comments array.
-  2. Second run on a new commit finds the existing review by marker and edits it. Verifies `updateReview` is called with the same `review_id` and a new marker; `createReview` is NOT called.
-  3. Session-marker parse handles malformed markers gracefully (truncated / non-hex / shorter SHAs). Falls back to fresh review — never silently overwrites a stranger's review.
-- 25 additional pure-function tests for the helpers (marker round-trip, diff classification, embedded-findings parse, render functions, etc.).
-- Total: 187 tests passing, 1 skipped (unchanged). Canonical: 38/38 ✓.
+### Tests
+- 4 new integration tests under `describe("run() — SARIF output wiring (v0.4.0, integration)", ...)` in `tests/sarif-formatter.test.ts`:
+  1. Emits `findings_sarif` when `output_format=sarif` with non-empty findings — verifies ruleId/level/location/message
+  2. Does NOT emit `findings_sarif` when `output_format=summary` (default, backward compat)
+  3. Emits empty SARIF log (`results=[]`, `rules=[]`) when pipeline has no findings (still valid SARIF)
+  4. Produces SARIF JSON matching schema version 2.1.0 (parseable, `$schema` + `version` pinned, tool name + version set)
+- 7 pure-function unit tests in the same file cover the formatter internals (severity mapping, fingerprint determinism, ruleId selection, multi-finding shape, versionControlProvenance conditional).
 
 ### Compatibility
-- 100% additive. v0.3.1 / v0.3.2 consumers see zero behaviour change unless they read the new `use_dedup_reviews` input. Existing 14 outputs (12 from v0.3.1 + `cost_usdc` + `timing_json` from v0.3.2) unchanged.
-- Old issue-style comments left in place (no migration). v0.3.3 dedup starts fresh from the first install.
-- `postReview()` is also re-exported from `dist/index.js` so consumers wiring `actions/github-script` can `require('@agentsmarket/pipeline-action/dist/index.js')` for the helper directly.
-- Distributed via `web3eco/shared-actions/.github/workflows/ai-code-review.yml` consumer workflow update — the new "Post PR review (dedup)" step inlines the same algorithm since the GitHub-script runtime can't import a TS module across packages.
+- 100% additive. v0.3.x consumers see no behaviour change. New inputs default to no-op values. New outputs always emit (default empty string for `provider_used='primary'`, zero for the cost splits, empty for the error message).
 
----
+### Files
+- New: `src/formatters/sarif.ts` (~330 LOC), `tests/sarif-formatter.test.ts` (~280 LOC).
+- Modified: `src/inputs.ts` (`OutputFormat` type + `normalizeOutputFormat` + `output_format` field on `ActionInputs`), `src/run.ts` (conditional emit + `buildSarifContext` helper + version bump to `0.4.0`), `action.yml` (`output_format` input + `findings_sarif` output), `README.md` (new "SARIF Output (v0.4.0)" section), `CHANGELOG.md` (this entry).
 
 ## v0.3.1 (2026-09-27) — output wiring hotfix
 
