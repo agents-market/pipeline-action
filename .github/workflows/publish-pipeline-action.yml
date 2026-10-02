@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.AGENTS_MARKET_NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -38,17 +40,16 @@ jobs:
           fi
           echo "Version check passed: $PKG_VERSION"
 
-      - name: Setup npm auth (write .npmrc)
+      - name: Test npm auth before publishing
+        if: github.event_name == 'push'
         run: |
-          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > .npmrc
-          echo "registry=https://registry.npmjs.org/" >> .npmrc
-          cat .npmrc
+          echo "Token length: ${#NODE_AUTH_TOKEN}"
+          echo "Token prefix: ${NODE_AUTH_TOKEN:0:6}..."
+          npm whoami 2>&1 || echo "whoami failed"
 
       - name: Publish to npm
         if: github.event_name == 'push'
         run: npm publish --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.AGENTS_MARKET_NPM_TOKEN }}
 
       - name: Verify on registry
         if: github.event_name == 'push'
