@@ -38,6 +38,12 @@ jobs:
           fi
           echo "Version check passed: $PKG_VERSION"
 
+      - name: Setup npm auth (write .npmrc)
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > .npmrc
+          echo "registry=https://registry.npmjs.org/" >> .npmrc
+          cat .npmrc
+
       - name: Publish to npm
         if: github.event_name == 'push'
         run: npm publish --access public --no-git-checks
