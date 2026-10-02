@@ -1,6 +1,6 @@
 {
   "name": "@agentsmarket/pipeline-action",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "GitHub Action that runs an agentsmarket pipeline.yaml inside a step. Streams stage outputs as GH log groups, sets action outputs on success.",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -18,7 +18,7 @@
     "dev": "tsx src/run.ts"
   },
   "dependencies": {
-    "@agentsmarket/pipeline-runtime": "workspace:*"
+    "@agentsmarket/pipeline-runtime": "^0.5.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
