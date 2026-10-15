@@ -1,0 +1,87 @@
+# Guards against shipping an action the runner cannot even parse.
+#
+# This repo has no CI at all, which is how tag v1 came to ship an unquoted
+# `description` containing ": ". Every consumer that copied `@v1` from the
+# README got a red check failing at "Set up job" with a YAML parser error that
+# named neither this repo nor the ref. The tag sat broken from 2026-09-26
+# until 2026-10-16, and nothing here would have caught it.
+#
+# The check is cheap enough to run on every push and every tag.
+
+name: validate
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  manifest:
+    name: action.yml is loadable and satisfies the Actions metadata contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check action.yml
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys, yaml
+
+          try:
+              with open('action.yml', encoding='utf-8') as fh:
+                  spec = yaml.safe_load(fh)
+          except yaml.YAMLError as exc:
+              mark = getattr(exc, 'problem_mark', None)
+              where = f' at line {mark.line + 1}, column {mark.column + 1}' if mark else ''
+              print(f'::error::action.yml is not valid YAML{where}: {getattr(exc, "problem", exc)}')
+              print('::error::a consuming workflow would fail at "Set up job" and name neither this repo nor the ref.')
+              sys.exit(1)
+
+          problems = []
+
+          if not isinstance(spec, dict):
+              problems.append(f'action.yml parsed as {type(spec).__name__}, expected a mapping')
+          else:
+              for key in ('name', 'description', 'runs'):
+                  if key not in spec:
+                      problems.append(f'missing required key: {key}')
+
+              runs = spec.get('runs')
+              if not isinstance(runs, dict):
+                  problems.append('runs must be a mapping')
+              else:
+                  using = runs.get('using')
+                  if using not in ('node12', 'node16', 'node20', 'node24'):
+                      problems.append(f'runs.using is {using!r}, expected one of node12/node16/node20/node24')
+                  if 'main' not in runs:
+                      problems.append('runs.main is required')
+
+              for key in ('inputs', 'outputs'):
+                  block = spec.get(key)
+                  if block is not None and not isinstance(block, dict):
+                      problems.append(f'{key} must be a mapping')
+
+          for problem in problems:
+              print(f'::error::{problem}')
+
+          if problems:
+              print('\naction.yml would fail at "Set up job" in a consuming workflow.')
+              sys.exit(1)
+
+          print(f'action.yml OK — {spec["name"]}, runs.using={spec["runs"]["using"]}')
+          PY
+
+      - name: main entrypoint exists
+        run: |
+          set -euo pipefail
+          main=$(python3 -c "import yaml; print(yaml.safe_load(open('action.yml'))['runs']['main'])")
+          if [ ! -f "$main" ]; then
+            echo "::error::runs.main points at $main, which does not exist"
+            exit 1
+          fi
+          echo "runs.main -> $main ($(wc -c < "$main") bytes)"
