@@ -1,5 +1,25 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## Unreleased — tag `v1` re-cut, manifest validation added
+
+### Fixed
+
+- **Tag `v1` pointed at a commit whose `action.yml` was not parseable YAML.** `v1` was cut on 2026-09-26 at `4b899d7` ("v0.2.0 — provider selection"), the same commit as tag `v0.2.0`. That commit reworded `description` to include `(provider: minimax|openai|anthropic|openrouter)` without quoting it. The unquoted scalar contains `: `, which YAML reads as a nested mapping, so the runner rejected the manifest. `v1` has now been re-cut to `6bd47c4` (`v0.4.4` / `main`).
+
+  Impact: every consumer who copied `uses: agents-market/pipeline-action@v1` — the pin the README recommends in six places — got a red check failing at **Set up job** in about three seconds, with a parser error naming neither this repository nor the ref. The breakage predates the quoting fix in `v0.4.3` (2026-09-28) by two days and went unnoticed because this repository had no CI.
+
+  Verified after re-cut: `action.yml?ref=v1` parses, `runs.using=node20`.
+
+- Tag `v0.2.0` is also unparseable and is **deliberately left in place** — a released semver tag is immutable, and rewriting it would silently change the artifact for anyone pinned to that exact version. Consumers on `v0.2.0` should move to `v0.2.1` or later.
+
+### Added
+
+- **`.github/workflows/validate.yml`** — first CI in this repository. Parses `action.yml` on every push and every `v*` tag, then asserts the Actions metadata contract: required keys `name` / `description` / `runs`, a recognised `runs.using`, a present `runs.main`, mapping-shaped `inputs` / `outputs`, and that `runs.main` points at a file that exists. A parse failure is reported as `::error::` with the exact line and column rather than a raw traceback, because the message is the whole point of the check.
+
+  The check was verified against four fixtures: the historical broken `action.yml` (fails, naming line 2 column 71), the current manifest (passes), a manifest missing `runs.main` (fails), and a manifest with `runs.using: node99` (fails).
+
+---
+
 ## v0.4.3 (2026-09-27) — raw-JSON findings fix + observability (patch)
 
 > **Patch release.** Fixes a high-severity operator-facing bug in style-review pipelines where findings lacking a `file` field were pushed to the GitHub PR Comments API with `path: "analyze_style"`, which the API rejected with HTTP 422 (`pull_request_review_thread.path "could not be resolved"`). Also adds first-class observability for the bug class — a new action output counter + warning notice — so operators see the issue directly instead of silently missing findings.
