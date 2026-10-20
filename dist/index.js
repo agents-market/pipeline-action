@@ -803,6 +803,97 @@ function computeCostInUsdc(usageMicroUsdc, contextModeMultiplier) {
 
 /***/ }),
 
+/***/ 2:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * Who runs the pipeline: the marketplace, or this GitHub runner.
+ *
+ * Until now there was only one answer — the runner. `runPipelineV2` executed
+ * locally against the caller's own LLM key, so a workflow that installed a
+ * pipeline from the marketplace never called
+ * `POST /v1/pipelines/:id/invoke`. No execution on the server, no escrow, no
+ * settlement: the author of the pipeline earned nothing, and the buyer paid the
+ * model provider directly.
+ *
+ * The choice is carried by the keys, not by a flag, because the keys already say
+ * it:
+ *
+ *   - `AGENTSMARKET_PRIVATE_KEY` → pay the server, the author gets paid;
+ *   - a provider `*_API_KEY`     → run locally, you pay the tokens yourself.
+ *
+ * A separate `server_mode: true` boolean would be a fourth way to express the
+ * same thing and would eventually disagree with the keys.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.decideExecutionMode = decideExecutionMode;
+exports.resolveServerSlug = resolveServerSlug;
+function decideExecutionMode(input) {
+    const hasMarketplace = typeof input.marketplaceKey === 'string' && input.marketplaceKey.length > 0;
+    const hasProvider = typeof input.providerKey === 'string' && input.providerKey.length > 0;
+    if (input.mock === true) {
+        return {
+            mode: 'local',
+            reason: hasMarketplace
+                ? 'mock run: a dry run must not spend money, so the server is not called'
+                : 'mock run: no provider is called',
+        };
+    }
+    if (hasMarketplace && hasProvider) {
+        return {
+            mode: null,
+            error: 'Both AGENTSMARKET_PRIVATE_KEY and a provider API key are set, so it is not ' +
+                'clear who should pay. Drop the provider key to run on the marketplace (the ' +
+                'pipeline author is paid), or drop AGENTSMARKET_PRIVATE_KEY to run locally ' +
+                '(you pay the model tokens yourself).',
+        };
+    }
+    if (hasMarketplace) {
+        return {
+            mode: 'server',
+            reason: 'AGENTSMARKET_PRIVATE_KEY is set: the run is executed and billed by the marketplace',
+        };
+    }
+    if (hasProvider) {
+        return {
+            mode: 'local',
+            reason: 'a provider API key is set and no marketplace key: the run is executed on this runner',
+        };
+    }
+    return {
+        mode: null,
+        error: 'No credentials for either execution path. Set AGENTSMARKET_PRIVATE_KEY to run on ' +
+            'the marketplace (you pay the pipeline author and the marketplace), or set ' +
+            'MINIMAX_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY to run ' +
+            'locally (you pay the model tokens yourself).',
+    };
+}
+/**
+ * Which pipeline the marketplace should run.
+ *
+ * An explicit `name@version` pins; a bare `name` takes the newest published
+ * version, which is `resolvePipelineId`'s own rule in the CLI — so the action
+ * does not need its own version comparison, and cannot disagree with it.
+ */
+function resolveServerSlug(explicit, specName) {
+    const value = (explicit ?? '').trim();
+    if (value.length > 0)
+        return { slug: value };
+    const name = (specName ?? '').trim();
+    if (name.length > 0)
+        return { slug: name };
+    return {
+        error: 'Server mode needs to know which marketplace pipeline to run. Pass the `pipeline` ' +
+            "input (e.g. `style-review` or `style-review@2.0.4`), or install the pipeline so its " +
+            'pipeline.yaml is available and carries a `name:`.',
+    };
+}
+
+
+/***/ }),
+
 /***/ 920:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -949,13 +1040,42 @@ function asMicroPricer(resolver) {
         resolveCostMicroUsdc: (model, usage) => resolver.resolveCostMicroUsdc(model, usage),
     };
 }
+/**
+ * Stand-in for the local provider on the marketplace execution path.
+ *
+ * `pickProvider` throws when there is no API key, which is correct for a local
+ * run — but the marketplace path has no provider key by design, because the
+ * server holds it. It also must not fall back to a mock: that would let a
+ * wiring mistake pass silently and post invented findings as if a model had
+ * produced them. Every call throws instead.
+ */
+function marketplaceOnlyProvider(providerName, modelName) {
+    const refuse = () => {
+        throw new Error(`internal error: the marketplace execution path tried to call the local ` +
+            `${providerName} provider. No pipeline stage should run locally when ` +
+            `AGENTSMARKET_PRIVATE_KEY is set.`);
+    };
+    return {
+        name: providerName,
+        models: [modelName],
+        simpleModel: modelName,
+        complexModel: modelName,
+        supports: () => true,
+        generateText: refuse,
+        generateJson: refuse,
+    };
+}
 async function buildExecutorDeps(params) {
     const apiKey = params.inputs.api_key;
     const primaryProviderName = params.inputs.primary_provider;
     const primaryModel = params.inputs.primary_model;
     const primary = params.inputs.mock
         ? new MockProvider()
-        : pickProvider(primaryProviderName, primaryModel, apiKey);
+        : apiKey
+            ? pickProvider(primaryProviderName, primaryModel, apiKey)
+            : params.inputs.agent_key
+                ? marketplaceOnlyProvider(primaryProviderName, primaryModel)
+                : pickProvider(primaryProviderName, primaryModel, apiKey);
     let effectiveProvider = primary;
     if (!params.inputs.mock && params.inputs.fallback_provider) {
         const fallbackName = params.inputs.fallback_provider;
@@ -1598,6 +1718,7 @@ exports.normalizeContextMode = normalizeContextMode;
 exports.normalizeOutputFormat = normalizeOutputFormat;
 exports.resolveApiKeyForProvider = resolveApiKeyForProvider;
 exports.resolveFallback = resolveFallback;
+exports.resolveMarketplaceKey = resolveMarketplaceKey;
 exports.readInputs = readInputs;
 exports.parseInputJson = parseInputJson;
 exports.SUPPORTED_PROVIDERS = [
@@ -1748,7 +1869,23 @@ function resolveFallback(rawProvider, rawModel, fallbackOnError, explicitKey, pr
         fallback_on_error: fallbackOnErrorResolved,
     };
 }
-function readInputs() {
+/**
+ * The buyer's marketplace identity.
+ *
+ * The `agent_key` input wins; `AGENTSMARKET_PRIVATE_KEY` in the environment is
+ * the same thing and is how a workflow usually supplies it. Whitespace is not a
+ * key — a secret that resolved to a newline would otherwise read as "a key is
+ * present" and switch the run into a paid server execution that then fails.
+ */
+function resolveMarketplaceKey(explicit, env = process.env) {
+    const candidates = [explicit, env.AGENTSMARKET_PRIVATE_KEY];
+    for (const c of candidates) {
+        if (typeof c === 'string' && c.trim().length > 0)
+            return c.trim();
+    }
+    return null;
+}
+function readInputs(env = process.env) {
     const model = readEnvString('INPUT_MODEL', DEFAULT_MODEL) ?? DEFAULT_MODEL;
     const provider = normalizeProvider(readEnvString('INPUT_PROVIDER', exports.DEFAULT_PROVIDER) ?? exports.DEFAULT_PROVIDER, model);
     const rawPrimaryProvider = readEnvString('INPUT_PRIMARY_PROVIDER', null);
@@ -1766,6 +1903,8 @@ function readInputs() {
         provider,
         pipeline_file: readEnvString('INPUT_PIPELINE_FILE', null),
         pipeline_yaml: readEnvString('INPUT_PIPELINE_YAML', null),
+        pipeline: readEnvString('INPUT_PIPELINE', null),
+        agent_key: resolveMarketplaceKey(readEnvString('INPUT_AGENT_KEY', null), env),
         model,
         inputs_json: readEnvString('INPUT_INPUTS_JSON', null),
         fail_fast: readEnvBool('INPUT_FAIL_FAST', true),
@@ -2144,7 +2283,7 @@ async function notify(opts) {
  * Pipeline actions produce `Record<stage_id, string>` where each value is the
  * raw stage output text (usually a JSON string per `output_format:
  * structured_json`). Many of our wedges — `code-review-security-audit`,
- * `code-review-vulnerability-detection`, `api-design-reviewer`,
+ * `api-design-reviewer`,
  * `style-review` — emit arrays of `findings` with severity, file/line,
  * description, CWE, confidence, recommendation. This module:
  *
@@ -2341,7 +2480,7 @@ function parseStringStageOutput(raw, stageId) {
 }
 /**
  * Regex fallback for plain-text outputs (rare in our wedges, but the
- * `code-review-vulnerability-detection` wedge and the `gh api` error
+ * the `code-review-security-audit` wedge and the `gh api` error
  * envelopes occasionally produce text-only output).
  *
  * Patterns matched (case-insensitive):
@@ -3175,6 +3314,8 @@ const source_cache_js_1 = __nccwpck_require__(682);
 const output_formatter_js_1 = __nccwpck_require__(750);
 const status_check_js_1 = __nccwpck_require__(420);
 const cost_js_1 = __nccwpck_require__(609);
+const execution_mode_js_1 = __nccwpck_require__(2);
+const server_run_js_1 = __nccwpck_require__(819);
 const timing_js_1 = __nccwpck_require__(558);
 const fallback_js_1 = __nccwpck_require__(122);
 const notifier_js_1 = __nccwpck_require__(690);
@@ -3246,47 +3387,108 @@ async function run(args) {
     }));
     const startedAt = Date.now();
     let result;
-    // ---- Stage 3/4: run_pipeline ----
-    timings.start('run_pipeline');
-    try {
-        result = await (0, retry_js_1.withRetry)(() => (0, pipeline_runtime_1.runPipelineV2)({
-            spec: { stages: stagesForRuntime },
-            inputs: params.pipeline_inputs,
-            deps,
-            hooks: {
-                onStageStart: (stageId) => {
-                    (0, streaming_js_1.group)(`▶ stage: ${stageId}`, () => {
-                        (0, streaming_js_1.notice)(`started at ${new Date().toISOString()}`);
-                    });
-                },
-                onStageComplete: (stageId, ms, output) => {
-                    (0, streaming_js_1.writeOutput)(`stage_${stageId}_ms`, String(ms));
-                    (0, streaming_js_1.writeOutput)(`stage_${stageId}_output`, output);
-                    (0, streaming_js_1.notice)(`✓ stage ${stageId} completed in ${ms}ms (${output.length} chars)`);
-                },
-            },
-        }), {
-            maxRetries: 3,
-            baseDelayMs: 1000,
-            maxDelayMs: 30_000,
-            jitter: true,
-            onRetry: (info) => {
-                (0, streaming_js_1.notice)(`↻ retry ${info.attempt + 1}/${info.maxRetries} after ${info.delayMs}ms ` +
-                    `(${info.errorName}: ${info.errorMessage})`);
-            },
-        });
-    }
-    catch (e) {
-        timings.end('run_pipeline');
-        (0, streaming_js_1.error)(`✗ pipeline failed ${providerTag}: ${e.message}`);
+    // Who pays decides who runs. Until now the answer was always "this runner",
+    // which meant a workflow that installed a marketplace pipeline never called the
+    // invoke route and the pipeline's author was paid nothing.
+    const marketplaceKey = inputs.agent_key;
+    const providerKey = (0, inputs_js_1.resolveApiKeyForProvider)(inputs.api_key, inputs.primary_provider);
+    const mode = (0, execution_mode_js_1.decideExecutionMode)({
+        marketplaceKey,
+        providerKey,
+        mock: inputs.mock,
+    });
+    if (mode.mode === null) {
+        timings.end('validate');
+        (0, streaming_js_1.error)(`✗ ${mode.error}`);
         return 1;
     }
-    timings.end('run_pipeline');
+    (0, streaming_js_1.notice)(`  execution: ${mode.mode} — ${mode.reason}`);
+    // ---- Stage 3/4: run_pipeline ----
+    timings.start('run_pipeline');
+    if (mode.mode === 'server') {
+        const target = (0, execution_mode_js_1.resolveServerSlug)(inputs.pipeline, spec.name);
+        if ('error' in target) {
+            timings.end('run_pipeline');
+            (0, streaming_js_1.error)(`✗ ${target.error}`);
+            return 1;
+        }
+        try {
+            const run = await (0, server_run_js_1.runOnMarketplace)({
+                slug: target.slug,
+                inputs: params.pipeline_inputs,
+                privateKey: marketplaceKey,
+                notice: streaming_js_1.notice,
+            });
+            (0, streaming_js_1.notice)(`  run_id ${run.runId ?? '?'} · charged $${(run.totalCostMicroUsdc / 1e6).toFixed(6)}`);
+            // The local path emits these from the stage hook. Server runs have no hook,
+            // and a consumer reading `stage_<id>_output` would silently get nothing.
+            for (const stage of run.stageTimings) {
+                (0, streaming_js_1.writeOutput)(`stage_${stage.id}_ms`, String(stage.ms));
+                if (run.outputs[stage.id] !== undefined) {
+                    (0, streaming_js_1.writeOutput)(`stage_${stage.id}_output`, String(run.outputs[stage.id]));
+                }
+                (0, streaming_js_1.notice)(`✓ stage ${stage.id} completed in ${stage.ms}ms`);
+            }
+            result = {
+                outputs: run.outputs,
+                stageTimings: run.stageTimings.map(s => ({
+                    id: s.id, ms: s.ms, costMicroUsdc: s.costMicroUsdc, model: s.model,
+                })),
+                totalCostMicroUsdc: run.totalCostMicroUsdc,
+            };
+        }
+        catch (e) {
+            timings.end('run_pipeline');
+            (0, streaming_js_1.error)(`✗ marketplace run failed: ${e.message}`);
+            return 1;
+        }
+        timings.end('run_pipeline');
+    }
+    else {
+        try {
+            result = await (0, retry_js_1.withRetry)(() => (0, pipeline_runtime_1.runPipelineV2)({
+                spec: { stages: stagesForRuntime },
+                inputs: params.pipeline_inputs,
+                deps,
+                hooks: {
+                    onStageStart: (stageId) => {
+                        (0, streaming_js_1.group)(`▶ stage: ${stageId}`, () => {
+                            (0, streaming_js_1.notice)(`started at ${new Date().toISOString()}`);
+                        });
+                    },
+                    onStageComplete: (stageId, ms, output) => {
+                        (0, streaming_js_1.writeOutput)(`stage_${stageId}_ms`, String(ms));
+                        (0, streaming_js_1.writeOutput)(`stage_${stageId}_output`, output);
+                        (0, streaming_js_1.notice)(`✓ stage ${stageId} completed in ${ms}ms (${output.length} chars)`);
+                    },
+                },
+            }), {
+                maxRetries: 3,
+                baseDelayMs: 1000,
+                maxDelayMs: 30_000,
+                jitter: true,
+                onRetry: (info) => {
+                    (0, streaming_js_1.notice)(`↻ retry ${info.attempt + 1}/${info.maxRetries} after ${info.delayMs}ms ` +
+                        `(${info.errorName}: ${info.errorMessage})`);
+                },
+            });
+        }
+        catch (e) {
+            timings.end('run_pipeline');
+            (0, streaming_js_1.error)(`✗ pipeline failed ${providerTag}: ${e.message}`);
+            return 1;
+        }
+        timings.end('run_pipeline');
+    }
     const totalMs = Date.now() - startedAt;
     // v0.4.0 — when fallback fires, the runtime prices against the stage's
     // declared model while actual tokens came from the fallback provider.
     // Trust the wrapper's accumulators over `result.totalCostMicroUsdc`.
-    const fallback = deps.provider instanceof fallback_js_1.FallbackProvider ? deps.provider : null;
+    // In server mode there is no local provider and no fallback: the marketplace
+    // picked the model. Reading the local wrapper would report zeros.
+    const fallback = mode.mode === 'server' || !(deps.provider instanceof fallback_js_1.FallbackProvider)
+        ? null
+        : deps.provider;
     const providerUsed = fallback ? (fallback.lastProviderUsed ?? 'primary') : 'primary';
     const costPrimaryMicroUsdc = fallback ? fallback.cost_primary_micro_usdc : 0;
     const costFallbackMicroUsdc = fallback ? fallback.cost_fallback_micro_usdc : 0;
@@ -3299,7 +3501,15 @@ async function run(args) {
     // multiplier is the documented 1x/3x/10x/100x from CONTEXT_MODE_MULTIPLIERS;
     // currently a no-op at 1.0 because the runtime already accounts for
     // context fetching. Threaded through for forward compatibility.
-    const totalCostUsdc = (0, cost_js_1.computeCostInUsdc)(effectiveTotalMicroUsdc, cost_js_1.CONTEXT_MODE_MULTIPLIERS[inputs.context_mode]);
+    // The context multiplier prices the extra tokens this action asks the model to
+    // read on a local run. On the marketplace path the server already billed the
+    // real tokens and took the real tokens; multiplying a settled invoice by 3 or
+    // 100 would report a cost nobody was charged. 1x here means "what the server
+    // charged", which is the truth on that path.
+    const costMultiplier = mode.mode === 'server'
+        ? 1
+        : cost_js_1.CONTEXT_MODE_MULTIPLIERS[inputs.context_mode];
+    const totalCostUsdc = (0, cost_js_1.computeCostInUsdc)(effectiveTotalMicroUsdc, costMultiplier);
     // ---- Stage 4/4: format_output ----
     timings.start('format_output');
     const { findings, stats: formatStats } = (0, output_formatter_js_1.formatFindingsWithStats)(result.outputs);
@@ -3466,6 +3676,172 @@ function buildSarifContext() {
     const ref = process.env['GITHUB_REF'] ?? '';
     const branch = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : '';
     return { repo, commit_sha: commitSha, ...(branch.length > 0 ? { branch } : {}) };
+}
+
+
+/***/ }),
+
+/***/ 819:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+/**
+ * Execute a pipeline on the marketplace, by delegating to the CLI.
+ *
+ * Why delegate instead of reimplementing: the CLI already does the parts that
+ * are easy to get subtly wrong — resolve the slug (newest version when none is
+ * pinned), take the 402 challenge, sign the EIP-2612 permit with the buyer's
+ * key, retry with payment — and every one of those has already been wrong at
+ * least once in this repository's history. A second implementation inside the
+ * action would be a second copy of the payment path, and the copy would not get
+ * the fixes.
+ *
+ * The CLI is invoked at its latest published version, unpinned. Pinning is how
+ * a security release silently stops reaching users: the 0.11.0 rollout was held
+ * on a version that had already been superseded.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.DEFAULT_SERVER_TIMEOUT_MS = exports.CLI_OVERRIDE_ENV = exports.CLI_PACKAGE = void 0;
+exports.resolveCliInvocation = resolveCliInvocation;
+exports.runOnMarketplace = runOnMarketplace;
+exports.parseServerResponse = parseServerResponse;
+const node_child_process_1 = __nccwpck_require__(421);
+const node_util_1 = __nccwpck_require__(975);
+const execFileAsync = (0, node_util_1.promisify)(node_child_process_1.execFile);
+/**
+ * npm package spec — latest, deliberately not pinned.
+ *
+ * The package is `@agentsmarket/cli`. Not `agentsmarket` (no such package) and
+ * not `agentsmarket/cli` (a scope needs the `@`; npx fails with enoent). I
+ * checked the unscoped name, got a 404, and wrote "the CLI is not published"
+ * into a comment and into an error message — the package has been on npm the
+ * whole time, at 26 versions.
+ */
+exports.CLI_PACKAGE = '@agentsmarket/cli@latest';
+/** Environment variable that overrides how the CLI is invoked. */
+exports.CLI_OVERRIDE_ENV = 'AGENTSMARKET_CLI';
+/**
+ * How to start the CLI: `AGENTSMARKET_CLI` when the step sets it, else npx.
+ *
+ * The override exists because the published CLI is what runs, and the published
+ * CLI is older than this repository: `--json` on `pipeline call` is in the
+ * working tree and unreleased, so `latest` does not speak the protocol this
+ * module parses until the next publish. The override is how a runner — and the
+ * live check — can point at a build that does.
+ */
+function resolveCliInvocation(override) {
+    const explicit = (override ?? '').trim();
+    if (explicit.length > 0) {
+        // A bare `node /path/x.js` and `npx --yes pkg` both arrive as one string.
+        const parts = explicit.split(/\s+/);
+        return { command: parts[0], prefix: parts.slice(1) };
+    }
+    return { command: 'npx', prefix: ['--yes', exports.CLI_PACKAGE] };
+}
+exports.DEFAULT_SERVER_TIMEOUT_MS = 15 * 60_000;
+/**
+ * Run `agentsmarket pipeline call <slug> --inputs … --json` and read the answer.
+ *
+ * `--json` matters: without it the CLI writes a human report and the only way to
+ * get the stage outputs would be to scrape `── stage ──` headings.
+ */
+async function runOnMarketplace(opts) {
+    const exec = opts.exec ?? execFileAsync;
+    const notice = opts.notice ?? (() => undefined);
+    const { command, prefix } = resolveCliInvocation(opts.cliCommand ?? process.env[exports.CLI_OVERRIDE_ENV]);
+    const args = [
+        ...prefix,
+        'pipeline',
+        'call',
+        opts.slug,
+        '--inputs',
+        JSON.stringify(opts.inputs ?? {}),
+        '--json',
+    ];
+    notice(`→ ${command} ${args.join(' ')}`);
+    let stdout = '';
+    let stderr = '';
+    let code = 0;
+    try {
+        const res = await exec(command, args, {
+            env: {
+                ...process.env,
+                AGENTSMARKET_PRIVATE_KEY: opts.privateKey,
+                ...(opts.baseUrl ? { AGENTSMARKET_URL: opts.baseUrl } : {}),
+            },
+            maxBuffer: 64 * 1024 * 1024,
+            timeout: opts.timeoutMs ?? exports.DEFAULT_SERVER_TIMEOUT_MS,
+        });
+        stdout = res.stdout;
+        stderr = res.stderr;
+    }
+    catch (e) {
+        const err = e;
+        code = err.code ?? 1;
+        stdout = err.stdout ?? '';
+        stderr = err.stderr ?? '';
+    }
+    const parsed = parseServerResponse(stdout);
+    if (!parsed) {
+        throw new Error(`The CLI did not return JSON (exit ${code}). ` +
+            'If it printed a human report, the published CLI is older than `--json` ' +
+            `(set ${exports.CLI_OVERRIDE_ENV} to a build that has it). ` +
+            (stderr.trim().slice(0, 400) || stdout.trim().slice(0, 400)));
+    }
+    if (code !== 0 || parsed.ok !== true) {
+        throw new Error(`Marketplace run failed${parsed.code ? ` [${parsed.code}]` : ''}: ` +
+            (parsed.error ?? stderr.trim().slice(0, 400) ?? 'unknown error'));
+    }
+    const resourceCost = typeof parsed.cost_actual_usdc === 'number' ? parsed.cost_actual_usdc : null;
+    const charged = typeof parsed.total_charged_usdc === 'number' ? parsed.total_charged_usdc : resourceCost;
+    return {
+        outputs: parsed.outputs ?? {},
+        stageTimings: (parsed.provenance?.stages ?? []).map(s => ({
+            id: s.id ?? '?',
+            ms: s.ms ?? 0,
+            // Provenance reports DOLLARS under a `_usdc` name — the server writes
+            // `cost_usdc: costMicroUsdc / 1_000_000`. Verified by running this against
+            // production: a stage came back as 0.001244, and the run's own
+            // `cost_actual_usdc` was 5092 for three such stages. Reading it as
+            // micro-USDC understated each stage by a factor of a million.
+            costMicroUsdc: Math.round((s.cost_usdc ?? 0) * 1_000_000),
+            model: s.model ?? '',
+        })),
+        totalCostMicroUsdc: charged ?? 0,
+        resourceCostMicroUsdc: resourceCost,
+        runId: parsed.run_id ?? null,
+        pipeline: parsed.pipeline ?? opts.slug,
+        version: parsed.version ?? '',
+    };
+}
+/**
+ * The CLI prints the server response on stdout in `--json` mode, including on
+ * failure. Anything the runtime logs goes to stderr, so stdout alone is the
+ * document. A run that printed progress before the JSON is still recoverable:
+ * the last `{` that starts a complete object wins.
+ */
+function parseServerResponse(stdout) {
+    const trimmed = stdout.trim();
+    if (trimmed.length === 0)
+        return null;
+    try {
+        return JSON.parse(trimmed);
+    }
+    catch { /* fall through to the salvage below */ }
+    const first = trimmed.indexOf('{');
+    if (first === -1)
+        return null;
+    for (let end = trimmed.length; end > first; end--) {
+        const slice = trimmed.slice(first, end);
+        if (!slice.endsWith('}'))
+            continue;
+        try {
+            return JSON.parse(slice);
+        }
+        catch { /* keep shrinking */ }
+    }
+    return null;
 }
 
 
@@ -20143,6 +20519,7 @@ __nccwpck_require__.d(__webpack_exports__, {
   ProviderSpecNotFoundError: () => (/* reexport */ ProviderSpecNotFoundError),
   R2CheckpointStorage: () => (/* reexport */ R2CheckpointStorage),
   R2MemoryStore: () => (/* reexport */ R2MemoryStore),
+  R6_PROVIDER_REQUIRED: () => (/* reexport */ R6_PROVIDER_REQUIRED),
   RetryAttemptError: () => (/* reexport */ RetryAttemptError),
   RetryExhaustedError: () => (/* reexport */ RetryExhaustedError),
   SHELL_DEFAULT_TIMEOUT_MS: () => (/* reexport */ SHELL_DEFAULT_TIMEOUT_MS),
@@ -20175,6 +20552,7 @@ __nccwpck_require__.d(__webpack_exports__, {
   computeBackoffMs: () => (/* reexport */ computeBackoffMs),
   computeCoverage: () => (/* reexport */ computeCoverage),
   computeSkillContentHash: () => (/* reexport */ computeSkillContentHash),
+  containsInputRef: () => (/* reexport */ containsInputRef),
   createDefaultPricingResolver: () => (/* reexport */ createDefaultPricingResolver),
   createDefaultSink: () => (/* reexport */ createDefaultSink),
   createFallbackProvider: () => (/* reexport */ createFallbackProvider),
@@ -20214,6 +20592,7 @@ __nccwpck_require__.d(__webpack_exports__, {
   loadPipelineYaml: () => (/* reexport */ loadPipelineYaml),
   loadTestSpecFile: () => (/* reexport */ loadTestSpecFile),
   makeStageRetriedEvent: () => (/* reexport */ makeStageRetriedEvent),
+  makeStageWarnedEvent: () => (/* reexport */ makeStageWarnedEvent),
   makeWhenResolve: () => (/* reexport */ makeWhenResolve),
   mergeRuntimeConstraints: () => (/* reexport */ mergeRuntimeConstraints),
   migrateProviderField: () => (/* reexport */ migrateProviderField),
@@ -20231,6 +20610,7 @@ __nccwpck_require__.d(__webpack_exports__, {
   renderJson: () => (/* reexport */ renderJson),
   renderJunit: () => (/* reexport */ renderJunit),
   renderText: () => (/* reexport */ renderText),
+  resolveDoubleBraceRefs: () => (/* reexport */ resolveDoubleBraceRefs),
   resolveEnvVars: () => (/* reexport */ resolveEnvVars),
   resolveEnvVarsInObject: () => (/* reexport */ resolveEnvVarsInObject),
   resolveInputRefs: () => (/* reexport */ resolveInputRefs),
@@ -20367,8 +20747,6 @@ class MultimodalModelUnsupportedError extends Error {
     }
 }
 
-// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/index.mjs + 102 modules
-var sdk = __nccwpck_require__(39);
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/adapters/multimodal-convert.js
 /**
  * Multimodal content conversion — maps our standard MultimodalMessage /
@@ -20476,15 +20854,699 @@ function toAnthropicBlock(part) {
     return { type: 'document', source };
 }
 
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/output-schema.js
+/**
+ * M5 — Stage output schema types and meta-validation.
+ *
+ * Per-stage `output_schema` block constrains the executor's string output.
+ * Companion field `output_retry` (none|single|loop) decides what happens
+ * when validation fails. The runtime validator lives in
+ * `./output-schema-validate.ts`; this file owns the type definitions and
+ * the meta-validation step (catches `$ref`/etc. on parse).
+ *
+ * Supported keywords (subset):
+ *   type            — string | number | integer | boolean | array | object | null
+ *   properties      — Record<string, JsonSchema> for object validation
+ *   required        — string[] of required keys
+ *   additionalProperties — boolean | JsonSchema (default true)
+ *   enum            — exact value match
+ *   items           — JsonSchema for array element validation
+ *   minItems / maxItems — array length bounds
+ *   minLength / maxLength — string length bounds
+ *   pattern         — regex string (matches whole value)
+ *   format          — informational only; not validated
+ *
+ * NOT supported (fail-fast on schema parse):
+ *   $ref, definitions, $defs, allOf, anyOf, oneOf, not, dependencies, propertyNames
+ */
+/** Max recursion depth for nested object/array schemas. */
+const MAX_VALIDATION_DEPTH = 32;
+const UNSUPPORTED_KEYWORDS = new Set([
+    '$ref', 'definitions', '$defs', 'allOf', 'anyOf', 'oneOf',
+    'not', 'dependencies', 'propertyNames',
+]);
+/**
+ * Validate the schema definition itself (meta-validation). Returns a
+ * non-empty violations list when the schema declares unsupported
+ * keywords (e.g. `$ref`) or is malformed. Schema is allowed to be
+ * `undefined`/`null` → returns `{ok: true}` so callers can use it as a
+ * permissive pre-check before wiring it into runtime validation.
+ */
+function validateJsonSchema(raw) {
+    const violations = [];
+    walkSchemaCheck(raw, '$', violations);
+    return { ok: violations.length === 0, violations };
+}
+function walkSchemaCheck(schema, schemaPath, violations) {
+    if (schema === undefined || schema === null)
+        return;
+    if (typeof schema !== 'object' || Array.isArray(schema)) {
+        violations.push({
+            path: '$',
+            message: `schema at ${schemaPath} must be an object`,
+            schema_path: schemaPath,
+        });
+        return;
+    }
+    const obj = schema;
+    for (const k of Object.keys(obj)) {
+        if (UNSUPPORTED_KEYWORDS.has(k)) {
+            violations.push({
+                path: '$',
+                message: `keyword '${k}' is not supported in the M5 subset validator`,
+                schema_path: `${schemaPath}.${k}`,
+            });
+        }
+    }
+    if (obj['properties'] !== undefined) {
+        const props = obj['properties'];
+        if (typeof props !== 'object' || props === null || Array.isArray(props)) {
+            violations.push({
+                path: '$',
+                message: 'properties must be an object',
+                schema_path: `${schemaPath}.properties`,
+            });
+        }
+        else {
+            for (const [key, child] of Object.entries(props)) {
+                walkSchemaCheck(child, `${schemaPath}.properties.${key}`, violations);
+            }
+        }
+    }
+    if (obj['items'] !== undefined) {
+        walkSchemaCheck(obj['items'], `${schemaPath}.items`, violations);
+    }
+    if (obj['additionalProperties'] !== undefined && typeof obj['additionalProperties'] === 'object') {
+        walkSchemaCheck(obj['additionalProperties'], `${schemaPath}.additionalProperties`, violations);
+    }
+}
+/** Shared helpers used by output-schema-validate.ts. */
+function jsonTypeOf(value) {
+    if (value === null)
+        return 'null';
+    if (Array.isArray(value))
+        return 'array';
+    if (typeof value === 'number') {
+        return Number.isInteger(value) ? 'integer' : 'number';
+    }
+    if (typeof value === 'string')
+        return 'string';
+    if (typeof value === 'boolean')
+        return 'boolean';
+    if (typeof value === 'object')
+        return 'object';
+    return 'null';
+}
+function typeMatches(expected, actual, _value) {
+    if (expected === 'integer' && actual === 'integer')
+        return true;
+    if (expected === 'number' && (actual === 'number' || actual === 'integer'))
+        return true;
+    return expected === actual;
+}
+function deepEqual(a, b) {
+    if (a === b)
+        return true;
+    if (typeof a !== typeof b)
+        return false;
+    if (a === null || b === null)
+        return a === b;
+    if (Array.isArray(a) && Array.isArray(b)) {
+        if (a.length !== b.length)
+            return false;
+        for (let i = 0; i < a.length; i++) {
+            if (!deepEqual(a[i], b[i]))
+                return false;
+        }
+        return true;
+    }
+    if (typeof a === 'object' && typeof b === 'object') {
+        const ak = Object.keys(a);
+        const bk = Object.keys(b);
+        if (ak.length !== bk.length)
+            return false;
+        for (const k of ak) {
+            if (!deepEqual(a[k], b[k]))
+                return false;
+        }
+        return true;
+    }
+    return false;
+}
+function isPlainObject(value) {
+    return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/output-schema-validate.js
+/**
+ * M5 — Runtime JSON Schema validator.
+ *
+ * Walks `value` against `schema` collecting `OutputValidationViolation`
+ * entries. Recursion is bounded by `MAX_VALIDATION_DEPTH` (32) defined
+ * in `./output-schema.ts`. Pure function — no side effects, safe to call
+ * from any environment (Workers, Node, browser).
+ */
+
+function validateAgainstSchema(value, schema, path = '$', schemaPath = '$', depth = 0) {
+    if (depth > MAX_VALIDATION_DEPTH) {
+        return [{
+                path,
+                message: `schema nesting exceeds MAX_VALIDATION_DEPTH (${MAX_VALIDATION_DEPTH})`,
+                schema_path: schemaPath,
+            }];
+    }
+    const violations = [];
+    if (schema.enum !== undefined) {
+        if (!schema.enum.some((v) => deepEqual(v, value))) {
+            violations.push({
+                path,
+                message: `value is not one of the allowed enum values`,
+                schema_path: `${schemaPath}.enum`,
+            });
+        }
+        return violations;
+    }
+    if (schema.type !== undefined) {
+        const expected = Array.isArray(schema.type) ? schema.type : [schema.type];
+        const actual = jsonTypeOf(value);
+        const isMatch = expected.some((t) => typeMatches(t, actual, value));
+        if (!isMatch) {
+            violations.push({
+                path,
+                message: `expected type ${expected.join(' | ')}, got ${actual}`,
+                schema_path: `${schemaPath}.type`,
+            });
+            return violations;
+        }
+    }
+    if (typeof value === 'string') {
+        checkStringConstraints(value, schema, path, schemaPath, violations);
+    }
+    if (Array.isArray(value)) {
+        checkArrayConstraints(value, schema, path, schemaPath, depth, violations);
+    }
+    if (isPlainObject(value)) {
+        checkObjectConstraints(value, schema, path, schemaPath, depth, violations);
+    }
+    return violations;
+}
+function checkStringConstraints(value, schema, path, schemaPath, violations) {
+    if (schema.minLength !== undefined && value.length < schema.minLength) {
+        violations.push({
+            path,
+            message: `string length ${value.length} is less than minLength ${schema.minLength}`,
+            schema_path: `${schemaPath}.minLength`,
+        });
+    }
+    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+        violations.push({
+            path,
+            message: `string length ${value.length} exceeds maxLength ${schema.maxLength}`,
+            schema_path: `${schemaPath}.maxLength`,
+        });
+    }
+    if (schema.pattern !== undefined) {
+        try {
+            const re = new RegExp(schema.pattern);
+            if (!re.test(value)) {
+                violations.push({
+                    path,
+                    message: `string does not match pattern /${schema.pattern}/`,
+                    schema_path: `${schemaPath}.pattern`,
+                });
+            }
+        }
+        catch {
+            violations.push({
+                path,
+                message: `pattern /${schema.pattern}/ is not a valid regular expression`,
+                schema_path: `${schemaPath}.pattern`,
+            });
+        }
+    }
+}
+function checkArrayConstraints(value, schema, path, schemaPath, depth, violations) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) {
+        violations.push({
+            path,
+            message: `array length ${value.length} is less than minItems ${schema.minItems}`,
+            schema_path: `${schemaPath}.minItems`,
+        });
+    }
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+        violations.push({
+            path,
+            message: `array length ${value.length} exceeds maxItems ${schema.maxItems}`,
+            schema_path: `${schemaPath}.maxItems`,
+        });
+    }
+    if (schema.items !== undefined) {
+        for (let i = 0; i < value.length; i++) {
+            violations.push(...validateAgainstSchema(value[i], schema.items, `${path}[${i}]`, `${schemaPath}.items`, depth + 1));
+        }
+    }
+}
+function checkObjectConstraints(value, schema, path, schemaPath, depth, violations) {
+    if (schema.required !== undefined) {
+        for (const key of schema.required) {
+            if (!(key in value)) {
+                violations.push({
+                    path,
+                    message: `missing required property '${key}'`,
+                    schema_path: `${schemaPath}.required`,
+                });
+            }
+        }
+    }
+    if (schema.properties !== undefined) {
+        for (const [key, childSchema] of Object.entries(schema.properties)) {
+            if (key in value) {
+                violations.push(...validateAgainstSchema(value[key], childSchema, `${path}.${key}`, `${schemaPath}.properties.${key}`, depth + 1));
+            }
+        }
+    }
+    if (schema.additionalProperties === false && schema.properties !== undefined) {
+        const allowed = new Set(Object.keys(schema.properties));
+        for (const key of Object.keys(value)) {
+            if (!allowed.has(key)) {
+                violations.push({
+                    path,
+                    message: `additional property '${key}' is not allowed`,
+                    schema_path: `${schemaPath}.additionalProperties`,
+                });
+            }
+        }
+    }
+    else if (typeof schema.additionalProperties === 'object' &&
+        schema.additionalProperties !== null) {
+        const allowed = new Set(Object.keys(schema.properties ?? {}));
+        for (const key of Object.keys(value)) {
+            if (!allowed.has(key)) {
+                violations.push(...validateAgainstSchema(value[key], schema.additionalProperties, `${path}.${key}`, `${schemaPath}.additionalProperties`, depth + 1));
+            }
+        }
+    }
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/validate-inputs.js
+/**
+ * Pre-flight input validation for pipeline execution.
+ *
+ * Catches the common UX trap: user runs `pipeline call daily-news-digest`
+ * without `--inputs urls=...`, pipeline silently starts, fetch stage fails
+ * 4.4s later with a confusing deep-stage error. This check fails fast
+ * with a clear "missing required input" message before any stage runs.
+ *
+ * Called from:
+ *   - CLI runCommand (packages/cli/src/commands/run.ts)
+ *   - Server /v1/pipelines/:slug/run endpoint (packages/server/src/routes/pipelines.ts)
+ *
+ * Behavior:
+ *   - Iterates spec.inputs (Record<string, InputDecl>)
+ *   - For each `required: true` input, asserts the value is present AND
+ *     matches the declared type (string|integer|number|boolean|array|object)
+ *   - For arrays with declared `items.type`, asserts every item matches
+ *   - Returns null if all checks pass, else a list of human-readable errors
+ *
+ * NOTE: This is intentionally permissive on unknown inputs (no error if
+ * spec.inputs is missing or input has extra keys). Permissiveness on the
+ * "extra" axis avoids breaking ad-hoc CLI invocations; strictness is only
+ * on the "missing required" axis.
+ *
+ * M5 — `validateOutput()` is the symmetric output validator (server-side
+ * stage output validation against JSON Schema). Returns structured
+ * violations the executor uses to drive retry modes (none|single|loop).
+ */
+
+
+
+function validateInputs(specInputs, provided) {
+    if (!specInputs)
+        return [];
+    const errors = [];
+    for (const [field, decl] of Object.entries(specInputs)) {
+        const value = provided[field];
+        const present = value !== undefined && value !== null;
+        if (decl.required && !present) {
+            errors.push({ field, reason: 'missing', expected: decl.type ?? 'any' });
+            continue;
+        }
+        if (!present)
+            continue;
+        const expectedType = decl.type;
+        if (expectedType) {
+            const actualType = jsTypeOf(value);
+            if (!validate_inputs_typeMatches(expectedType, actualType, value)) {
+                const gotMsg = expectedType === 'integer' && actualType === 'number'
+                    ? (Number.isInteger(value) ? 'number' : 'float')
+                    : actualType;
+                errors.push({
+                    field,
+                    reason: 'wrong_type',
+                    expected: expectedType,
+                    got: gotMsg,
+                });
+                continue;
+            }
+            if (expectedType === 'array' && Array.isArray(value)) {
+                if (value.length === 0 && decl.required) {
+                    errors.push({ field, reason: 'empty_array', expected: 'non-empty array' });
+                    continue;
+                }
+                if (decl.items?.type && value.length > 0) {
+                    for (let i = 0; i < value.length; i++) {
+                        const itemType = jsTypeOf(value[i]);
+                        if (!validate_inputs_typeMatches(decl.items.type, itemType, value[i])) {
+                            errors.push({
+                                field,
+                                reason: 'wrong_item_type',
+                                expected: `${decl.items.type}[]`,
+                                got: `${itemType}[${i}]`,
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return errors;
+}
+function formatInputErrors(errors, inputs) {
+    if (errors.length === 0)
+        return '';
+    const lines = [];
+    for (const e of errors) {
+        const decl = inputs?.[e.field];
+        const desc = decl?.description;
+        const itemType = decl?.items?.type;
+        const typeHint = decl?.type
+            ? ` (${decl.type}${itemType ? `<${itemType}>` : ''})`
+            : '';
+        const descSuffix = desc ? ` — ${desc}` : '';
+        if (e.reason === 'missing') {
+            lines.push(`  - ${e.field}${typeHint}: required${descSuffix}`);
+        }
+        else if (e.reason === 'empty_array') {
+            lines.push(`  - ${e.field}${typeHint}: must not be empty${descSuffix}`);
+        }
+        else {
+            lines.push(`  - ${e.field}${typeHint}: expected ${e.expected}, got ${e.got}${descSuffix}`);
+        }
+    }
+    return lines.join('\n');
+}
+function jsTypeOf(value) {
+    if (Array.isArray(value))
+        return 'array';
+    if (value === null)
+        return 'null';
+    return typeof value;
+}
+function validate_inputs_typeMatches(expected, actual, value) {
+    if (expected === 'integer' && actual === 'number') {
+        return Number.isInteger(value);
+    }
+    if (expected === 'number' && actual === 'number')
+        return true;
+    return expected === actual;
+}
+function validateOutput(rawOutput, schema, opts = {}) {
+    const schemaError = validateJsonSchema(schema);
+    if (!schemaError.ok) {
+        return { ok: false, violations: [], schemaError };
+    }
+    const value = parseValue(rawOutput, schema, opts);
+    const violations = validateAgainstSchema(value, schema);
+    if (violations.length === 0)
+        return { ok: true, value };
+    return { ok: false, violations };
+}
+/**
+ * Strip a wrapping markdown code fence.
+ *
+ * A model asked for JSON routinely answers ```json … ``` no matter how
+ * plainly the prompt says not to. The generateJson paths have always coped —
+ * adapters/minimax.ts, adapters/openrouter.ts, providers/anthropic.ts and
+ * providers/openai-chat.ts each carried the same two-line regex — but the two
+ * output validators parsed the raw text. So a fenced answer failed
+ * `output_format: structured_json` and `output_schema` validation while the
+ * identical string parsed fine through generateJson, which is why every
+ * structured-output stage was exposed to this.
+ *
+ * Deliberately conservative: it only acts when the text actually begins with a
+ * fence, so prose that merely mentions backticks is untouched. Accepts a fence
+ * with a language tag or none, and an unterminated one.
+ */
+function stripJsonFence(text) {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith('```'))
+        return trimmed;
+    return trimmed.replace(/^```[A-Za-z0-9_+-]*[ \t]*\r?\n?/, '').replace(/```\s*$/, '').trim();
+}
+/**
+ * The first balanced `{...}` / `[...]` region in `text`, or null if there is
+ * none. Brace counting respects string literals and escapes, so a `{` inside a
+ * JSON string value cannot throw the scan off.
+ *
+ * This exists because `stripJsonFence` requires the text to *begin* with a fence,
+ * which is a reasonable guard against prose that merely mentions backticks — but
+ * it misses the case production actually hit twice: the model answering
+ *
+ *     Here is the JSON you asked for:
+ *     ```json
+ *     { ... }
+ *     ```
+ *
+ * Prose, then a fence. Not stripped, so `JSON.parse` died on the backtick and
+ * the whole run failed. Measured in prod before this: 2 runs on exactly that
+ * shape, 2 more on prose with no fence at all.
+ */
+function extractJsonRegion(text) {
+    const start = text.search(/[{[]/);
+    if (start === -1)
+        return null;
+    const open = text[start];
+    const close = open === '{' ? '}' : ']';
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (ch === '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch === '"') {
+            inString = !inString;
+            continue;
+        }
+        if (inString)
+            continue;
+        if (ch === '{' || ch === '[')
+            depth++;
+        else if (ch === '}' || ch === ']') {
+            depth--;
+            if (depth === 0)
+                return ch === close ? text.slice(start, i + 1) : null;
+        }
+    }
+    return null; // unbalanced — truncated output, or not JSON at all
+}
+/** Drop `,` that sits immediately before a closing brace/bracket.
+ *
+ *  String-aware, so a comma inside a value is never touched. */
+function removeTrailingCommas(json) {
+    let out = '';
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < json.length; i++) {
+        const ch = json[i];
+        if (escaped) {
+            out += ch;
+            escaped = false;
+            continue;
+        }
+        if (ch === '\\') {
+            out += ch;
+            escaped = true;
+            continue;
+        }
+        if (ch === '"') {
+            inString = !inString;
+            out += ch;
+            continue;
+        }
+        if (!inString && ch === ',') {
+            let j = i + 1;
+            while (j < json.length && /\s/.test(json[j]))
+                j++;
+            if (json[j] === '}' || json[j] === ']')
+                continue; // drop the comma
+        }
+        out += ch;
+    }
+    return out;
+}
+/**
+ * Max recursion depth for unwrapping double-encoded JSON. Models occasionally
+ * emit a JSON object as a STRING value (i.e. the answer is a quoted JSON
+ * document), which the strict parser sees as a plain string. Three levels is
+ * enough to cover the realistic case — one accidental re-quoting, maybe two —
+ * without turning a missing-bracket case into an infinite loop.
+ */
+const MAX_DOUBLE_UNWRAP_DEPTH = 3;
+/**
+ * If `value` is a string that itself parses strictly as JSON, return the inner
+ * parsed value. Otherwise return `value` unchanged. Bounded depth so a
+ * pathological input cannot loop forever.
+ *
+ * Safety property — same shape as `parseJsonLenient`. The inner parse is
+ * strict: a string that does not parse is left as a string, and only the
+ * outermost string is "unwrapped" — there is no reshaping of structure, no
+ * invented keys, no coercion of numbers/booleans/null. A single level of
+ * unwrap is the common case; deeper levels only fire if each step strictly
+ * parses.
+ */
+function unwrapDoubleEncoded(value, depth = 0) {
+    if (depth >= MAX_DOUBLE_UNWRAP_DEPTH)
+        return value;
+    if (typeof value !== 'string')
+        return value;
+    let inner;
+    try {
+        inner = JSON.parse(value);
+    }
+    catch {
+        return value;
+    }
+    return unwrapDoubleEncoded(inner, depth + 1);
+}
+/**
+ * Parse JSON a model produced, tolerating the wrappers it actually adds.
+ *
+ * Strict parse first, and every fallback is only accepted if it parses strictly.
+ * That ordering is the whole safety argument: valid JSON is returned untouched,
+ * and anything unparseable still throws the ORIGINAL error from the strict
+ * attempt, so nothing is silently reshaped into "valid" and the error still
+ * points at what the model really said.
+ *
+ * Deliberately NOT attempted: rewriting quotes, adding missing braces, or
+ * coercing unquoted keys. Those change the meaning of string content, and a
+ * marketplace that guesses at a buyer's data is worse than one that fails.
+ *
+ * Production, before this existed, also failed on JSON that the model emitted
+ * as a quoted string — `"{\"summary\": \"...\"}"`. Strict parse returned a
+ * plain string, the schema asked for an object, and the run died with
+ * "$: expected type object, got string". `unwrapDoubleEncoded` unpacks such a
+ * shape recursively up to `MAX_DOUBLE_UNWRAP_DEPTH`, only ever when the inner
+ * parse is strict. This is unwrapping, not invention: the value the model
+ * returned is byte-for-byte the same JSON document, just wrapped one extra
+ * time in quotes.
+ */
+function parseJsonLenient(text) {
+    const attempt = (s) => {
+        try {
+            return { ok: true, value: JSON.parse(s) };
+        }
+        catch (e) {
+            return { ok: false, error: e };
+        }
+    };
+    const direct = attempt(text);
+    if (direct.ok)
+        return unwrapDoubleEncoded(direct.value);
+    const unfenced = attempt(stripJsonFence(text));
+    if (unfenced.ok)
+        return unwrapDoubleEncoded(unfenced.value);
+    const region = extractJsonRegion(text);
+    if (region !== null) {
+        const asRegion = attempt(region);
+        if (asRegion.ok)
+            return unwrapDoubleEncoded(asRegion.value);
+        const repaired = attempt(removeTrailingCommas(region));
+        if (repaired.ok)
+            return unwrapDoubleEncoded(repaired.value);
+    }
+    throw direct.error;
+}
+function parseValue(rawOutput, schema, opts) {
+    const parseJson = opts.parseJson !== false;
+    const isScalarType = typeof schema.type === 'string'
+        && (schema.type === 'string' || schema.type === 'number' || schema.type === 'integer'
+            || schema.type === 'boolean' || schema.type === 'null');
+    if (isScalarType)
+        return rawOutput;
+    if (!parseJson)
+        return rawOutput;
+    try {
+        return parseJsonLenient(rawOutput);
+    }
+    catch {
+        return rawOutput;
+    }
+}
+function validateMultimodalInput(messages) {
+    const errors = [];
+    if (!Array.isArray(messages) || messages.length === 0) {
+        return { ok: false, errors: [{ messageIndex: 0, reason: 'empty_content' }] };
+    }
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        if (!msg || (msg.role !== 'user' && msg.role !== 'assistant' && msg.role !== 'system')) {
+            errors.push({ messageIndex: i, reason: 'invalid_role' });
+            continue;
+        }
+        if (typeof msg.content === 'string')
+            continue;
+        if (!Array.isArray(msg.content) || msg.content.length === 0) {
+            errors.push({ messageIndex: i, reason: 'empty_content' });
+            continue;
+        }
+        for (let j = 0; j < msg.content.length; j++) {
+            const part = msg.content[j];
+            if (part.type === 'text')
+                continue;
+            const url = part.type === 'image_url' ? part.image_url.url
+                : part.type === 'audio_url' ? part.audio_url.url
+                    : part.video_url.url;
+            if (!url || typeof url !== 'string') {
+                errors.push({ messageIndex: i, partIndex: j, reason: 'invalid_url' });
+                continue;
+            }
+            if (!url.startsWith('data:') && !url.startsWith('https://') && !url.startsWith('http://')) {
+                errors.push({ messageIndex: i, partIndex: j, reason: 'unsupported_scheme', detail: url.slice(0, 24) });
+                continue;
+            }
+            const mime = detectMime(url);
+            if (!mime) {
+                errors.push({ messageIndex: i, partIndex: j, reason: 'unsupported_mime', detail: url.slice(0, 24) });
+                continue;
+            }
+            const ok = part.type === 'image_url' ? isImageMime(mime)
+                : part.type === 'audio_url' ? isAudioMime(mime)
+                    : isVideoMime(mime);
+            if (!ok) {
+                errors.push({ messageIndex: i, partIndex: j, reason: 'unsupported_mime', detail: mime });
+            }
+        }
+    }
+    return errors.length === 0 ? { ok: true } : { ok: false, errors };
+}
+
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/adapters/minimax.js
 /**
- * MiniMax provider — wraps MiniMax API which exposes an Anthropic-compatible endpoint.
+ * MiniMax provider — calls MiniMax API (Anthropic-compatible endpoint) via
+ * global `fetch`. Does NOT use @anthropic-ai/sdk because SDK v0.125+
+ * hardcodes `Authorization: Bearer` and does not honour our `x-api-key`
+ * requirement (MiniMax API rejects Bearer with 401).
  *
- * Endpoint: https://api.minimax.io/anthropic/v1/messages
- * Auth:     MINIMAX_API_KEY env var (or apiKey in opts)
- *
- * IMPORTANT: Anthropic SDK appends '/v1/messages' to baseURL.
- * So baseURL must NOT include '/v1' (else we get '/v1/v1/messages' → 404).
+ * Endpoint: POST https://api.minimax.io/anthropic/v1/messages
+ * Auth:     x-api-key: <MINIMAX_API_KEY>  (NOT Bearer)
  *
  * Models:
  *   - MiniMax-M2.7          (fast, simple tasks)
@@ -20492,7 +21554,7 @@ function toAnthropicBlock(part) {
  *   - MiniMax-M3            (slower, more capable, complex tasks — vision-capable)
  *
  * M1 — multimodal (image/audio/video) supported via `opts.messages`. Each
- * MultimodalMessage is converted to Anthropic SDK content blocks
+ * MultimodalMessage is converted to Anthropic-style content blocks
  * (image for `image_url`, document for `audio_url`/`video_url`). The
  * vision-capable check is the executor's responsibility (see
  * `assertMultimodalSupported` in provider-registry.ts); this adapter only
@@ -20500,14 +21562,14 @@ function toAnthropicBlock(part) {
  */
 
 
-// SDK appends '/v1/messages' → baseURL must NOT end with /v1
 const DEFAULT_BASE_URL = 'https://api.minimax.io/anthropic';
 class MiniMaxProvider {
     name = 'minimax';
     models = ['MiniMax-M2.7', 'MiniMax-M2.7-highspeed', 'MiniMax-M3'];
     simpleModel = 'MiniMax-M2.7';
     complexModel = 'MiniMax-M3';
-    client;
+    apiKey;
+    baseURL;
     supports(model) {
         return this.models.includes(model);
     }
@@ -20517,31 +21579,52 @@ class MiniMaxProvider {
         if (!apiKey) {
             throw new Error('MiniMaxProvider: apiKey missing. Pass via opts.apiKey or set MINIMAX_API_KEY env var.');
         }
-        this.client = new sdk/* default */.Ay({
-            apiKey,
-            baseURL: opts.baseURL || procEnv?.MINIMAX_BASE_URL || DEFAULT_BASE_URL,
-        });
+        this.apiKey = apiKey;
+        this.baseURL = opts.baseURL || procEnv?.MINIMAX_BASE_URL || DEFAULT_BASE_URL;
     }
     async generateText(prompt, opts = {}) {
         const model = opts.model ?? (opts.complexity === 'complex' ? this.complexModel : this.simpleModel);
         const { messages, systemParts } = buildAnthropicMessages(opts.messages, prompt);
         const system = joinSystem(opts.system, systemParts);
-        const response = await this.client.messages.create({
+        const body = {
             model,
             max_tokens: opts.maxTokens ?? 2048,
             temperature: opts.temperature ?? 0.7,
             ...(opts.topP !== undefined ? { top_p: opts.topP } : {}),
             ...(system !== undefined ? { system } : {}),
             ...(opts.stopSequences ? { stop_sequences: opts.stopSequences } : {}),
-            messages: messages,
+            messages,
+        };
+        const response = await fetch(`${this.baseURL}/v1/messages`, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-api-key': this.apiKey,
+                'anthropic-version': '2023-06-01',
+            },
+            body: JSON.stringify(body),
+        }).catch((e) => {
+            console.error(`[MiniMax fetch] ERROR: ${e instanceof Error ? e.message : e}`);
+            throw e;
         });
-        const text = response.content
-            .filter((block) => block.type === 'text')
-            .map((block) => block.text)
+        if (!response.ok) {
+            const errText = await response.text();
+            console.error(`[MiniMax fetch] ${response.status} keyLen=${this.apiKey.length} url=${this.baseURL}/v1/messages`);
+            console.error(`[MiniMax fetch] body:`, errText);
+            throw new Error(`MiniMax API ${response.status}: ${errText}`);
+        }
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`MiniMax API ${response.status}: ${errText}`);
+        }
+        const data = (await response.json());
+        const text = (data.content ?? [])
+            .filter((b) => b.type === 'text' && typeof b.text === 'string')
+            .map((b) => b.text)
             .join('');
         const usage = {
-            inputTokens: response.usage.input_tokens,
-            outputTokens: response.usage.output_tokens,
+            inputTokens: data.usage?.input_tokens ?? 0,
+            outputTokens: data.usage?.output_tokens ?? 0,
         };
         return { text, usage };
     }
@@ -20551,26 +21634,26 @@ class MiniMaxProvider {
             ...opts,
             system: opts.system ?? 'You are a JSON generator. Output only valid JSON, nothing else.',
         });
-        const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
-        const parsed = JSON.parse(cleaned);
+        const parsed = parseJsonLenient(text);
         return schema.parse(parsed);
     }
 }
 /**
- * Build the `messages` payload for `client.messages.create`. When multimodal
- * messages are supplied we convert each to Anthropic content blocks; otherwise
- * we fall back to wrapping the legacy string `prompt` as a single user turn.
+ * Build the `messages` payload. When multimodal messages are supplied we
+ * convert each to content blocks; otherwise we fall back to wrapping the
+ * legacy string `prompt` as a single user turn.
  *
- * Anthropic API does NOT accept `role:'system'` on messages — system prompts
+ * MiniMax API does NOT accept `role:'system'` on messages — system prompts
  * are a top-level parameter. We extract any system-role messages and return
  * them as `systemParts` for the caller to merge into the `system` field.
  */
 function buildAnthropicMessages(messages, fallbackPrompt) {
-    if (!messages || messages.length === 0) {
-        return { messages: [{ role: 'user', content: fallbackPrompt }], systemParts: [] };
-    }
     const systemParts = [];
     const out = [];
+    if (!messages || messages.length === 0) {
+        out.push({ role: 'user', content: fallbackPrompt });
+        return { messages: out, systemParts };
+    }
     for (const msg of messages) {
         if (msg.role === 'system') {
             systemParts.push(typeof msg.content === 'string' ? msg.content : textFromParts(msg.content));
@@ -20593,14 +21676,17 @@ function textFromParts(parts) {
     return parts
         .filter((p) => p.type === 'text' && typeof p.text === 'string')
         .map((p) => p.text)
-        .join('\n');
+        .join('');
 }
-function joinSystem(existing, parts) {
-    const filtered = parts.filter((s) => s.length > 0);
-    if (filtered.length === 0)
-        return existing;
-    const joined = filtered.join('\n\n');
-    return existing && existing.length > 0 ? `${existing}\n\n${joined}` : joined;
+function joinSystem(system, parts) {
+    const filtered = parts.filter((p) => p.length > 0);
+    if (system && filtered.length > 0)
+        return `${system}\n\n${filtered.join('\n\n')}`;
+    if (system)
+        return system;
+    if (filtered.length > 0)
+        return filtered.join('\n\n');
+    return undefined;
 }
 
 ;// CONCATENATED MODULE: ../../node_modules/openai/internal/tslib.mjs
@@ -42410,6 +43496,7 @@ bedrock_a = brand_privateBedrockClient;
  * so we pass messages through unchanged.
  */
 
+
 const openrouter_DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 class OpenRouterProvider {
     name = 'openrouter';
@@ -42468,8 +43555,7 @@ class OpenRouterProvider {
             ...opts,
             system: opts.system ?? 'You are a JSON generator. Output only valid JSON, nothing else.',
         });
-        const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
-        const parsed = JSON.parse(cleaned);
+        const parsed = parseJsonLenient(text);
         return schema.parse(parsed);
     }
 }
@@ -42531,6 +43617,7 @@ function openrouter_textFromParts(parts) {
  * the OpenAI API accepts image_url parts natively.
  */
 
+
 const openai_chat_DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 class OpenAIChatProvider {
     name = 'openai';
@@ -42576,8 +43663,7 @@ class OpenAIChatProvider {
             ...opts,
             system: opts.system ?? 'You are a JSON generator. Output only valid JSON, nothing else.',
         });
-        const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
-        const parsed = JSON.parse(cleaned);
+        const parsed = parseJsonLenient(text);
         return schema.parse(parsed);
     }
 }
@@ -42626,6 +43712,8 @@ function openai_chat_textFromParts(parts) {
         .join('\n');
 }
 
+// EXTERNAL MODULE: ../../node_modules/@anthropic-ai/sdk/index.mjs + 102 modules
+var sdk = __nccwpck_require__(39);
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/providers/anthropic.js
 /**
  * Anthropic Claude 3 provider — claude-3-opus / sonnet / haiku.
@@ -42638,6 +43726,7 @@ function openai_chat_textFromParts(parts) {
  * handling (top-level `system`, never role:system in messages), and
  * multimodal conversion (toAnthropicContent) are shared.
  */
+
 
 
 const anthropic_DEFAULT_BASE_URL = 'https://api.anthropic.com';
@@ -42694,8 +43783,7 @@ class AnthropicProvider {
             ...opts,
             system: opts.system ?? 'You are a JSON generator. Output only valid JSON, nothing else.',
         });
-        const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
-        const parsed = JSON.parse(cleaned);
+        const parsed = parseJsonLenient(text);
         return schema.parse(parsed);
     }
 }
@@ -42822,6 +43910,338 @@ class FallbackProvider {
 }
 function createFallbackProvider(providers) {
     return providers.length === 1 ? providers[0] : new FallbackProvider(providers);
+}
+
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/pipeline-refs.js
+/**
+ * Resolve pipeline-level template references in skill chain input blocks.
+ *
+ * Supports two reference flavors (both with and without braces):
+ *   - `$input.X`     / `${input.X}`      → ctx.inputs[X]
+ *   - `$stages.X.output` / `${stages.X.output}` → ctx.previousOutputs[X]
+ *
+ * Scope (F26-min): only the skill-chain `input:` block is resolved.
+ * Prompts keep their existing behavior (LLM interprets literal refs
+ * as context markers — works because LLMs are smart).
+ *
+ * Native types are PRESERVED. When `$input.urls` resolves and `urls`
+ * is an array, the substituted value is the array, NOT a JSON string.
+ * Tool skills (web_fetch, etc.) need native arrays/objects to work.
+ * If a prompt needs the array stringified, the prompt author can do
+ * it inside the template (e.g. wrap in explicit JSON.stringify call
+ * is not available in YAML — but a downstream LLM can handle arrays
+ * shown as `[object Array]` if needed).
+ *
+ * Why "leave literal if missing" instead of throwing:
+ *   The skill may receive partial input and choose to return an
+ *   error JSON (which downstream stages can handle). Throwing
+ *   would short-circuit that and bury the real cause one layer
+ *   deeper. The pipeline author can still catch missing inputs at
+ *   spec-validation time by adding `required: true` to spec.inputs.
+ *
+ * Recursion: objects and arrays are walked; primitives pass through.
+ * Strings get the regex substitution. Numbers, booleans, null return
+ * unchanged.
+ */
+/* ------------------------------------------------------------------------- *
+ * `{{ }}` double-brace interpolation
+ *
+ * The third pattern in the documented trio (PIPELINE.md "Pre-existing
+ * interpolation patterns", specs §12): `{{var}}`, stage-input interpolation.
+ * It was documented from the start and never implemented — `$input.X` and
+ * `${stages.X.outputs.Y}` were built, this one was skipped, and no test
+ * covered it, so the gap survived. The 2019s avoided it entirely: stage input
+ * blocks never had `{{ }}` in them, so LLM stages masked the hole by
+ * receiving every input and every prior stage output as separate context
+ * blocks and reading from there instead. Tool skills get no such blocks and
+ * no model to guess with, so a literal `{{image_url}}` reached
+ * `image_describe` and the stage died on the literal.
+ *
+ * Accepted resolution order (2026-10-13):
+ *   - `{{name}}`         → stage input, then pipeline input. Stage wins.
+ *   - `{{ inputs.X }}`   → pipeline input, addressed explicitly
+ *   - `{{stages.X.outputs}}` → prior stage output
+ *   - unknown            → left literal + a warning, never thrown
+ *
+ * Stage-wins shadowing is only half a decision: a silently shadowed pipeline
+ * input is exactly the kind of thing an author cannot debug from the output,
+ * so every collision is reported rather than quietly applied.
+ *
+ * Extends specs §12/§16, which define stage-output refs only as
+ * `${stages.X.outputs.Y}`. The canonical pipeline set writes the double-brace
+ * form instead, so both are honoured; that is a superset of the contract, not
+ * a contradiction of it.
+ * ------------------------------------------------------------------------- */
+const DOUBLE_BRACE_PATTERN = /\{\{\s*([^{}]+?)\s*\}\}/g;
+const DOUBLE_BRACE_WHOLE_PATTERN = /^\{\{\s*([^{}]+?)\s*\}\}$/;
+const PIPELINE_SCOPED_RE = /^inputs\.([A-Za-z_][A-Za-z0-9_]*)$/;
+const STAGE_OUTPUT_RE = /^stages\.([A-Za-z_][A-Za-z0-9_-]*)(?:\.outputs?)(?:\.([A-Za-z_][A-Za-z0-9_-]*))?$/;
+const BARE_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+function report(ctx, message) {
+    if (ctx.onWarning)
+        ctx.onWarning(message);
+    else
+        console.warn(`[refs] ${message}`);
+}
+function lookupDoubleBrace(expression, ctx) {
+    // `{{ inputs.X }}` — the pipeline address, spelled out so it cannot be
+    // mistaken for a stage argument of the same name.
+    const scoped = PIPELINE_SCOPED_RE.exec(expression);
+    if (scoped) {
+        const key = scoped[1];
+        if (Object.prototype.hasOwnProperty.call(ctx.pipelineInputs, key)) {
+            return { found: true, value: ctx.pipelineInputs[key] };
+        }
+        report(ctx, `{{ ${expression} }} refers to a pipeline input that does not exist; left literal.`);
+        return { found: false, value: undefined };
+    }
+    // `{{ stages.X.outputs }}` / `{{ stages.X.outputs.Y }}`
+    const stageRef = STAGE_OUTPUT_RE.exec(expression);
+    if (stageRef) {
+        const stageId = stageRef[1];
+        const outputs = ctx.previousOutputs ?? {};
+        if (Object.prototype.hasOwnProperty.call(outputs, stageId)) {
+            return { found: true, value: outputs[stageId] ?? '' };
+        }
+        report(ctx, `{{ ${expression} }} refers to stage '${stageId}', which has not produced output yet; left literal.`);
+        return { found: false, value: undefined };
+    }
+    // `{{name}}` — stage argument first, pipeline input second.
+    if (!BARE_NAME_RE.test(expression)) {
+        report(ctx, `{{ ${expression} }} is not a recognised reference form; left literal.`);
+        return { found: false, value: undefined };
+    }
+    const stageInputs = ctx.stageInputs;
+    const inPipeline = Object.prototype.hasOwnProperty.call(ctx.pipelineInputs, expression);
+    if (stageInputs !== null && Object.prototype.hasOwnProperty.call(stageInputs, expression)) {
+        const resolved = resolveStageArgument(expression, ctx);
+        if (resolved.found) {
+            // Report shadowing only when the stage really carries its own value. An
+            // argument like `image_url: "{{image_url}}"` forwards to the pipeline, so
+            // calling that a collision would be noise — and it would be noise on
+            // every reference, which trains the author to ignore the warning.
+            if (inPipeline && !ctx.viaPipeline?.has(expression)) {
+                report(ctx, `{{ ${expression} }} is declared both as a stage argument and as a pipeline input; ` +
+                    'the stage argument wins. Rename one of them to make the intent explicit.');
+            }
+            return resolved;
+        }
+    }
+    if (inPipeline) {
+        ctx.viaPipeline?.add(expression);
+        return { found: true, value: ctx.pipelineInputs[expression] };
+    }
+    report(ctx, `{{ ${expression} }} does not match any stage argument or pipeline input; left literal.`);
+    return { found: false, value: undefined };
+}
+/**
+ * Resolve a stage argument as a value in its own right.
+ *
+ * A stage argument may itself be a template — every canonical spec writes
+ * `image_url: "{{image_url}}"`, naming the argument after the very ref it
+ * carries. Handing that raw string back as the value of `{{image_url}}`
+ * satisfies the lookup with the template itself, so the tool skill receives
+ * the literal and rejects it. So an argument is resolved in the same scope as
+ * anything else, with the name it is resolving marked as in-flight: reaching it
+ * again means the definitions are circular, which yields "not found" and lets
+ * the pipeline scope answer instead of spinning.
+ */
+function resolveStageArgument(name, ctx) {
+    const stageInputs = ctx.stageInputs;
+    if (stageInputs === null || !Object.prototype.hasOwnProperty.call(stageInputs, name)) {
+        return { found: false, value: undefined };
+    }
+    const visiting = ctx.visiting ?? new Set();
+    if (visiting.has(name))
+        return { found: false, value: undefined };
+    const nested = new Set(visiting);
+    nested.add(name);
+    return { found: true, value: resolveDoubleBraceRefs(stageInputs[name], { ...ctx, visiting: nested }) };
+}
+function resolveDoubleBraceString(text, ctx) {
+    // A string that is nothing but one reference yields the native value, so an
+    // array argument stays an array. Same rule the $-forms follow — tool skills
+    // need native types, and JSON.stringify at the YAML layer is not available.
+    const whole = DOUBLE_BRACE_WHOLE_PATTERN.exec(text);
+    if (whole) {
+        const resolved = lookupDoubleBrace(whole[1], ctx);
+        return resolved.found ? resolved.value : text;
+    }
+    DOUBLE_BRACE_PATTERN.lastIndex = 0;
+    let touched = false;
+    const out = text.replace(DOUBLE_BRACE_PATTERN, (match, expression) => {
+        const resolved = lookupDoubleBrace(expression, ctx);
+        if (!resolved.found)
+            return match;
+        touched = true;
+        return typeof resolved.value === 'string' ? resolved.value : JSON.stringify(resolved.value);
+    });
+    return touched ? out : text;
+}
+function resolveDoubleBraceRefs(value, ctx) {
+    // The two sets are per-resolution-run state. Seeding them here means every
+    // caller gets a correct cycle guard and shadowing report without having to
+    // know they exist, while nested calls inherit the same instances.
+    const root = ctx.visiting && ctx.viaPipeline
+        ? ctx
+        : { ...ctx, visiting: ctx.visiting ?? new Set(), viaPipeline: ctx.viaPipeline ?? new Set() };
+    if (typeof value === 'string')
+        return resolveDoubleBraceString(value, root);
+    if (Array.isArray(value))
+        return value.map((v) => resolveDoubleBraceRefs(v, root));
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            out[k] = resolveDoubleBraceRefs(v, root);
+        }
+        return out;
+    }
+    return value;
+}
+/**
+ * Whether a value carries an input reference (`$input.X` / `${input.X}`).
+ *
+ * Callers that must inspect a value BEFORE inputs are known use this to tell
+ * "this is a literal" from "this will be substituted later". Spec validation is
+ * the case that matters: `provider: ${input.provider}` cannot be checked against
+ * the provider registry at that point, because the actual value is not known yet.
+ *
+ * Lives here so the ref syntax has one definition — a second copy of the pattern
+ * in a consumer would drift the moment either side gains a form.
+ */
+function containsInputRef(value) {
+    return typeof value === 'string' && INPUT_REF_PROBE.test(value);
+}
+// One definition of the ref syntax, two regexes over it. Substitution needs the
+// global flag; the predicate must NOT have it — a global regex carries
+// `lastIndex` between `.test()` calls, so `containsInputRef` answered
+// true/false/true for the same string and every second stage that used
+// `${input.provider}` was validated as a literal.
+const INPUT_REF_SRC = String.raw `\$\{\s*input\.([A-Za-z_][A-Za-z0-9_]*)\s*\}|\$input\.([A-Za-z_][A-Za-z0-9_]*)`;
+const INPUT_REF_PATTERN = new RegExp(INPUT_REF_SRC, 'g');
+const INPUT_REF_PROBE = new RegExp(INPUT_REF_SRC);
+const STAGE_OUTPUT_REF_PATTERN = /\$\{\s*stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output\s*\}|\$stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output/g;
+const SPECIAL_KEYS = {
+    today: () => new Date().toISOString().slice(0, 10),
+    now: () => new Date().toISOString(),
+    year: () => String(new Date().getFullYear()),
+    month: () => new Date().toISOString().slice(0, 7),
+    weekday: () => new Date().toLocaleDateString('en-US', { weekday: 'long' }),
+};
+function resolveInputRefs(value, ctx) {
+    if (typeof value === 'string') {
+        return resolveStringRefs(value, ctx);
+    }
+    if (Array.isArray(value)) {
+        return value.map((v) => resolveInputRefs(v, ctx));
+    }
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            out[k] = resolveInputRefs(v, ctx);
+        }
+        return out;
+    }
+    return value;
+}
+const SPECIAL_KEY_PATTERN = /\$(today|now|year|month|weekday)\b|\$\{\s*(today|now|year|month|weekday)\s*\}/g;
+function resolveStringRefs(text, ctx) {
+    const trimmed = text.trim();
+    const inputMatches = [...trimmed.matchAll(/\$input\.([A-Za-z_][A-Za-z0-9_]*)|\$\{\s*input\.([A-Za-z_][A-Za-z0-9_]*)\s*\}/g)];
+    const stageMatches = [...trimmed.matchAll(/\$stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output|\$\{\s*stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output\s*\}/g)];
+    const specialMatches = [...trimmed.matchAll(SPECIAL_KEY_PATTERN)];
+    const allMatches = inputMatches.length + stageMatches.length + specialMatches.length;
+    if (inputMatches.length === 1 && allMatches === 1 && inputMatches[0][0] === trimmed) {
+        const m = inputMatches[0];
+        const key = m[1] ?? m[2];
+        if (key !== undefined && Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
+            return ctx.inputs[key];
+        }
+        return text;
+    }
+    if (stageMatches.length === 1 && allMatches === 1 && stageMatches[0][0] === trimmed) {
+        const m = stageMatches[0];
+        const stageId = m[1] ?? m[2];
+        if (stageId !== undefined && Object.prototype.hasOwnProperty.call(ctx.previousOutputs, stageId)) {
+            return ctx.previousOutputs[stageId] ?? '';
+        }
+        return text;
+    }
+    if (specialMatches.length === 1 && allMatches === 1 && specialMatches[0][0] === trimmed) {
+        const m = specialMatches[0];
+        const key = m[1] ?? m[2];
+        if (key !== undefined) {
+            if (Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
+                return ctx.inputs[key];
+            }
+            if (Object.prototype.hasOwnProperty.call(SPECIAL_KEYS, key)) {
+                return SPECIAL_KEYS[key]();
+            }
+        }
+        return text;
+    }
+    let out = text;
+    out = out.replace(INPUT_REF_PATTERN, (match, key1, key2) => {
+        const key = key1 ?? key2;
+        if (key !== undefined && Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
+            const v = ctx.inputs[key];
+            return stringifyValue(v);
+        }
+        return match;
+    });
+    out = out.replace(STAGE_OUTPUT_REF_PATTERN, (match, sid1, sid2) => {
+        const stageId = sid1 ?? sid2;
+        if (stageId !== undefined && Object.prototype.hasOwnProperty.call(ctx.previousOutputs, stageId)) {
+            return ctx.previousOutputs[stageId] ?? '';
+        }
+        return match;
+    });
+    out = out.replace(SPECIAL_KEY_PATTERN, (match, k1, k2) => {
+        const key = k1 ?? k2;
+        if (key !== undefined) {
+            if (Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
+                return stringifyValue(ctx.inputs[key]);
+            }
+            if (Object.prototype.hasOwnProperty.call(SPECIAL_KEYS, key)) {
+                return SPECIAL_KEYS[key]();
+            }
+        }
+        return match;
+    });
+    return out;
+}
+function stringifyValue(v) {
+    if (typeof v === 'string')
+        return v;
+    if (v === null || v === undefined)
+        return '';
+    return JSON.stringify(v);
+}
+/**
+ * Substitute built-in special keys (\$today, \$now, \$year, \$month, \$weekday)
+ * anywhere they appear in text. Used for LLM prompts / system messages where
+ * \$input.X / \$stages.X.output are NOT resolved (they would inflate prompts
+ * with raw arrays or huge prior outputs). Special keys are small strings —
+ * safe to substitute everywhere.
+ *
+ * Bare and braced forms both work:
+ *   \$today / \${today}     → '2026-09-22'
+ *   \$now / \${now}         → '2026-09-22T00:00:00Z'
+ *   \$year / \${year}       → '2026'
+ *   \$month / \${month}     → '2026-09'
+ *   \$weekday / \${weekday} → 'Monday'
+ *
+ * Unknown \$keys are left literal (no false-matching — only the 5 known
+ * keys trigger substitution).
+ */
+function resolveSpecialKeys(text) {
+    return text.replace(SPECIAL_KEY_PATTERN, (match, k1, k2) => {
+        const key = k1 ?? k2;
+        if (key !== undefined && Object.prototype.hasOwnProperty.call(SPECIAL_KEYS, key)) {
+            return SPECIAL_KEYS[key]();
+        }
+        return match;
+    });
 }
 
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/provider-registry.js
@@ -43053,6 +44473,17 @@ function listSupportedModels(providerName) {
  *   3. The stage's effective model = `stage.model ?? spec.defaults?.model ?? 'MiniMax-M3'`.
  *      Stages using `uses:` (skill invocation) skip the gate entirely.
  */
+/**
+ * The R6 remedy text, in one place.
+ *
+ * It used to name only `provider: minimax`, and that is how all six canonical
+ * pipelines came to hardcode it — the message was followed literally. Since a
+ * stage can now take its provider from a pipeline input, the message has to say
+ * so, otherwise the same trap is re-set for the next author.
+ */
+const R6_PROVIDER_REQUIRED = `R6 requires explicit 'provider:' field (auto-dispatch by model name removed). ` +
+    `Add 'provider: minimax' (or openrouter/openai/anthropic/replicate), or pick it ` +
+    `per run with provider: \${input.provider} and a declared default under inputs:.`;
 function validateR6Spec(spec) {
     const errors = [];
     const stages = spec.stages ?? [];
@@ -43067,14 +44498,18 @@ function validateR6Spec(spec) {
             continue;
         const stageLabel = `Stage '${stage.id ?? '<no-id>'}'`;
         if (typeof stage.provider !== 'string' || stage.provider.length === 0) {
-            errors.push(`${stageLabel}: R6 requires explicit 'provider:' field ` +
-                `(auto-dispatch by model name removed). Add 'provider: minimax' ` +
-                `(or openrouter/openai/anthropic/replicate).`);
+            errors.push(`${stageLabel}: ${R6_PROVIDER_REQUIRED}`);
             continue;
         }
         const effectiveModel = hasModel
             ? stage.model
             : (spec.defaults?.model ?? 'MiniMax-M3');
+        // A provider or model that will be substituted from pipeline inputs has no
+        // value yet at spec-validation time — this function only sees the spec. The
+        // runtime resolves both fields before dispatch and rejects an unknown
+        // provider there, against the real value.
+        if (containsInputRef(stage.provider) || containsInputRef(effectiveModel))
+            continue;
         try {
             validateProviderModel(stage.provider, effectiveModel);
         }
@@ -43150,6 +44585,7 @@ class ProviderModelMismatchError extends Error {
         this.availableModels = availableModels;
     }
 }
+
 
 /**
  * Thrown when a stage declares `provider: X` but X is not in the
@@ -46843,6 +48279,18 @@ function makeStageSkippedEvent(stageId) {
 function makeStageFailedEvent(args) {
     return { type: 'stage.failed', at: nowIso(), stageId: args.stageId, error: args.error, reason: 'error' };
 }
+/**
+ * A non-fatal problem worth telling the author about.
+ *
+ * For unresolved `{{ }}` references: `{{ }}` resolves only pipeline inputs and
+ * prior stage outputs, so anything else in that shape stays literal and would
+ * otherwise ship inside the deliverable with no signal anywhere. The pipeline
+ * still runs — a literal prompt is the author's business, and failing a run the
+ * buyer has already paid for would be a worse outcome than the warning.
+ */
+function makeStageWarnedEvent(args) {
+    return { type: 'stage.warned', at: nowIso(), stageId: args.stageId, message: args.message };
+}
 function makeStageRetriedEvent(args) {
     return {
         type: 'stage.retry',
@@ -47614,162 +49062,6 @@ async function computeSkillContentHash(skill) {
     const version = (skill.version ?? '0.0.0').trim();
     const author = (skill.author_agent_id ?? '').toLowerCase().trim();
     return sha256Hex(`${body}\n---\nversion:${version}\nauthor:${author}`);
-}
-
-;// CONCATENATED MODULE: ../pipeline-runtime/dist/pipeline-refs.js
-/**
- * Resolve pipeline-level template references in skill chain input blocks.
- *
- * Supports two reference flavors (both with and without braces):
- *   - `$input.X`     / `${input.X}`      → ctx.inputs[X]
- *   - `$stages.X.output` / `${stages.X.output}` → ctx.previousOutputs[X]
- *
- * Scope (F26-min): only the skill-chain `input:` block is resolved.
- * Prompts keep their existing behavior (LLM interprets literal refs
- * as context markers — works because LLMs are smart).
- *
- * Native types are PRESERVED. When `$input.urls` resolves and `urls`
- * is an array, the substituted value is the array, NOT a JSON string.
- * Tool skills (web_fetch, etc.) need native arrays/objects to work.
- * If a prompt needs the array stringified, the prompt author can do
- * it inside the template (e.g. wrap in explicit JSON.stringify call
- * is not available in YAML — but a downstream LLM can handle arrays
- * shown as `[object Array]` if needed).
- *
- * Why "leave literal if missing" instead of throwing:
- *   The skill may receive partial input and choose to return an
- *   error JSON (which downstream stages can handle). Throwing
- *   would short-circuit that and bury the real cause one layer
- *   deeper. The pipeline author can still catch missing inputs at
- *   spec-validation time by adding `required: true` to spec.inputs.
- *
- * Recursion: objects and arrays are walked; primitives pass through.
- * Strings get the regex substitution. Numbers, booleans, null return
- * unchanged.
- */
-const INPUT_REF_PATTERN = /\$\{\s*input\.([A-Za-z_][A-Za-z0-9_]*)\s*\}|\$input\.([A-Za-z_][A-Za-z0-9_]*)/g;
-const STAGE_OUTPUT_REF_PATTERN = /\$\{\s*stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output\s*\}|\$stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output/g;
-const SPECIAL_KEYS = {
-    today: () => new Date().toISOString().slice(0, 10),
-    now: () => new Date().toISOString(),
-    year: () => String(new Date().getFullYear()),
-    month: () => new Date().toISOString().slice(0, 7),
-    weekday: () => new Date().toLocaleDateString('en-US', { weekday: 'long' }),
-};
-function resolveInputRefs(value, ctx) {
-    if (typeof value === 'string') {
-        return resolveStringRefs(value, ctx);
-    }
-    if (Array.isArray(value)) {
-        return value.map((v) => resolveInputRefs(v, ctx));
-    }
-    if (value && typeof value === 'object') {
-        const out = {};
-        for (const [k, v] of Object.entries(value)) {
-            out[k] = resolveInputRefs(v, ctx);
-        }
-        return out;
-    }
-    return value;
-}
-const SPECIAL_KEY_PATTERN = /\$(today|now|year|month|weekday)\b|\$\{\s*(today|now|year|month|weekday)\s*\}/g;
-function resolveStringRefs(text, ctx) {
-    const trimmed = text.trim();
-    const inputMatches = [...trimmed.matchAll(/\$input\.([A-Za-z_][A-Za-z0-9_]*)|\$\{\s*input\.([A-Za-z_][A-Za-z0-9_]*)\s*\}/g)];
-    const stageMatches = [...trimmed.matchAll(/\$stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output|\$\{\s*stages\.([A-Za-z_][A-Za-z0-9_.-]*)\.output\s*\}/g)];
-    const specialMatches = [...trimmed.matchAll(SPECIAL_KEY_PATTERN)];
-    const allMatches = inputMatches.length + stageMatches.length + specialMatches.length;
-    if (inputMatches.length === 1 && allMatches === 1 && inputMatches[0][0] === trimmed) {
-        const m = inputMatches[0];
-        const key = m[1] ?? m[2];
-        if (key !== undefined && Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
-            return ctx.inputs[key];
-        }
-        return text;
-    }
-    if (stageMatches.length === 1 && allMatches === 1 && stageMatches[0][0] === trimmed) {
-        const m = stageMatches[0];
-        const stageId = m[1] ?? m[2];
-        if (stageId !== undefined && Object.prototype.hasOwnProperty.call(ctx.previousOutputs, stageId)) {
-            return ctx.previousOutputs[stageId] ?? '';
-        }
-        return text;
-    }
-    if (specialMatches.length === 1 && allMatches === 1 && specialMatches[0][0] === trimmed) {
-        const m = specialMatches[0];
-        const key = m[1] ?? m[2];
-        if (key !== undefined) {
-            if (Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
-                return ctx.inputs[key];
-            }
-            if (Object.prototype.hasOwnProperty.call(SPECIAL_KEYS, key)) {
-                return SPECIAL_KEYS[key]();
-            }
-        }
-        return text;
-    }
-    let out = text;
-    out = out.replace(INPUT_REF_PATTERN, (match, key1, key2) => {
-        const key = key1 ?? key2;
-        if (key !== undefined && Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
-            const v = ctx.inputs[key];
-            return stringifyValue(v);
-        }
-        return match;
-    });
-    out = out.replace(STAGE_OUTPUT_REF_PATTERN, (match, sid1, sid2) => {
-        const stageId = sid1 ?? sid2;
-        if (stageId !== undefined && Object.prototype.hasOwnProperty.call(ctx.previousOutputs, stageId)) {
-            return ctx.previousOutputs[stageId] ?? '';
-        }
-        return match;
-    });
-    out = out.replace(SPECIAL_KEY_PATTERN, (match, k1, k2) => {
-        const key = k1 ?? k2;
-        if (key !== undefined) {
-            if (Object.prototype.hasOwnProperty.call(ctx.inputs, key)) {
-                return stringifyValue(ctx.inputs[key]);
-            }
-            if (Object.prototype.hasOwnProperty.call(SPECIAL_KEYS, key)) {
-                return SPECIAL_KEYS[key]();
-            }
-        }
-        return match;
-    });
-    return out;
-}
-function stringifyValue(v) {
-    if (typeof v === 'string')
-        return v;
-    if (v === null || v === undefined)
-        return '';
-    return JSON.stringify(v);
-}
-/**
- * Substitute built-in special keys (\$today, \$now, \$year, \$month, \$weekday)
- * anywhere they appear in text. Used for LLM prompts / system messages where
- * \$input.X / \$stages.X.output are NOT resolved (they would inflate prompts
- * with raw arrays or huge prior outputs). Special keys are small strings —
- * safe to substitute everywhere.
- *
- * Bare and braced forms both work:
- *   \$today / \${today}     → '2026-09-22'
- *   \$now / \${now}         → '2026-09-22T00:00:00Z'
- *   \$year / \${year}       → '2026'
- *   \$month / \${month}     → '2026-09'
- *   \$weekday / \${weekday} → 'Monday'
- *
- * Unknown \$keys are left literal (no false-matching — only the 5 known
- * keys trigger substitution).
- */
-function resolveSpecialKeys(text) {
-    return text.replace(SPECIAL_KEY_PATTERN, (match, k1, k2) => {
-        const key = k1 ?? k2;
-        if (key !== undefined && Object.prototype.hasOwnProperty.call(SPECIAL_KEYS, key)) {
-            return SPECIAL_KEYS[key]();
-        }
-        return match;
-    });
 }
 
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/providers/types.js
@@ -48675,498 +49967,6 @@ function stripHtmlToText(html) {
         .trim();
 }
 
-;// CONCATENATED MODULE: ../pipeline-runtime/dist/output-schema.js
-/**
- * M5 — Stage output schema types and meta-validation.
- *
- * Per-stage `output_schema` block constrains the executor's string output.
- * Companion field `output_retry` (none|single|loop) decides what happens
- * when validation fails. The runtime validator lives in
- * `./output-schema-validate.ts`; this file owns the type definitions and
- * the meta-validation step (catches `$ref`/etc. on parse).
- *
- * Supported keywords (subset):
- *   type            — string | number | integer | boolean | array | object | null
- *   properties      — Record<string, JsonSchema> for object validation
- *   required        — string[] of required keys
- *   additionalProperties — boolean | JsonSchema (default true)
- *   enum            — exact value match
- *   items           — JsonSchema for array element validation
- *   minItems / maxItems — array length bounds
- *   minLength / maxLength — string length bounds
- *   pattern         — regex string (matches whole value)
- *   format          — informational only; not validated
- *
- * NOT supported (fail-fast on schema parse):
- *   $ref, definitions, $defs, allOf, anyOf, oneOf, not, dependencies, propertyNames
- */
-/** Max recursion depth for nested object/array schemas. */
-const MAX_VALIDATION_DEPTH = 32;
-const UNSUPPORTED_KEYWORDS = new Set([
-    '$ref', 'definitions', '$defs', 'allOf', 'anyOf', 'oneOf',
-    'not', 'dependencies', 'propertyNames',
-]);
-/**
- * Validate the schema definition itself (meta-validation). Returns a
- * non-empty violations list when the schema declares unsupported
- * keywords (e.g. `$ref`) or is malformed. Schema is allowed to be
- * `undefined`/`null` → returns `{ok: true}` so callers can use it as a
- * permissive pre-check before wiring it into runtime validation.
- */
-function validateJsonSchema(raw) {
-    const violations = [];
-    walkSchemaCheck(raw, '$', violations);
-    return { ok: violations.length === 0, violations };
-}
-function walkSchemaCheck(schema, schemaPath, violations) {
-    if (schema === undefined || schema === null)
-        return;
-    if (typeof schema !== 'object' || Array.isArray(schema)) {
-        violations.push({
-            path: '$',
-            message: `schema at ${schemaPath} must be an object`,
-            schema_path: schemaPath,
-        });
-        return;
-    }
-    const obj = schema;
-    for (const k of Object.keys(obj)) {
-        if (UNSUPPORTED_KEYWORDS.has(k)) {
-            violations.push({
-                path: '$',
-                message: `keyword '${k}' is not supported in the M5 subset validator`,
-                schema_path: `${schemaPath}.${k}`,
-            });
-        }
-    }
-    if (obj['properties'] !== undefined) {
-        const props = obj['properties'];
-        if (typeof props !== 'object' || props === null || Array.isArray(props)) {
-            violations.push({
-                path: '$',
-                message: 'properties must be an object',
-                schema_path: `${schemaPath}.properties`,
-            });
-        }
-        else {
-            for (const [key, child] of Object.entries(props)) {
-                walkSchemaCheck(child, `${schemaPath}.properties.${key}`, violations);
-            }
-        }
-    }
-    if (obj['items'] !== undefined) {
-        walkSchemaCheck(obj['items'], `${schemaPath}.items`, violations);
-    }
-    if (obj['additionalProperties'] !== undefined && typeof obj['additionalProperties'] === 'object') {
-        walkSchemaCheck(obj['additionalProperties'], `${schemaPath}.additionalProperties`, violations);
-    }
-}
-/** Shared helpers used by output-schema-validate.ts. */
-function jsonTypeOf(value) {
-    if (value === null)
-        return 'null';
-    if (Array.isArray(value))
-        return 'array';
-    if (typeof value === 'number') {
-        return Number.isInteger(value) ? 'integer' : 'number';
-    }
-    if (typeof value === 'string')
-        return 'string';
-    if (typeof value === 'boolean')
-        return 'boolean';
-    if (typeof value === 'object')
-        return 'object';
-    return 'null';
-}
-function typeMatches(expected, actual, _value) {
-    if (expected === 'integer' && actual === 'integer')
-        return true;
-    if (expected === 'number' && (actual === 'number' || actual === 'integer'))
-        return true;
-    return expected === actual;
-}
-function deepEqual(a, b) {
-    if (a === b)
-        return true;
-    if (typeof a !== typeof b)
-        return false;
-    if (a === null || b === null)
-        return a === b;
-    if (Array.isArray(a) && Array.isArray(b)) {
-        if (a.length !== b.length)
-            return false;
-        for (let i = 0; i < a.length; i++) {
-            if (!deepEqual(a[i], b[i]))
-                return false;
-        }
-        return true;
-    }
-    if (typeof a === 'object' && typeof b === 'object') {
-        const ak = Object.keys(a);
-        const bk = Object.keys(b);
-        if (ak.length !== bk.length)
-            return false;
-        for (const k of ak) {
-            if (!deepEqual(a[k], b[k]))
-                return false;
-        }
-        return true;
-    }
-    return false;
-}
-function isPlainObject(value) {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-;// CONCATENATED MODULE: ../pipeline-runtime/dist/output-schema-validate.js
-/**
- * M5 — Runtime JSON Schema validator.
- *
- * Walks `value` against `schema` collecting `OutputValidationViolation`
- * entries. Recursion is bounded by `MAX_VALIDATION_DEPTH` (32) defined
- * in `./output-schema.ts`. Pure function — no side effects, safe to call
- * from any environment (Workers, Node, browser).
- */
-
-function validateAgainstSchema(value, schema, path = '$', schemaPath = '$', depth = 0) {
-    if (depth > MAX_VALIDATION_DEPTH) {
-        return [{
-                path,
-                message: `schema nesting exceeds MAX_VALIDATION_DEPTH (${MAX_VALIDATION_DEPTH})`,
-                schema_path: schemaPath,
-            }];
-    }
-    const violations = [];
-    if (schema.enum !== undefined) {
-        if (!schema.enum.some((v) => deepEqual(v, value))) {
-            violations.push({
-                path,
-                message: `value is not one of the allowed enum values`,
-                schema_path: `${schemaPath}.enum`,
-            });
-        }
-        return violations;
-    }
-    if (schema.type !== undefined) {
-        const expected = Array.isArray(schema.type) ? schema.type : [schema.type];
-        const actual = jsonTypeOf(value);
-        const isMatch = expected.some((t) => typeMatches(t, actual, value));
-        if (!isMatch) {
-            violations.push({
-                path,
-                message: `expected type ${expected.join(' | ')}, got ${actual}`,
-                schema_path: `${schemaPath}.type`,
-            });
-            return violations;
-        }
-    }
-    if (typeof value === 'string') {
-        checkStringConstraints(value, schema, path, schemaPath, violations);
-    }
-    if (Array.isArray(value)) {
-        checkArrayConstraints(value, schema, path, schemaPath, depth, violations);
-    }
-    if (isPlainObject(value)) {
-        checkObjectConstraints(value, schema, path, schemaPath, depth, violations);
-    }
-    return violations;
-}
-function checkStringConstraints(value, schema, path, schemaPath, violations) {
-    if (schema.minLength !== undefined && value.length < schema.minLength) {
-        violations.push({
-            path,
-            message: `string length ${value.length} is less than minLength ${schema.minLength}`,
-            schema_path: `${schemaPath}.minLength`,
-        });
-    }
-    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
-        violations.push({
-            path,
-            message: `string length ${value.length} exceeds maxLength ${schema.maxLength}`,
-            schema_path: `${schemaPath}.maxLength`,
-        });
-    }
-    if (schema.pattern !== undefined) {
-        try {
-            const re = new RegExp(schema.pattern);
-            if (!re.test(value)) {
-                violations.push({
-                    path,
-                    message: `string does not match pattern /${schema.pattern}/`,
-                    schema_path: `${schemaPath}.pattern`,
-                });
-            }
-        }
-        catch {
-            violations.push({
-                path,
-                message: `pattern /${schema.pattern}/ is not a valid regular expression`,
-                schema_path: `${schemaPath}.pattern`,
-            });
-        }
-    }
-}
-function checkArrayConstraints(value, schema, path, schemaPath, depth, violations) {
-    if (schema.minItems !== undefined && value.length < schema.minItems) {
-        violations.push({
-            path,
-            message: `array length ${value.length} is less than minItems ${schema.minItems}`,
-            schema_path: `${schemaPath}.minItems`,
-        });
-    }
-    if (schema.maxItems !== undefined && value.length > schema.maxItems) {
-        violations.push({
-            path,
-            message: `array length ${value.length} exceeds maxItems ${schema.maxItems}`,
-            schema_path: `${schemaPath}.maxItems`,
-        });
-    }
-    if (schema.items !== undefined) {
-        for (let i = 0; i < value.length; i++) {
-            violations.push(...validateAgainstSchema(value[i], schema.items, `${path}[${i}]`, `${schemaPath}.items`, depth + 1));
-        }
-    }
-}
-function checkObjectConstraints(value, schema, path, schemaPath, depth, violations) {
-    if (schema.required !== undefined) {
-        for (const key of schema.required) {
-            if (!(key in value)) {
-                violations.push({
-                    path,
-                    message: `missing required property '${key}'`,
-                    schema_path: `${schemaPath}.required`,
-                });
-            }
-        }
-    }
-    if (schema.properties !== undefined) {
-        for (const [key, childSchema] of Object.entries(schema.properties)) {
-            if (key in value) {
-                violations.push(...validateAgainstSchema(value[key], childSchema, `${path}.${key}`, `${schemaPath}.properties.${key}`, depth + 1));
-            }
-        }
-    }
-    if (schema.additionalProperties === false && schema.properties !== undefined) {
-        const allowed = new Set(Object.keys(schema.properties));
-        for (const key of Object.keys(value)) {
-            if (!allowed.has(key)) {
-                violations.push({
-                    path,
-                    message: `additional property '${key}' is not allowed`,
-                    schema_path: `${schemaPath}.additionalProperties`,
-                });
-            }
-        }
-    }
-    else if (typeof schema.additionalProperties === 'object' &&
-        schema.additionalProperties !== null) {
-        const allowed = new Set(Object.keys(schema.properties ?? {}));
-        for (const key of Object.keys(value)) {
-            if (!allowed.has(key)) {
-                violations.push(...validateAgainstSchema(value[key], schema.additionalProperties, `${path}.${key}`, `${schemaPath}.additionalProperties`, depth + 1));
-            }
-        }
-    }
-}
-
-;// CONCATENATED MODULE: ../pipeline-runtime/dist/validate-inputs.js
-/**
- * Pre-flight input validation for pipeline execution.
- *
- * Catches the common UX trap: user runs `pipeline call daily-news-digest`
- * without `--inputs urls=...`, pipeline silently starts, fetch stage fails
- * 4.4s later with a confusing deep-stage error. This check fails fast
- * with a clear "missing required input" message before any stage runs.
- *
- * Called from:
- *   - CLI runCommand (packages/cli/src/commands/run.ts)
- *   - Server /v1/pipelines/:slug/run endpoint (packages/server/src/routes/pipelines.ts)
- *
- * Behavior:
- *   - Iterates spec.inputs (Record<string, InputDecl>)
- *   - For each `required: true` input, asserts the value is present AND
- *     matches the declared type (string|integer|number|boolean|array|object)
- *   - For arrays with declared `items.type`, asserts every item matches
- *   - Returns null if all checks pass, else a list of human-readable errors
- *
- * NOTE: This is intentionally permissive on unknown inputs (no error if
- * spec.inputs is missing or input has extra keys). Permissiveness on the
- * "extra" axis avoids breaking ad-hoc CLI invocations; strictness is only
- * on the "missing required" axis.
- *
- * M5 — `validateOutput()` is the symmetric output validator (server-side
- * stage output validation against JSON Schema). Returns structured
- * violations the executor uses to drive retry modes (none|single|loop).
- */
-
-
-
-function validateInputs(specInputs, provided) {
-    if (!specInputs)
-        return [];
-    const errors = [];
-    for (const [field, decl] of Object.entries(specInputs)) {
-        const value = provided[field];
-        const present = value !== undefined && value !== null;
-        if (decl.required && !present) {
-            errors.push({ field, reason: 'missing', expected: decl.type ?? 'any' });
-            continue;
-        }
-        if (!present)
-            continue;
-        const expectedType = decl.type;
-        if (expectedType) {
-            const actualType = jsTypeOf(value);
-            if (!validate_inputs_typeMatches(expectedType, actualType, value)) {
-                const gotMsg = expectedType === 'integer' && actualType === 'number'
-                    ? (Number.isInteger(value) ? 'number' : 'float')
-                    : actualType;
-                errors.push({
-                    field,
-                    reason: 'wrong_type',
-                    expected: expectedType,
-                    got: gotMsg,
-                });
-                continue;
-            }
-            if (expectedType === 'array' && Array.isArray(value)) {
-                if (value.length === 0 && decl.required) {
-                    errors.push({ field, reason: 'empty_array', expected: 'non-empty array' });
-                    continue;
-                }
-                if (decl.items?.type && value.length > 0) {
-                    for (let i = 0; i < value.length; i++) {
-                        const itemType = jsTypeOf(value[i]);
-                        if (!validate_inputs_typeMatches(decl.items.type, itemType, value[i])) {
-                            errors.push({
-                                field,
-                                reason: 'wrong_item_type',
-                                expected: `${decl.items.type}[]`,
-                                got: `${itemType}[${i}]`,
-                            });
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return errors;
-}
-function formatInputErrors(errors, inputs) {
-    if (errors.length === 0)
-        return '';
-    const lines = [];
-    for (const e of errors) {
-        const decl = inputs?.[e.field];
-        const desc = decl?.description;
-        const itemType = decl?.items?.type;
-        const typeHint = decl?.type
-            ? ` (${decl.type}${itemType ? `<${itemType}>` : ''})`
-            : '';
-        const descSuffix = desc ? ` — ${desc}` : '';
-        if (e.reason === 'missing') {
-            lines.push(`  - ${e.field}${typeHint}: required${descSuffix}`);
-        }
-        else if (e.reason === 'empty_array') {
-            lines.push(`  - ${e.field}${typeHint}: must not be empty${descSuffix}`);
-        }
-        else {
-            lines.push(`  - ${e.field}${typeHint}: expected ${e.expected}, got ${e.got}${descSuffix}`);
-        }
-    }
-    return lines.join('\n');
-}
-function jsTypeOf(value) {
-    if (Array.isArray(value))
-        return 'array';
-    if (value === null)
-        return 'null';
-    return typeof value;
-}
-function validate_inputs_typeMatches(expected, actual, value) {
-    if (expected === 'integer' && actual === 'number') {
-        return Number.isInteger(value);
-    }
-    if (expected === 'number' && actual === 'number')
-        return true;
-    return expected === actual;
-}
-function validateOutput(rawOutput, schema, opts = {}) {
-    const schemaError = validateJsonSchema(schema);
-    if (!schemaError.ok) {
-        return { ok: false, violations: [], schemaError };
-    }
-    const value = parseValue(rawOutput, schema, opts);
-    const violations = validateAgainstSchema(value, schema);
-    if (violations.length === 0)
-        return { ok: true, value };
-    return { ok: false, violations };
-}
-function parseValue(rawOutput, schema, opts) {
-    const parseJson = opts.parseJson !== false;
-    const isScalarType = typeof schema.type === 'string'
-        && (schema.type === 'string' || schema.type === 'number' || schema.type === 'integer'
-            || schema.type === 'boolean' || schema.type === 'null');
-    if (isScalarType)
-        return rawOutput;
-    if (!parseJson)
-        return rawOutput;
-    try {
-        return JSON.parse(rawOutput);
-    }
-    catch {
-        return rawOutput;
-    }
-}
-function validateMultimodalInput(messages) {
-    const errors = [];
-    if (!Array.isArray(messages) || messages.length === 0) {
-        return { ok: false, errors: [{ messageIndex: 0, reason: 'empty_content' }] };
-    }
-    for (let i = 0; i < messages.length; i++) {
-        const msg = messages[i];
-        if (!msg || (msg.role !== 'user' && msg.role !== 'assistant' && msg.role !== 'system')) {
-            errors.push({ messageIndex: i, reason: 'invalid_role' });
-            continue;
-        }
-        if (typeof msg.content === 'string')
-            continue;
-        if (!Array.isArray(msg.content) || msg.content.length === 0) {
-            errors.push({ messageIndex: i, reason: 'empty_content' });
-            continue;
-        }
-        for (let j = 0; j < msg.content.length; j++) {
-            const part = msg.content[j];
-            if (part.type === 'text')
-                continue;
-            const url = part.type === 'image_url' ? part.image_url.url
-                : part.type === 'audio_url' ? part.audio_url.url
-                    : part.video_url.url;
-            if (!url || typeof url !== 'string') {
-                errors.push({ messageIndex: i, partIndex: j, reason: 'invalid_url' });
-                continue;
-            }
-            if (!url.startsWith('data:') && !url.startsWith('https://') && !url.startsWith('http://')) {
-                errors.push({ messageIndex: i, partIndex: j, reason: 'unsupported_scheme', detail: url.slice(0, 24) });
-                continue;
-            }
-            const mime = detectMime(url);
-            if (!mime) {
-                errors.push({ messageIndex: i, partIndex: j, reason: 'unsupported_mime', detail: url.slice(0, 24) });
-                continue;
-            }
-            const ok = part.type === 'image_url' ? isImageMime(mime)
-                : part.type === 'audio_url' ? isAudioMime(mime)
-                    : isVideoMime(mime);
-            if (!ok) {
-                errors.push({ messageIndex: i, partIndex: j, reason: 'unsupported_mime', detail: mime });
-            }
-        }
-    }
-    return errors.length === 0 ? { ok: true } : { ok: false, errors };
-}
-
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/output-errors.js
 /**
  * M5 — Output validation error + retry mode primitives.
@@ -49176,13 +49976,103 @@ function validateMultimodalInput(messages) {
  * `packages/server/src/routes/pipelines/invoke.ts` catches it and
  * surfaces a structured HTTP 500 envelope (see PIPELINE.md §"Stage
  * output validation (M5)").
+ *
+ * `rawOutput` (added M-diagnostics): the truncated text the model emitted
+ * on the final attempt, so the server side can persist the actual model
+ * response next to `failure_reason` instead of forcing operators to
+ * reverse-engineer whether the LLM emitted JSON, a JSON-in-quotes string,
+ * or a prose block — that is the breadcrumb that makes
+ * `$: expected type object, got string` actionable in one glance.
+ *
+ * The `truncatedChars` counter tells the server how many characters were
+ * dropped from the middle: callers that already know the model wasn't
+ * truncated benefit from the exact size; callers that only have the
+ * stored envelope can show `[...truncated N chars...]` without guessing.
  */
+/**
+ * Maximum total characters of the model output we will keep on a single
+ * failed run. The total budget is split evenly between the head (often
+ * contains the LLM's prose preamble, the opening quote, or the start of
+ * a JSON block) and the tail (often contains the trailing garbage, the
+ * cropped close brace, or the explanation the model tacked on after
+ * closing the JSON). 3000 chars is enough to capture both ends of any
+ * realistic validation-failure diagnostic while keeping the persisted
+ * row well under the 4 KB cap of cheap D1/SQLite TEXT indexing and a
+ * comfortable headroom for surrounding envelope JSON.
+ *
+ * Rationale (3000 vs the 2000–4000 range the brief considered):
+ *   - 2000 is too tight once the model answers with a one-paragraph
+ *     apology + a 1 KB payload + a stray trailing comma. We have seen
+ *     those in prod; trimming at 2000 eats one of the two edges every
+ *     time.
+ *   - 4000 starts to leak tens of KBs of large nested arrays that the
+ *     validator never reached, into a column that is mirrored by
+ *     receipts and page-rendering paths.
+ *   - 3000 is the cautious middle: enough room for the diagnostic, far
+ *     below the small-text ceiling of every consumer that parses
+ *     `output_json` back into JSON.
+ */
+const MAX_RAW_OUTPUT_CHARS = 3000;
+const HEAD_CHARS = Math.floor(MAX_RAW_OUTPUT_CHARS / 2);
+const TAIL_CHARS = MAX_RAW_OUTPUT_CHARS - HEAD_CHARS;
+/**
+ * Marker inserted between the kept head and kept tail when truncation
+ * occurs. Keeps the ellipsis count so the envelope is self-describing
+ * even without `truncatedChars` (e.g. when surfaced through a route
+ * that flattens the JSON).
+ */
+const TRUNCATION_MARKER = '\n\n[...truncated {N} chars of middle...]\n\n';
+/**
+ * Truncate model output while preserving both ends. Used by
+ * `OutputValidationError` to carry a bounded diagnostic with the
+ * failure — a 50 KB LLM response is collapsed to a few KB without
+ * losing the opening quote, the closing brace, or anything in
+ * between that mattered for the validation failure.
+ *
+ * When the input is shorter than `MAX_RAW_OUTPUT_CHARS`, the head
+ * contains the entire input and the tail is empty (and
+ * `truncatedChars` is 0).
+ */
+function truncateRawOutput(text) {
+    if (typeof text !== 'string') {
+        return { head: '', tail: '', truncatedChars: 0 };
+    }
+    if (text.length <= MAX_RAW_OUTPUT_CHARS) {
+        return { head: text, tail: '', truncatedChars: 0 };
+    }
+    const truncatedChars = text.length - HEAD_CHARS - TAIL_CHARS;
+    const head = text.slice(0, HEAD_CHARS);
+    const tail = text.slice(text.length - TAIL_CHARS);
+    return { head, tail, truncatedChars };
+}
+/** Build the canonical truncation marker with the dropped count baked in. */
+function formatTruncatedRawOutput(t) {
+    if (t.truncatedChars <= 0)
+        return t.head;
+    const marker = TRUNCATION_MARKER.replace('{N}', String(t.truncatedChars));
+    return t.head + marker + t.tail;
+}
 class OutputValidationError extends Error {
     stageId;
     attempt;
     violations;
     lastError;
-    constructor(stageId, attempt, violations) {
+    /**
+     * Bounded raw model output that failed validation. `undefined` when
+     * the throw site had no text to attach (e.g. a malformed schema
+     * detected before any LLM call). When present, `rawOutput` is at
+     * most `MAX_RAW_OUTPUT_CHARS` characters, may include a
+     * `[...truncated N chars...]` marker in the middle, and is the
+     * single source of truth for "what did the model actually return".
+     */
+    rawOutput;
+    /**
+     * Character count dropped from the middle of `rawOutput`. Pair with
+     * `rawOutput` so consumers can show "kept N of M" without re-walking
+     * the marker. `undefined` exactly when `rawOutput` is undefined.
+     */
+    truncatedChars;
+    constructor(stageId, attempt, violations, rawOutput, truncatedChars) {
         const summary = violations.length > 0
             ? violations.map((v) => `${v.path}: ${v.message}`).join('; ')
             : 'unknown validation failure';
@@ -49192,6 +50082,10 @@ class OutputValidationError extends Error {
         this.attempt = attempt;
         this.violations = violations;
         this.lastError = summary;
+        if (rawOutput !== undefined) {
+            this.rawOutput = rawOutput;
+            this.truncatedChars = truncatedChars ?? 0;
+        }
     }
 }
 const OUTPUT_VALIDATION_RETRY_ATTEMPTS = {
@@ -49423,6 +50317,55 @@ function buildInputsString(inputs) {
         return '';
     return entries.map(([k, v]) => `${k}: ${JSON.stringify(v)}\n`).join('');
 }
+/**
+ * All three documented interpolation engines, for `prompt` and `system`.
+ *
+ * Double-brace runs first so a substituted value that itself carries a
+ * stage-output or `${today}` reference is still resolved. `{{ }}` sees
+ * pipeline inputs and prior stage outputs only — a prompt has no stage
+ * argument block, which is the same scope the $-forms give it.
+ *
+ * Prompts used to keep their literals deliberately: the executor hands the
+ * model every input and every prior output as separate `Inputs:` and
+ * `Previous stage outputs:` blocks, so a model reads the values from there and
+ * a literal in the prompt was harmless noise. That is a sound argument, and it
+ * was the reason the scope was narrowed in the first place — but it left
+ * PIPELINE.md and specs §12 promising substitution in prompts that never
+ * happened, with all 21 canonical specs written against it. Accepted
+ * 2026-10-13, deliberately as its own commit: unlike a tool skill's arguments,
+ * this changes the text sent to the model for every pipeline at once, so it
+ * has to be revertible on its own.
+ */
+function resolvePromptRefs(value, inputs, previousOutputs, onWarning) {
+    if (typeof value === 'string') {
+        const braced = resolveDoubleBraceRefs(value, {
+            stageInputs: null,
+            pipelineInputs: inputs,
+            previousOutputs,
+            // `{{ }}` is documented for pipeline inputs and prior stage outputs
+            // only, so `{{date}}` or any other unbound name resolves to itself and
+            // stays literal. That is deliberate — guessing the author's intent
+            // would silently rewrite their prompt. But a literal that was meant to
+            // be a reference is a defect in the pipeline, and without a sink it
+            // reached nobody: report() fell back to console.warn, which in a
+            // Worker means the logs the author never reads.
+            onWarning,
+        });
+        const asText = typeof braced === 'string' ? braced : String(braced);
+        return resolveSpecialKeys(resolveStageOutputRefs(asText, previousOutputs));
+    }
+    if (Array.isArray(value)) {
+        return value.map((v) => resolvePromptRefs(v, inputs, previousOutputs));
+    }
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(value)) {
+            out[k] = resolvePromptRefs(v, inputs, previousOutputs);
+        }
+        return out;
+    }
+    return value;
+}
 function makeWhenResolve(inputs, outputs) {
     const stageRefRe = /^stages\.([A-Za-z_][A-Za-z0-9_]*)(?:\.outputs?(?:\.[A-Za-z_][A-Za-z0-9_]*)?)?$/;
     const inputRefRe = /^inputs\.([A-Za-z_][A-Za-z0-9_]*)$/;
@@ -49452,10 +50395,17 @@ function parseUsesEntry(raw) {
     if (!trimmed)
         return { id: '', version: null };
     const at = trimmed.lastIndexOf('@');
-    if (at <= 0 || at === trimmed.length - 1) {
-        return { id: trimmed, version: null };
-    }
-    return { id: trimmed.slice(0, at), version: trimmed.slice(at + 1) };
+    const rawId = at <= 0 || at === trimmed.length - 1 ? trimmed : trimmed.slice(0, at);
+    // `tool:<name>` is the documented way to declare a runtime-native tool skill,
+    // but nothing ever stripped the prefix — the id stayed `tool:image_describe`,
+    // which is neither a marketplace skill nor a key in TOOL_SKILLS, so every
+    // stage using it died as "references missing skill". Both spellings must
+    // reach invokeToolSkill under the bare name. Only strip when what follows is
+    // really a tool skill: an unknown `tool:` prefix should keep failing loudly
+    // rather than being silently downgraded to a bare skill that also isn't there.
+    const id = rawId.startsWith('tool:') && isToolSkill(rawId.slice(5)) ? rawId.slice(5) : rawId;
+    const version = at <= 0 || at === trimmed.length - 1 ? null : trimmed.slice(at + 1);
+    return { id, version };
 }
 function parseUsesList(stage) {
     if (typeof stage.uses === 'string' && stage.uses.length > 0) {
@@ -49513,7 +50463,7 @@ function validateOutputFormat(text, outputFormat, requiredFields) {
         return;
     let parsed;
     try {
-        parsed = JSON.parse(text);
+        parsed = parseJsonLenient(text);
     }
     catch (e) {
         throw new StageOutputFormatError([
@@ -49583,6 +50533,26 @@ class StageBadConfigError extends Error {
         this.name = 'BAD_STAGE';
     }
 }
+/**
+ * Substitute `${input.X}` / `$input.X` references in `stage.provider` and
+ * `stage.model` before they reach the resolver. Same walking strategy that
+ * already runs over `chainedInput` (stage arguments) at line ~830; literals
+ * pass through unchanged and unresolved references stay as their text form
+ * (matching resolveInputRefs:266 — pipeline-refs.ts).
+ *
+ * Returns a shallow clone when at least one field actually changes; returns
+ * the same `stage` object otherwise so we don't allocate per-call.
+ */
+function resolveStageMetaRefs(stage, inputs) {
+    const resolvedProvider = resolveInputRefs(stage.provider, { inputs, previousOutputs: {} });
+    const resolvedModelRaw = resolveInputRefs(stage.model, { inputs, previousOutputs: {} });
+    const resolvedModel = typeof resolvedModelRaw === 'string' ? resolvedModelRaw : stage.model;
+    const providerChanged = typeof resolvedProvider === 'string' && resolvedProvider !== stage.provider;
+    const modelChanged = typeof stage.model === 'string' && resolvedModel !== stage.model;
+    if (!providerChanged && !modelChanged)
+        return stage;
+    return { ...stage, provider: resolvedProvider, model: resolvedModel };
+}
 function resolveStageProvider(deps, stage, model) {
     // F12: --mock must override explicit per-stage `provider:` declarations,
     // otherwise canonical seeded pipelines (which all declare
@@ -49597,7 +50567,38 @@ function resolveStageProvider(deps, stage, model) {
     }
     return deps.registry.resolveWithSupports(stage.provider, model);
 }
-async function invokeSkill(skill, input, previousContext, skillLabel, provider, retry, retryCtx, outputFormat) {
+/**
+ * Price one model call, tolerating a model whose price cannot be resolved.
+ *
+ * Whether a failed lookup is fatal depends on who is paying. Locally the buyer
+ * spends their own key — or runs a local model that has no price at all — so a
+ * missing price is informational and must not take the run down. On the server
+ * we pay from our own key, so an unpriced model is a real loss and stays fatal.
+ *
+ * This was not hypothetical: the resolver's static table holds exactly two
+ * model names, everything else falls through to OpenRouter, which matches on the
+ * full namespaced id. So a bare `gpt-4`, or any local model like `llama3`, threw
+ * *after* the model had answered and took the whole run down with it. All 24
+ * model references across the six canonical pipelines are `MiniMax-M3`, so no
+ * shipped pipeline ever reached it.
+ */
+async function priceStageCost(deps, stageId, model, usage) {
+    try {
+        return await deps.pricing.resolveCostMicroUsdc(model, usage);
+    }
+    catch (err) {
+        if (!deps.isLocal)
+            throw err;
+        deps.eventSink?.emit(makeStageWarnedEvent({
+            stageId,
+            message: `no price resolved for model '${model}' — counting this stage as $0. ` +
+                'Locally nothing is billed, so this does not change what you pay; the ' +
+                'same run against the server would be refused.',
+        }));
+        return 0;
+    }
+}
+async function invokeSkill(skill, input, previousContext, skillLabel, provider, retry, retryCtx, outputFormat, maxTokens) {
     const t0 = Date.now();
     const inputStr = JSON.stringify(input ?? {}, null, 2);
     const fullMd = skill.full_md ?? '';
@@ -49606,7 +50607,11 @@ async function invokeSkill(skill, input, previousContext, skillLabel, provider, 
     const ran = await runWithRetry(() => provider.generateText(composedPrompt, {
         system: `${skillLabel}\n${description}`,
         complexity: 'complex',
-        maxTokens: 4096,
+        // Same reasoning-budget trap as the direct stage paths: a skill invoked
+        // from a stage has no way to declare its own budget, so it inherited the
+        // hardcoded 4096 and a reasoning model could spend all of it thinking,
+        // returning no text while the stage went on to validate it as JSON.
+        maxTokens: Number.isFinite(maxTokens) ? maxTokens : 4096,
         ...(outputFormat ? { outputFormat } : {}),
     }), retry, retryCtx);
     return { result: ran.value, durationMs: Date.now() - t0, attempts: ran.attempts };
@@ -49683,7 +50688,40 @@ async function runWithRetry(op, retry, retryCtx) {
 }
 // Fallback constant (kept local — retry.ts owns the canonical list).
 const DEFAULT_RETRYABLE_STATUSES_FALLBACK = [429, 503];
-async function executeStage(stage, pipeline, ctx, deps) {
+/**
+ * `model_params` (snake_case in a spec) → `GenerateOptions` (camelCase).
+ *
+ * Returns an empty object when the stage sets nothing, so spreading it at a call
+ * site adds no keys and every adapter keeps its own default. `max_tokens` is
+ * mapped too even though `stage.maxTokens` wins at the call sites: a spec that
+ * sets only `model_params.max_tokens` should not silently get 4096.
+ */
+function stageModelParams(stage) {
+    const mp = stage.model_params;
+    if (!mp)
+        return {};
+    return {
+        temperature: mp.temperature,
+        topP: mp.top_p,
+        seed: mp.seed,
+        stopSequences: mp.stop,
+        reasoningEffort: mp.reasoning_effort,
+    };
+}
+function resolveMaxTokens(stage) {
+    if (Number.isFinite(stage.maxTokens))
+        return stage.maxTokens;
+    const fromParams = stage.model_params?.max_tokens;
+    return Number.isFinite(fromParams) ? fromParams : 4096;
+}
+async function executeStage(stage, pipeline, ctx, deps, 
+/**
+ * Appended to the prompt on a validation retry. `output_retry` used to
+ * re-run the stage with byte-identical input, which only pays off when the
+ * failure was a one-off transport glitch; a stage whose output shape is
+ * wrong re-rolls the same wrong shape. See runStageWithOutputValidation.
+ */
+correctionHint) {
     const mcpResult = validateMCPConfig(stage.mcp_servers, stage.mcp_tools, deps.validateMCPRefs);
     const workingDir = typeof stage.working_dir === 'string' && stage.working_dir.length > 0
         ? stage.working_dir
@@ -49755,7 +50793,15 @@ async function executeStage(stage, pipeline, ctx, deps) {
         }
     }
     if (hasUses) {
-        let chainedInput = stage.input ?? ctx.inputs;
+        // `inputs:` (plural) is how 16 of the 18 stage blocks in the canonical set
+        // declare per-stage arguments, and `input:` (singular) is how the runtime
+        // has always read them. Nothing ever reconciled the two, so every stage
+        // written the plural way silently received the *pipeline's* inputs instead
+        // of its own — image-captioner's store_caption asks memory_store for a
+        // pipeline_id it never got, and the handler reported "pipeline_id is
+        // required" for an input that was sitting right there in the YAML.
+        const stageInputs = stage.inputs;
+        let chainedInput = stage.input ?? stageInputs ?? ctx.inputs;
         let lastResult = null;
         const nestedCalls = [];
         const usesDetails = [];
@@ -49810,16 +50856,27 @@ async function executeStage(stage, pipeline, ctx, deps) {
             const skillModel = deps.modelResolver.resolveSync(stage, pipeline, skill);
             resolvedModel = skillModel;
             const stageProvider = resolveStageProvider(deps, stage, skillModel);
+            const stageInputsScope = (typeof chainedInput === 'object' && chainedInput !== null && !Array.isArray(chainedInput))
+                ? chainedInput
+                : null;
             const resolvedInput = typeof chainedInput === 'string'
                 ? resolveStageOutputRefs(chainedInput, ctx.previousOutputs)
-                : resolveInputRefs(chainedInput, { inputs: ctx.inputs, previousOutputs: ctx.previousOutputs });
+                // `{{ }}` first, then the `$`-forms. Both are spec'd as supported and
+                // the canonical specs use the double-brace spelling for stage arguments
+                // (see resolveDoubleBraceRefs); tool skills get no context blocks and
+                // no model to guess with, so a literal reaching them fails the stage.
+                : resolveInputRefs(resolveDoubleBraceRefs(chainedInput, {
+                    stageInputs: stageInputsScope,
+                    pipelineInputs: ctx.inputs,
+                    previousOutputs: ctx.previousOutputs,
+                }), { inputs: ctx.inputs, previousOutputs: ctx.previousOutputs });
             if (isToolSkill(use.id)) {
                 const toolT0 = Date.now();
                 const toolResult = await invokeToolSkill(use.id, resolvedInput, {
                     agentId: deps.getCurrentAgentId(),
                 });
                 const toolDurationMs = Date.now() - toolT0;
-                deps.onLlmResponse?.(`${stage.id}:${use.id}`, toolResult.text, 'tool');
+                await deps.onLlmResponse?.(`${stage.id}:${use.id}`, toolResult.text, 'tool');
                 lastResult = {
                     text: toolResult.text,
                     usage: toolResult.usage,
@@ -49833,8 +50890,8 @@ async function executeStage(stage, pipeline, ctx, deps) {
                 });
                 continue;
             }
-            const { result, durationMs } = await invokeSkill(skill, resolvedInput, previousContext, label, stageProvider, stage.retry, retryCtx, stage.output_format);
-            deps.onLlmResponse?.(`${stage.id}:${use.id}`, result.text, skillModel);
+            const { result, durationMs } = await invokeSkill(skill, resolvedInput, previousContext, label, stageProvider, stage.retry, retryCtx, stage.output_format, stage.maxTokens);
+            await deps.onLlmResponse?.(`${stage.id}:${use.id}`, result.text, skillModel);
             lastResult = result;
             chainedInput = { input_from_previous_skill: result.text };
             nestedCalls.push({
@@ -49843,7 +50900,7 @@ async function executeStage(stage, pipeline, ctx, deps) {
                 duration_ms: durationMs,
                 ok: true,
             });
-            const skillCost = await deps.pricing.resolveCostMicroUsdc(skillModel, result.usage);
+            const skillCost = await priceStageCost(deps, use.id, skillModel, result.usage);
             totalCost += skillCost;
             totalUsage = {
                 inputTokens: totalUsage.inputTokens + result.usage.inputTokens,
@@ -49863,10 +50920,21 @@ async function executeStage(stage, pipeline, ctx, deps) {
             ...(workingDir ? { working_dir: workingDir, working_dir_ignored_on_server: workingDirIgnoredOnServer } : {}),
         };
     }
+    // Unresolved `{{ }}` references become `stage.warned` events rather than
+    // console output. A Worker's stdout goes to Cloudflare logs, which the
+    // pipeline's author never opens — so a literal that was meant to be a
+    // reference shipped in the deliverable with nothing anywhere to say so.
+    // Warnings only: the pipeline still runs, because refusing would turn a
+    // cosmetic authoring problem into a failed run the buyer paid for.
+    const onWarning = deps.eventSink
+        ? (message) => {
+            deps.eventSink.emit(makeStageWarnedEvent({ stageId: stage.id, message }));
+        }
+        : undefined;
     const model = deps.modelResolver.resolveSync(stage, pipeline);
     const stageProvider = resolveStageProvider(deps, stage, model);
     const resolvedSystem = stage.system
-        ? resolveSpecialKeys(resolveStageOutputRefs(stage.system, ctx.previousOutputs))
+        ? resolvePromptRefs(stage.system, ctx.inputs, ctx.previousOutputs, onWarning)
         : stage.system;
     const stageProviderName = (stage.provider ?? stageProvider.name);
     // M1 — multimodal prompt path. When stage.prompt is an array of
@@ -49881,38 +50949,58 @@ async function executeStage(stage, pipeline, ctx, deps) {
     const ctxPrefix = previousContext.length > 0 || inputsString.length > 0
         ? `${previousContext}Inputs:\n${inputsString}\n---\n\n`
         : '';
+    // Resolved here rather than inside generateText so a nested
+    // image_url.url and a text part are interpolated by the same walk.
+    const resolvedPromptMessages = isMultimodal
+        ? resolvePromptRefs(rawPrompt, ctx.inputs, ctx.previousOutputs)
+        : null;
     const ran = await runWithRetry(() => isMultimodal
         ? stageProvider.generateText('', {
             model,
             system: resolvedSystem,
             complexity: stage.model?.includes('M3') || stage.model?.includes('opus') ? 'complex' : 'simple',
-            maxTokens: 4096,
+            maxTokens: resolveMaxTokens(stage),
+            ...stageModelParams(stage),
             fields: stage.fields,
             outputFormat: stage.output_format,
-            messages: ctxPrefix.length > 0
+            messages: correctionHint
                 ? [
-                    { role: 'user', content: ctxPrefix },
-                    ...rawPrompt,
+                    ...(ctxPrefix.length > 0 ? [{ role: 'user', content: ctxPrefix }] : []),
+                    { role: 'user', content: correctionHint },
+                    ...(resolvedPromptMessages ?? []),
                 ]
-                : rawPrompt,
+                : ctxPrefix.length > 0
+                    ? [
+                        { role: 'user', content: ctxPrefix },
+                        ...(resolvedPromptMessages ?? []),
+                    ]
+                    : (resolvedPromptMessages ?? []),
         })
         : (() => {
             const stringPrompt = typeof stage.prompt === 'string' ? stage.prompt : '';
-            const resolvedPrompt = resolveSpecialKeys(resolveStageOutputRefs(stringPrompt, ctx.previousOutputs));
-            const prompt = `${previousContext}Inputs:\n${inputsString}\n---\n\n${resolvedPrompt}`;
+            const resolvedPrompt = resolvePromptRefs(stringPrompt, ctx.inputs, ctx.previousOutputs, onWarning);
+            const prompt = `${previousContext}Inputs:\n${inputsString}\n---\n\n${correctionHint ? `${correctionHint}\n\n` : ''}${resolvedPrompt}`;
             return stageProvider.generateText(prompt, {
                 model,
                 system: resolvedSystem,
                 complexity: stage.model?.includes('M3') || stage.model?.includes('opus') ? 'complex' : 'simple',
-                maxTokens: 4096,
+                maxTokens: resolveMaxTokens(stage),
+                ...stageModelParams(stage),
                 fields: stage.fields,
                 outputFormat: stage.output_format,
             });
         })(), stage.retry, retryCtx);
     const result = ran.value;
-    const costMicroUsdc = await deps.pricing.resolveCostMicroUsdc(model, result.usage);
-    deps.onLlmResponse?.(stage.id, result.text, model);
-    validateOutputFormat(result.text, stage.output_format, stage.fields);
+    const costMicroUsdc = await priceStageCost(deps, stage.id, model, result.usage);
+    await deps.onLlmResponse?.(stage.id, result.text, model);
+    // When output_schema is present this stage runs under
+    // runStageWithOutputValidation, which performs this check inside its retry
+    // loop so output_retry can recover a wrong-shaped answer. Throwing here
+    // would pre-empt that loop, so the check is skipped for exactly that case
+    // and nothing else.
+    if (!stage.output_schema) {
+        validateOutputFormat(result.text, stage.output_format, stage.fields);
+    }
     return {
         output: result.text,
         costMicroUsdc,
@@ -49950,16 +51038,21 @@ async function runOneStage(stage, shared) {
     for (const w of collectRuntimeWarnings(stage, shared.constraints)) {
         shared.emit({ type: 'stage.started', at: new Date().toISOString(), stageId, reason: 'normal' });
     }
+    // Substitute `${input.X}` references in provider/model before the resolver
+    // sees them. Without this a stage like `provider: ${input.provider}` reaches
+    // the registry with the verbatim string and throws
+    // `Provider '${input.provider}' is not registered`. Literals pass through.
+    const effectiveStage = resolveStageMetaRefs(stage, shared.opts.inputs);
     const t0 = Date.now();
     try {
-        const stageModel = stage.model ?? shared.opts.spec.defaults?.model ?? 'MiniMax-M3';
+        const stageModel = effectiveStage.model ?? shared.opts.spec.defaults?.model ?? 'MiniMax-M3';
         const stageDeps = shared.opts.providerResolver
             ? { ...shared.opts.deps, provider: shared.opts.providerResolver(stageModel) }
             : shared.opts.deps;
         const stageDepsWithSink = shared.opts.eventSink
             ? { ...stageDeps, eventSink: shared.opts.eventSink }
             : stageDeps;
-        const result = await runStageWithOutputValidation(stage, shared.opts.spec, { inputs: shared.opts.inputs, previousOutputs: shared.outputs }, stageDepsWithSink);
+        const result = await runStageWithOutputValidation(effectiveStage, shared.opts.spec, { inputs: shared.opts.inputs, previousOutputs: shared.outputs }, stageDepsWithSink);
         const ms = Date.now() - t0;
         shared.outputs[stageId] = result.output;
         shared.stageTimings.push({
@@ -50008,30 +51101,109 @@ async function runOneStage(stage, shared) {
  */
 async function runStageWithOutputValidation(stage, pipeline, ctx, deps) {
     const schema = stage.output_schema;
+    // Default was `none` (a single attempt) until M38. `single` is now the
+    // default: the correction hint below makes a retry far more likely to
+    // succeed than a blind re-roll, and the cost is only incurred on a stage
+    // that would otherwise have failed outright.
+    //
+    // An author who wants one attempt still says so — `output_retry: 'none'`
+    // is explicit and unchanged. This changes only the unset case.
+    const mode = isOutputValidationMode(stage.output_retry)
+        ? stage.output_retry
+        : 'single';
     if (!schema) {
+        // No schema means no retry loop, so output_format is enforced inside
+        // executeStage as before.
         return executeStage(stage, pipeline, ctx, deps);
     }
     const schemaCheck = validateJsonSchema(schema);
     if (!schemaCheck.ok) {
         throw new OutputValidationError(stage.id, 1, schemaCheck.violations);
     }
-    const mode = isOutputValidationMode(stage.output_retry)
-        ? stage.output_retry
-        : 'none';
-    const maxAttempts = OUTPUT_VALIDATION_RETRY_ATTEMPTS[mode];
+    const mode2 = mode;
+    const maxAttempts = OUTPUT_VALIDATION_RETRY_ATTEMPTS[mode2];
     let lastViolations = [];
+    // M-diagnostics: capture the raw model output from each attempt so a
+    // final-attempt `OutputValidationError` can carry what the LLM actually
+    // produced, not just a parser-derived summary. Without this, operators
+    // faced with `$: expected type object, got string` were forced to
+    // deduce whether the model emitted JSON, a JSON-in-quotes string, or
+    // a prose block — exactly the diagnostic we now pin next to
+    // `failure_reason` via the server route.
+    let lastRawOutput;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const result = await executeStage(stage, pipeline, ctx, deps);
+        const result = await executeStage(stage, pipeline, ctx, deps, attempt > 1 ? correctionHint(stage.id, schema, lastViolations) : undefined);
+        lastRawOutput = result.output;
+        // output_format first: it is the stricter check, and it used to throw from
+        // inside executeStage — before this loop — which pre-empted output_retry
+        // entirely. That is why a prose answer to a structured_json stage failed
+        // on the first attempt with no correction ever offered, while a schema
+        // mismatch (a softer failure) did retry.
+        try {
+            validateOutputFormat(result.output, stage.output_format, stage.fields);
+        }
+        catch (formatErr) {
+            if (attempt >= maxAttempts) {
+                // Wrap the stricter output_format failure into OutputValidationError
+                // so the server route treats it the same as a schema mismatch:
+                // one error class, one diagnostic payload, one persisted `output_json`.
+                // validateOutputFormat throws StageOutputFormatError with violations
+                // shaped differently than OutputValidationViolation, so we re-shape.
+                const message = formatErr instanceof Error ? formatErr.message : String(formatErr);
+                const truncated = truncateRawOutput(result.output);
+                throw new OutputValidationError(stage.id, attempt, [{ path: '$', message, schema_path: '$' }], formatTruncatedRawOutput(truncated), truncated.truncatedChars);
+            }
+            lastViolations = [{
+                    path: '$',
+                    message: formatErr instanceof Error ? formatErr.message : String(formatErr),
+                    schema_path: '$',
+                }];
+            continue;
+        }
         const validation = validateOutput(result.output, schema);
         if (validation.ok) {
             return result;
         }
         lastViolations = validation.violations;
         if (attempt >= maxAttempts) {
-            throw new OutputValidationError(stage.id, attempt, lastViolations);
+            const truncated = truncateRawOutput(result.output);
+            throw new OutputValidationError(stage.id, attempt, lastViolations, formatTruncatedRawOutput(truncated), truncated.truncatedChars);
         }
     }
-    throw new OutputValidationError(stage.id, maxAttempts, lastViolations);
+    // Unreachable in practice — the loop always `throw`s on the final
+    // attempt — but TypeScript needs a terminator and we keep it
+    // symmetric: attach whatever the most recent attempt produced.
+    const truncated = lastRawOutput !== undefined ? truncateRawOutput(lastRawOutput) : undefined;
+    throw new OutputValidationError(stage.id, maxAttempts, lastViolations, truncated ? formatTruncatedRawOutput(truncated) : undefined, truncated?.truncatedChars);
+}
+/**
+ * Tell the model exactly what its previous answer got wrong.
+ *
+ * `output_retry` re-ran the stage with byte-identical input, so it only helped
+ * when the failure was a transient glitch; a stage that answers in prose when
+ * the schema wants an object just produces prose again. Feeding the violations
+ * back turns the retry into a correction, which is the whole point of having a
+ * retry mode at all.
+ *
+ * The schema is echoed because the model is not shown it — validation happens
+ * after the call returns, so "expected type object, got string" is the first
+ * time it hears about the shape it was supposed to produce.
+ */
+function correctionHint(stageId, schema, violations) {
+    const lines = violations
+        .slice(0, 8)
+        .map((v) => `- ${v.path || '$'}: ${v.message}`)
+        .join('\n');
+    return [
+        `Your previous answer for stage "${stageId}" was rejected by output validation:`,
+        lines,
+        '',
+        'Reply again with ONLY a JSON value matching this schema. No prose, no explanation,',
+        'no markdown code fences — the first character must be { or [ and the last } or ].',
+        '',
+        'Schema:',
+        JSON.stringify(schema, null, 2),
+    ].join('\n');
 }
 async function runPipelineV2(opts) {
     const outputs = {};

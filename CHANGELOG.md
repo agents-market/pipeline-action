@@ -1,24 +1,37 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
-## Unreleased — tag `v1` re-cut, manifest validation added
+## v0.4.5 (2026-10-21) — the CLI package that exists, and the runtime fix
+
+> **Patch release.** Two things that made the Action unusable, plus the runtime
+> fix the `model_params` support depends on.
 
 ### Fixed
 
-- **Tag `v1` pointed at a commit whose `action.yml` was not parseable YAML.** `v1` was cut on 2026-09-26 at `4b899d7` ("v0.2.0 — provider selection"), the same commit as tag `v0.2.0`. That commit reworded `description` to include `(provider: minimax|openai|anthropic|openrouter)` without quoting it. The unquoted scalar contains `: `, which YAML reads as a nested mapping, so the runner rejected the manifest. `v1` has now been re-cut to `6bd47c4` (`v0.4.4` / `main`).
-
-  Impact: every consumer who copied `uses: agents-market/pipeline-action@v1` — the pin the README recommends in six places — got a red check failing at **Set up job** in about three seconds, with a parser error naming neither this repository nor the ref. The breakage predates the quoting fix in `v0.4.3` (2026-09-28) by two days and went unnoticed because this repository had no CI.
-
-  Verified after re-cut: `action.yml?ref=v1` parses, `runs.using=node20`.
-
-- Tag `v0.2.0` is also unparseable and is **deliberately left in place** — a released semver tag is immutable, and rewriting it would silently change the artifact for anyone pinned to that exact version. Consumers on `v0.2.0` should move to `v0.2.1` or later.
+- **The Action installed a package that was never published.** It asked for
+  `agentsmarket/cli`; the published package is `@agentsmarket/cli`. Every run
+  failed at the install step with a 404. The error message now names the
+  version gap and the `AGENTSMARKET_CLI` override instead of reporting a bare
+  "not found".
+- **`model_params` is read by the runtime** (bundled here): a stage can now
+  carry `model_params.temperature` and the runner passes it through, instead of
+  the parameter being silently dropped.
 
 ### Added
 
-- **`.github/workflows/validate.yml`** — first CI in this repository. Parses `action.yml` on every push and every `v*` tag, then asserts the Actions metadata contract: required keys `name` / `description` / `runs`, a recognised `runs.using`, a present `runs.main`, mapping-shaped `inputs` / `outputs`, and that `runs.main` points at a file that exists. A parse failure is reported as `::error::` with the exact line and column rather than a raw traceback, because the message is the whole point of the check.
+- **Server-side execution.** The Action can run the pipeline on the
+  marketplace instead of locally, which is what a paid pipeline needs: the
+  author's price is paid per call, and the spec never leaves the server.
+- **`AGENTSMARKET_CLI`** — override the CLI the Action invokes, for testing a
+  build that is not on npm yet.
 
-  The check was verified against four fixtures: the historical broken `action.yml` (fails, naming line 2 column 71), the current manifest (passes), a manifest missing `runs.main` (fails), and a manifest with `runs.using: node99` (fails).
+## [0.4.3](https://github.com/agents-market/main/compare/pipeline-action-v0.4.2...pipeline-action-v0.4.3) (2026-10-07)
 
----
+
+### Bug Fixes
+
+* **lint:** clear 18 pre-existing tsc errors blocking the lint step ([59cb075](https://github.com/agents-market/main/commit/59cb0750f37db45dfe0fa16796d9456aaf0f5aac))
+* **pipeline-action:** drop findings without file/line metadata; emit findings_skipped_no_metadata counter ([#19](https://github.com/agents-market/main/issues/19)) ([214695b](https://github.com/agents-market/main/commit/214695b513d4c47bf3ae54fa1d2d2f6e82c179dd))
+* **pipeline-action:** remove broken runs.pre + add manifest contract gate ([304435d](https://github.com/agents-market/main/commit/304435d3e42adce07c23bb5e5bfa1d1bf3260f9e))
 
 ## v0.4.3 (2026-09-27) — raw-JSON findings fix + observability (patch)
 
@@ -36,13 +49,46 @@
 - **`humanizeStageId(id)`** — new exported utility Title-Casing snake_case stage IDs in the Actions summary headings (`### profile_style` → `### Profile Style`).
 - **Warning notice in CI logs when `stats.no_file > 0`** — points the operator at the exact prompt field that's missing and references the prompt update needed for the fix to be complete.
 
-### Required companion fix (consumer workflows)
+### Required companion fix chain (Day 49-50 PR chain)
 
-This fix is complete only when the consumer's style-review prompts also require `file` explicitly. See [`web3eco/shared-actions` companion PR](https://github.com/web3eco/shared-actions/pull/29) for the prompt updates to `analyze_style` + `aggregate_style` stages. Without those, the LLM continues emitting `region`/`line_range` and the action correctly drops the findings (with the new warning notice). With the prompt update, findings flow through to inline PR comments as expected.
+v0.4.3 became operationally usable only when the consumer ecosystem caught up. Five coordinated changes landed in order, each gating the next:
+
+#### 1. PR #29: `web3eco/shared-actions` wrapper SIGPIPE fix + prompt update (MERGED 2026-09-27T22:48:25Z, commit `0f9b160`)
+
+- **SIGPIPE on line 102 of the wrapper.** When the LLM emitted an unanchored finding and the wrapper pushed `path: <stageId>` (e.g. `path: "analyze_style"`) to the GitHub PR Comments API, GitHub returned `422 pull_request_review_thread.path "could not be resolved"`. The wrapper re-raised the exception out of the `pipe(...)` subshell, and Bash propagated it as `SIGPIPE` (signal 13) on a closing pipe, masking the real cause. The fix silences the 422 to a non-fatal warning so the rest of the pipeline runs to completion; v0.4.3's `formatFindingsWithStats()` then ensures these never reach the API in the first place.
+- **Prompt updates** to `analyze_style` + `aggregate_style` stages requiring an explicit `file` field instead of the previous `region` / `line_range` style metadata.
+
+#### 2. Monorepo row-113 follow-up: `examples/pipelines/style-review.yaml` (commit `0ad45810`)
+
+The canonical consumer-facing pipeline example in this monorepo's `examples/pipelines/style-review.yaml` was updated to require `file` (and `line`) in the prompt schema. Without this, downstream consumer workflows continue drifting back to the broken prompt that emits `region` / `line_range` and triggers the drop path. With this in place, `formatFindingsWithStats()` stops dropping findings as unanchored metadata.
+
+#### 3. PR #30: `web3eco/shared-actions` yaml pipeline `file` field sync (MERGED 2026-09-27T23:27:17Z)
+
+Mirrors the monorepo follow-up on the shared-actions side: `.github/pipelines/style-review.yaml` in `web3eco/shared-actions` now enforces `file` in the prompt schema. Aligns both canonical pipeline files so consumer repos pulling either source get the corrected prompt.
+
+#### 4. PR #51: `web3eco/blockchain` SHA bump to `a2ef58e` (MERGED 2026-09-27T23:00:14Z)
+
+The first end-to-end validation of the v0.4.3 chain. The consumer repo bumped from `@de0dbbf` (v0.4.1, manifest broken) to `@a2ef58e` (v0.4.3). All 7 CI checks green on PR #51 confirms:
+
+- v0.4.3's manifest contract gate (`scripts/validate-action-manifest.mjs`) accepts the action.
+- `formatFindingsWithStats()` drops unanchored findings cleanly.
+- The shared-actions wrapper handles the residual 422 gracefully (post-#29 SIGPIPE fix).
+- Inline PR comments flow through to GitHub for findings with valid `file` + `line`.
+
+#### 5. Day 50 consumer-side CI prerequisites (PRs #50, #54 in `web3eco/blockchain`)
+
+Unblocks the chain by fixing the consumer repo's CI plumbing before PR #51 could merge.
+
+- **PR #50** lefthook `commit-msg` hook fix. Switched the positional-argument syntax to `{1}` so the conventional-commit message reaches the validator intact.
+- **PR #54** commitlint config rename `.mts` → `.cjs`. Commitlint v19 does not resolve the `.mts` extension on Node 20 by default; renaming to `commitlint.config.cjs` lets the config load.
+
+### Without the companion chain
+
+Without the consumer-side fixes above, the LLM continues emitting `region` / `line_range`. v0.4.3 then correctly drops those findings (with the new warning notice + `findings_skipped_no_metadata` counter); no SIGPIPE, no 422 storm. The chain exists because the goal is inline PR comments, not silent drops.
 
 ### Migration
 
-No action required. All changes are additive and the `formatFindings()` signature is preserved. `v0.4.1` consumers MUST upgrade to `@v0.4.2` or `@v0.4.3` — see the v0.4.2 entry below for the manifest-loading bug fix that v0.4.1 shipped with.
+No action required. All changes are additive and the `formatFindings()` signature is preserved. `v0.4.1` consumers MUST upgrade to `@v0.4.2` or `@v0.4.3`; see the v0.4.2 entry below for the manifest-loading bug fix that v0.4.1 shipped with. Consumer repos running style-review pipelines should also pull the updated `examples/pipelines/style-review.yaml` (or the shared-actions equivalent) so the prompt emits `file` + `line` instead of `region` / `line_range`.
 
 ---
 

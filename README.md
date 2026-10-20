@@ -4,6 +4,10 @@ GitHub Action that runs an agentsmarket `pipeline.yaml` inside a step. Streams e
 
 ## Status
 
+**v0.4.3 — raw-JSON findings fix + observability (patch).** `formatFindings` is split into a back-compat shim + new `formatFindingsWithStats()` that drops findings where `file` defaulted to the stageId (only when `line` is set, so file-level findings without a line still surface in the summary). New `findings_skipped_no_metadata` output exposes the dropped count for downstream gates. `streaming.ts` adds `humanizeStageId()` for Title-Cased per-stage headings (`### profile_style` → `### Profile Style`). Pure additive — no breaking changes. Fixes the analyze_style:73 raw-JSON dump seen on `web3eco/blockchain` PR #47. See [v0.4.3 release notes](https://github.com/agents-market/pipeline-action/releases/tag/v0.4.3).
+
+**v0.4.2 — manifest contract fix.** Removed the broken `runs.pre:` block (was a YAML sequence instead of a JS path — the GH runner refused to load the manifest and the action never ran). v0.3.0..v0.4.1 were silently unrunnable for the same reason; v0.4.2 restores them. Cumulative feature surface is identical to v0.3.1.
+
 **v0.4.1 — consolidation hotfix (cumulative of v0.3.x + v0.4.0).** v0.3.1 wired the 6 PR-review outputs (`findings_json`, `summary_only_findings_json`, `findings_count_json`, `status`, `failed_count`, `max_severity`) to action boundaries; v0.3.2 added `cost_usdc` + `timing_json` machine-readable outputs for downstream observability; v0.3.3 shipped **PR Review deduplication** (TASKS row 102): a single PR Review per commit, edited on subsequent runs via GitHub's PR Review API (`octokit.rest.pulls.createReview` + `updateReview`); v0.3.4 added webhook notifications (Slack/Discord/Teams); v0.4.0 added provider fallback (MiniMax → OpenAI/Anthropic) and SARIF 2.1.0 output format for GitHub Code Scanning. **v0.4.1 is the first cumulative release** — five parallel feature branches were shipped as separate releases while main never received their commits; `@v0.4.0` standalone releases were incomplete. v0.4.1 restores the cumulative contract — every input/output from every merged feature is present in `action.yml`. Backward-compat: set `use_dedup_reviews: false` to fall back to the v0.3.1 issue-comment behaviour. The new `src/post-review.ts` exports `postReview({ octokit, owner, repo, pull_number, commit_sha, findings, severity_threshold, fail_on })` for direct use in `actions/github-script` blocks. All v0.3.0/v0.3.1 features remain: `context_mode` input (`diff | imports | related | full`), exponential backoff retry for 429/5xx, per-job pipeline source cache, pre-step `agentsmarket validate` (catches malformed `pipeline.yaml` before any LLM call, saves $). Build on v0.2.1's provider selection. Pre-step requires `@agentsmarket/cli` (npm, v0.9.0+). LLM-only stages work; `uses:` skill stages surface "skill not found" (R12.2-R12.4 ship marketplace-fetched skills). **Consumer contract:** consumers wire v0.3.1 outputs to GH status checks + PR review threads via `actions/github-script` using the `postReview()` helper. See `examples/integrations/code-review-workflow.yml` for the canonical pattern (shipped in `web3eco/shared-actions/.github/workflows/ai-code-review.yml`).
 
 ## Usage
@@ -37,6 +41,8 @@ jobs:
 | `provider` | no | `minimax` | LLM provider: `minimax` \| `openai` \| `anthropic` \| `openrouter` |
 | `pipeline_file` | no | — | Path to `pipeline.yaml`. Mutually exclusive with `pipeline_yaml` |
 | `pipeline_yaml` | no | — | Inline YAML body. Mutually exclusive with `pipeline_file` |
+| `pipeline` | no | spec `name:` | Marketplace pipeline for server execution: `name` or `name@version`. Bare name runs the newest published version. |
+| `agent_key` | no | `$AGENTSMARKET_PRIVATE_KEY` | Buyer identity for server execution. Setting it (with no provider `*_API_KEY`) is what selects server execution. |
 | `model` | no | `MiniMax-M3` | Default model identifier (must be supported by `provider`) |
 | `inputs_json` | no | `{}` | JSON object passed to pipeline `inputs` |
 | `fail_fast` | no | `true` | Stop on first stage error |
@@ -49,6 +55,56 @@ jobs:
 | `fallback_model` | no | `gpt-4o-mini` | v0.4.0+ — model on the fallback provider. Ignored when fallback is disabled. |
 | `fallback_on_error` | no | `any` | v0.4.0+ — which primary error classes trigger the fallback attempt. One of `rate_limit \| timeout \| server_error \| any`. |
 | `output_format` | no | `summary` | v0.4.0 — Format for downstream findings emission. `summary` (default) keeps v0.3.x behaviour: only the `findings_json` + `summary_only_findings_json` outputs. `sarif` additionally emits `findings_sarif` (SARIF 2.1.0 JSON) for upload to GitHub Code Scanning via `github/codeql-action/upload-sarif@v3`. Pure additive — summary outputs ALWAYS fire regardless of this input. |
+
+## Execution: this runner or the marketplace
+
+The action runs the pipeline in one of two places, and **the keys decide which**:
+
+| you set | the run goes to | you pay | the pipeline author gets |
+|---|---|---|---|
+| `AGENTSMARKET_PRIVATE_KEY` (or `agent_key:`) | the marketplace, `POST /v1/pipelines/:id/invoke` | the marketplace | their `call_price_usdc` |
+| `MINIMAX_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` | this runner | the model provider, in tokens | nothing |
+
+There is no `server_mode` flag. A flag would be a fourth way to say something the
+keys already say, and it would eventually disagree with them.
+
+**Both set → the action stops and tells you.** It will not guess who is paying.
+**Neither set → the action stops and tells you** which keys to pass.
+
+```yaml
+- uses: web3eco/agents-market-pipeline-action@v1
+  with:
+    pipeline_file: .agentsmarket/pipelines/code-review@1.0.1/pipeline.yaml
+    pipeline: code-review          # optional; defaults to the spec's `name:`
+    agent_key: ${{ secrets.AGENTSMARKET_PRIVATE_KEY }}
+```
+
+Pinning: `pipeline: code-review` runs the newest published version;
+`code-review@1.0.1` pins one. With no `pipeline:` at all the action uses the
+`name:` from the installed `pipeline.yaml` and the newest version.
+
+How it executes: the action delegates to the CLI (`npx --yes agentsmarket@latest
+pipeline call <slug> --inputs … --json`) rather than reimplementing the payment
+path. The CLI already resolves the slug, takes the 402 challenge, signs the
+EIP-2612 permit and retries with payment, and each of those has been wrong at
+least once in this repository's history. The version is deliberately unpinned so
+a security release reaches you without a bump here.
+
+Cost outputs on this path report **what you were charged**
+(`total_charged_usdc` — resource cost plus the per-call rent), not the resource
+cost alone, and the `context_mode` multiplier does not apply: the server already
+read the context and billed it. Micro-USDC goes in, dollars come out, exactly as
+on the local path.
+
+`mock: true` always runs locally. A dry run must not spend money.
+
+### Output parity
+
+Both paths emit the same outputs: `stage_<id>_ms`, `stage_<id>_output`,
+`total_cost_usdc`, `findings_json`, `summary_only_findings_json`, `status`,
+`max_severity`, the SARIF body, and the job summary. Server runs get their
+per-stage values from the run's provenance, so a consumer reading
+`stage_<id>_output` keeps working when you switch execution mode.
 
 ## Providers
 
@@ -93,6 +149,7 @@ Each run appends a step-summary report (`$GITHUB_STEP_SUMMARY`) with pipeline na
 | `stage_<id>_ms` | Per-stage wall-clock |
 | `stage_<id>_output` | Per-stage output text |
 | `findings_json` | (PR-review only) `JSON.stringify` of `formatFindings(result.outputs)` — flat array of `ReviewFinding` with severity / file / line / message / cwe / confidence / recommendation. Merged across all stages, deduped by `(file, line, cwe)`. |
+| `findings_skipped_no_metadata` | (v0.4.3+, PR-review only) Integer count of findings dropped by `formatFindingsWithStats()` because they had `file` defaulting to the stageId AND a `line` set (i.e. unanchored inline-comment candidates). Non-zero is a signal to inspect the LLM prompt — it should be emitting explicit `file` paths. Backward-compat: stays `0` when all findings have valid `file` metadata. |
 | `findings_count_json` | (PR-review only) `JSON.stringify` of `{ critical, high, medium, low }` — count by severity across all merged findings. |
 | `summary_only_findings_json` | (PR-review only) `JSON.stringify` of `filterBySeverity(findings, severity_threshold)` — only findings at or above the threshold. Empty array if none. |
 | `status` | (PR-review only) `'passed'` or `'failed'` — based on `computeStatus(findings, fail_on)`. Default fail-on = `critical`. |
@@ -414,7 +471,7 @@ The `postReview()` function is also exported from `dist/index.js` after `pnpm bu
 
 ## PR-review consumer contract
 
-For pipelines that emit `findings[]` (e.g. `code-review-security-audit`, `code-review-vulnerability-detection`, `api-design-reviewer`, `style-review`), the action emits the structured outputs above. **The action does NOT call the GitHub API** — the caller (consumer repo workflow) reads the outputs and posts:
+For pipelines that emit `findings[]` (e.g. `code-review-security-audit`, `api-design-reviewer`, `style-review`), the action emits the structured outputs above. **The action does NOT call the GitHub API** — the caller (consumer repo workflow) reads the outputs and posts:
 
 1. **Inline PR review comments** for `critical` / `high` findings via `gh api ... /repos/{owner}/{repo}/pulls/{n}/comments` (or `actions/github-script`). Each comment carries the severity, optional CWE link, and the recommendation. See `examples/integrations/code-review-workflow.yml` for the canonical pattern.
 2. **A GitHub status check** via `gh api ... /repos/{owner}/{repo}/statuses/{sha}` (or the Checks API). Read `status`, `failed_count`, and `max_severity` — render `success` when `status == passed`, `failure` when `failed`. This is the consumer wiring Agent A is responsible for in web3eco repos.

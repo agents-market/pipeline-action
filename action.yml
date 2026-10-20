@@ -16,6 +16,12 @@ inputs:
   pipeline_yaml:
     description: 'Inline pipeline YAML string. Mutually exclusive with pipeline_file.'
     required: false
+  pipeline:
+    description: 'Marketplace pipeline for server execution: `name` or `name@version`. A bare name runs the newest published version; omit it to use the installed pipeline.yaml `name:`.'
+    required: false
+  agent_key:
+    description: 'Buyer identity for server execution. Defaults to $AGENTSMARKET_PRIVATE_KEY. Setting it (and no provider *_API_KEY) is what selects server execution — that is what pays the pipeline author.'
+    required: false
   model:
     description: 'Default model identifier. Used as the primary model unless `primary_model` is explicitly set.'
     required: false
