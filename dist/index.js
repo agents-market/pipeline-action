@@ -2794,6 +2794,7 @@ exports.findExistingReview = findExistingReview;
 exports.parseEmbeddedFindings = parseEmbeddedFindings;
 exports.buildInlineComments = buildInlineComments;
 exports.countBySeverity = countBySeverity;
+const version_js_1 = __nccwpck_require__(918);
 const output_formatter_js_1 = __nccwpck_require__(750);
 // ---------------------------------------------------------------------------
 // Session marker (contract — do not change without major version bump)
@@ -2853,7 +2854,7 @@ function renderReviewBody(opts) {
     const counts = countBySeverity(findings);
     const status = computeBodyStatus(findings, failOn);
     const lines = [];
-    lines.push(`## AI Code Review (agents-market pipeline-action v0.3.3)`);
+    lines.push(`## AI Code Review (agents-market pipeline-action v${version_js_1.ACTION_VERSION})`);
     lines.push('');
     lines.push(`**Status:** ${status.badge} ${status.label}`);
     lines.push(`**Findings:** ${findings.length} total · `
@@ -3274,7 +3275,7 @@ async function withRetry(fn, opts = {}) {
 /***/ }),
 
 /***/ 795:
-/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
@@ -3303,9 +3304,6 @@ async function withRetry(fn, opts = {}) {
  *   0 — success (skipped stages OK; no failures)
  *   1 — pipeline validation/runtime error
  */
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.ACTION_VERSION = void 0;
 exports.run = run;
@@ -3323,21 +3321,8 @@ const timing_js_1 = __nccwpck_require__(558);
 const fallback_js_1 = __nccwpck_require__(122);
 const notifier_js_1 = __nccwpck_require__(690);
 const sarif_js_1 = __nccwpck_require__(157);
-const package_json_1 = __importDefault(__nccwpck_require__(330));
-/**
- * The version this bundle was built from.
- *
- * It was a hand-written constant, and it lied: the bundle of every tag from
- * v0.4.3 to v0.4.5 printed "pipeline-action v0.4.2" while the tag and
- * package.json said 0.4.3, 0.4.4 and 0.4.5. The log is the only place a
- * consumer can see what actually ran, so a wrong version there sends the
- * audit to a release that never existed — and the drift was invisible,
- * because the comment in the code and the tag agreed with each other.
- *
- * Reading package.json makes the drift impossible: the version is baked in
- * at build time from the same file the release is cut from.
- */
-exports.ACTION_VERSION = package_json_1.default.version;
+const version_js_1 = __nccwpck_require__(918);
+Object.defineProperty(exports, "ACTION_VERSION", ({ enumerable: true, get: function () { return version_js_1.ACTION_VERSION; } }));
 async function run(args) {
     const { params, deps } = args;
     const inputs = params.inputs;
@@ -3387,7 +3372,7 @@ async function run(args) {
     const stageCount = spec.stages.length;
     const pipelineName = spec.name ?? 'unnamed';
     const providerTag = `[provider=${inputs.provider} model=${inputs.model} context=${inputs.context_mode}]`;
-    (0, streaming_js_1.notice)(`▶ pipeline-action v${exports.ACTION_VERSION} — ${pipelineName} (${stageCount} stage${stageCount === 1 ? '' : 's'}) ${providerTag}`);
+    (0, streaming_js_1.notice)(`▶ pipeline-action v${version_js_1.ACTION_VERSION} — ${pipelineName} (${stageCount} stage${stageCount === 1 ? '' : 's'}) ${providerTag}`);
     const stagesForRuntime = spec.stages.map((s) => ({
         id: s.id,
         model: s.model,
@@ -4312,6 +4297,38 @@ async function timeStageAsync(name, body) {
     timings.end(name);
     return { result, timings };
 }
+
+
+/***/ }),
+
+/***/ 918:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ACTION_VERSION = void 0;
+/**
+ * The version this bundle was built from.
+ *
+ * It used to be a hand-written constant, and it lied: the bundle of every tag
+ * from v0.4.3 to v0.4.5 printed "pipeline-action v0.4.2" while the tag and
+ * package.json said 0.4.3, 0.4.4 and 0.4.5. The log is the only place a
+ * consumer can see which release actually ran, so a wrong version there sends
+ * the audit to a release that never existed — and the drift was invisible,
+ * because the comment in the code and the tag agreed with each other.
+ *
+ * Reading package.json makes the drift impossible: the version is baked in
+ * at build time from the same file the release is cut from. It lives in its
+ * own module because two different surfaces print it — the run log and the
+ * review comment the action posts on the PR — and a constant that lives in
+ * one of them is a constant the other one will forget.
+ */
+const package_json_1 = __importDefault(__nccwpck_require__(330));
+exports.ACTION_VERSION = package_json_1.default.version;
 
 
 /***/ }),
@@ -73813,7 +73830,7 @@ async function runPipeline(spec, inputs, opts) {
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"@agentsmarket/pipeline-action","version":"0.4.6","description":"GitHub Action that runs an agentsmarket pipeline.yaml inside a step. Streams stage outputs as GH log groups, sets action outputs on success.","license":"MIT","main":"./dist/index.js","files":["dist","action.yml","README.md","examples"],"scripts":{"build":"rm -rf dist && ncc build -t src/index.ts -o dist","build:check":"tsc --noEmit","test":"vitest run","lint":"tsc --noEmit","dev":"tsx src/run.ts","typecheck":"tsc --noEmit -p tsconfig.json"},"dependencies":{"@agentsmarket/pipeline-runtime":"workspace:*"},"devDependencies":{"@types/node":"^22.20.5","@vercel/ncc":"^0.45.0","tsx":"^4.23.15","typescript":"^5.6.0","vitest":"^4.1.12"},"engines":{"node":">=20"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"@agentsmarket/pipeline-action","version":"0.4.7","description":"GitHub Action that runs an agentsmarket pipeline.yaml inside a step. Streams stage outputs as GH log groups, sets action outputs on success.","license":"MIT","main":"./dist/index.js","files":["dist","action.yml","README.md","examples"],"scripts":{"build":"rm -rf dist && ncc build -t src/index.ts -o dist","build:check":"tsc --noEmit","test":"vitest run","lint":"tsc --noEmit","dev":"tsx src/run.ts","typecheck":"tsc --noEmit -p tsconfig.json"},"dependencies":{"@agentsmarket/pipeline-runtime":"workspace:*"},"devDependencies":{"@types/node":"^22.20.5","@vercel/ncc":"^0.45.0","tsx":"^4.23.15","typescript":"^5.6.0","vitest":"^4.1.12"},"engines":{"node":">=20"}}');
 
 /***/ })
 

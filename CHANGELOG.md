@@ -1,5 +1,19 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## v0.4.7 (2026-10-22) — the version the PR comment names is the version that ran
+
+> **Patch release.** The second surface that printed a version of its own.
+
+### Fixed
+
+- **The review comment the Action posts on the PR said `v0.3.3`** while the
+  package was at 0.4.x. v0.4.6 fixed the run log, which was the surface the
+  drift was noticed on; the PR comment was the same hand-written constant in
+  a second file, and it is the surface a consumer actually reads — a comment
+  that names a release that never existed is worse than a log line that does,
+  because it is quoted in review threads. The version now comes from
+  `package.json` in both places.
+
 ## v0.4.6 (2026-10-22) — the version the log prints is the version that ran
 
 > **Patch release.** The version was a hand-written constant, and it lied.
