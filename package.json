@@ -1,6 +1,6 @@
 {
   "name": "@agentsmarket/pipeline-action",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "GitHub Action that runs an agentsmarket pipeline.yaml inside a step. Streams stage outputs as GH log groups, sets action outputs on success.",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -11,7 +11,7 @@
     "examples"
   ],
   "scripts": {
-    "build": "ncc build -t src/index.ts -o dist",
+    "build": "rm -rf dist && ncc build -t src/index.ts -o dist",
     "build:check": "tsc --noEmit",
     "test": "vitest run",
     "lint": "tsc --noEmit",
@@ -22,11 +22,11 @@
     "@agentsmarket/pipeline-runtime": "^0.5.4"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "@vercel/ncc": "^0.38.3",
-    "tsx": "^4.19.0",
+    "@types/node": "^22.20.5",
+    "@vercel/ncc": "^0.45.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.6.0",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   },
   "engines": {
     "node": ">=20"

@@ -1,5 +1,24 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## v0.4.6 (2026-10-22) — the version the log prints is the version that ran
+
+> **Patch release.** The version was a hand-written constant, and it lied.
+
+### Fixed
+
+- **The bundle printed a version that never existed.** Every tag from v0.4.3
+  to v0.4.5 shipped a bundle that printed `pipeline-action v0.4.2`. The log
+  line is the only place a consumer can see what actually ran, so an audit by
+  log landed on a release that was never cut — and the drift was invisible,
+  because the comment in the code and the tag agreed with each other and only
+  the printed line disagreed. The version is now read from `package.json` at
+  build time, so the bundle cannot drift from the package it was cut from.
+- **The release process can no longer paper over a mismatch.** The publish
+  workflow used to rewrite `package.json` to match the tag and carry on —
+  which is exactly how the drift shipped. It now refuses a tag that does not
+  match the package, and the sync workflow checks the built bundle against
+  `package.json` before it is allowed to push.
+
 ## v0.4.5 (2026-10-21) — the CLI package that exists, and the runtime fix
 
 > **Patch release.** Two things that made the Action unusable, plus the runtime
