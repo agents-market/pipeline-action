@@ -1,5 +1,31 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## v0.4.9 (2026-10-22) — a shell stage runs locally, and only if you say so
+
+> **Minor release.** The Action could not run a `shell:` stage at all: it built
+> the server's dependencies for both modes, so even the local mode was refused
+> by the runtime. Now it runs — and refuses when you did not ask for it.
+
+### Features
+
+- **A local run executes `shell:` stages.** The local mode (your own provider
+  key, no marketplace key) gets `isLocal: true` and a real `NodeShellExecutor` —
+  the same wiring the CLI has. Before, the Action always said `isLocal: false`,
+  so the runtime refused the stage.
+- **New input `allow_shell` (default `false`).** A pipeline from the
+  marketplace can ask to run commands on your runner: your tokens, your
+  secrets, your network. Without this input the run stops and says which
+  stage asks for what — `pipeline "x" asks to run `python3 verify.py` (stage
+  "verify"). Set allow_shell: true if you trust the author`. No mode enables
+  shell stages by default.
+- **The server path always refuses**, opt-in or not: the marketplace is not a
+  place to run commands from a catalogue.
+
+### Fixed
+
+- **The refusal named no stage.** The executor is handed a command, not a
+  stage, so it said `<unknown>`; the runtime now fills in the real stage id.
+
 ## v0.4.7 (2026-10-22) — the version the PR comment names is the version that ran
 
 > **Patch release.** The second surface that printed a version of its own.

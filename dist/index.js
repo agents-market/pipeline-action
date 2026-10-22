@@ -829,6 +829,7 @@ function computeCostInUsdc(usageMicroUsdc, contextModeMultiplier) {
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.decideExecutionMode = decideExecutionMode;
+exports.checkShellConsent = checkShellConsent;
 exports.resolveServerSlug = resolveServerSlug;
 function decideExecutionMode(input) {
     const hasMarketplace = typeof input.marketplaceKey === 'string' && input.marketplaceKey.length > 0;
@@ -869,6 +870,47 @@ function decideExecutionMode(input) {
             'MINIMAX_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENROUTER_API_KEY to run ' +
             'locally (you pay the model tokens yourself).',
     };
+}
+/**
+ * May this run execute the pipeline's `shell:` stages?
+ *
+ * A `shell:` stage runs a command the pipeline author chose, on this runner,
+ * with this runner's tokens, secrets and network. The author is a stranger
+ * until the buyer reads the YAML, so the buyer — not the author, not the
+ * action, not `allow_shell` being quietly true — has to consent.
+ *
+ *   - server mode: never. The server is not a command runner, and letting a
+ *     marketplace flag reach it would turn hosting into arbitrary execution.
+ *   - local mode: only with `allow_shell: true`.
+ *
+ * Returns the reason when the run may not proceed. Silently skipping the
+ * stage instead would leave the pipeline reporting success on work it never
+ * did, so both refusals are hard errors naming the stage and the command.
+ */
+function checkShellConsent(input) {
+    const first = input.stages.find((s) => s.shell !== undefined && s.shell !== null);
+    if (!first)
+        return { ok: true };
+    const stageId = first.id ?? '<no-id>';
+    const spec = input.normalizeShell(first.shell);
+    const command = spec
+        ? [spec.cmd, ...(spec.args ?? [])].join(' ')
+        : String(first.shell).trim();
+    if (input.mode === 'server') {
+        return {
+            error: `pipeline "${input.pipelineName}" asks to run \`${command}\` (stage "${stageId}"), ` +
+                'but the server does not run commands. Run it locally instead: drop ' +
+                'AGENTSMARKET_PRIVATE_KEY so the pipeline executes on your own runner.',
+        };
+    }
+    if (!input.allowShell) {
+        return {
+            error: `pipeline "${input.pipelineName}" asks to run \`${command}\` (stage "${stageId}"). ` +
+                'Set allow_shell: true if you trust the author — the command runs on this runner ' +
+                'with its tokens, secrets and network.',
+        };
+    }
+    return { ok: true };
 }
 /**
  * Which pipeline the marketplace should run.
@@ -929,9 +971,11 @@ function resolveServerSlug(explicit, specName) {
  * verbatim in $GITHUB_STEP_SUMMARY so users can identify missing pieces.
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.localRunSelected = localRunSelected;
 exports.buildExecutorDeps = buildExecutorDeps;
 const pipeline_runtime_1 = __nccwpck_require__(584);
 const inputs_js_1 = __nccwpck_require__(601);
+const execution_mode_js_1 = __nccwpck_require__(2);
 const fallback_js_1 = __nccwpck_require__(122);
 class MockProvider {
     name = 'mock';
@@ -1065,10 +1109,26 @@ function marketplaceOnlyProvider(providerName, modelName) {
         generateJson: refuse,
     };
 }
+/**
+ * Where this run happens.
+ *
+ * The same `decideExecutionMode` the run loop uses, over the same keys, so the
+ * deps can never claim "local" for a run the loop then executes on the
+ * marketplace. `null` means undecidable — no local capability either.
+ */
+function localRunSelected(params) {
+    const decision = (0, execution_mode_js_1.decideExecutionMode)({
+        marketplaceKey: params.inputs.agent_key,
+        providerKey: (0, inputs_js_1.resolveApiKeyForProvider)(params.inputs.api_key, params.inputs.primary_provider),
+        mock: params.inputs.mock,
+    });
+    return decision.mode === 'local';
+}
 async function buildExecutorDeps(params) {
     const apiKey = params.inputs.api_key;
     const primaryProviderName = params.inputs.primary_provider;
     const primaryModel = params.inputs.primary_model;
+    const isLocal = localRunSelected(params);
     const primary = params.inputs.mock
         ? new MockProvider()
         : apiKey
@@ -1110,7 +1170,11 @@ async function buildExecutorDeps(params) {
         fetchSkill: async () => null,
         getCurrentAgentId: () => '0xaction-runner',
         getPipelineAuthorId: () => '0xaction-runner',
-        isLocal: false,
+        // A local run really is local: working_dir is honoured and `shell:` stages
+        // have a runner. The marketplace path keeps none of that — the server
+        // executes, and refuses shell itself.
+        isLocal,
+        ...(isLocal ? { shellExecutor: new pipeline_runtime_1.NodeShellExecutor() } : {}),
         context_mode: params.inputs.context_mode,
     };
     return deps;
@@ -1910,6 +1974,7 @@ function readInputs(env = process.env) {
         fail_fast: readEnvBool('INPUT_FAIL_FAST', true),
         mock: readEnvBool('INPUT_MOCK', false),
         context_mode: normalizeContextMode(process.env.INPUT_CONTEXT_MODE),
+        allow_shell: readEnvBool('INPUT_ALLOW_SHELL', false),
         primary_provider: primaryProvider,
         primary_model: primaryModel,
         fallback_provider: fallbackResolved.provider,
@@ -3386,6 +3451,7 @@ async function run(args) {
         mcp_tools: s.mcp_tools,
         working_dir: s.working_dir,
         provider: s.provider,
+        shell: s.shell,
     }));
     const startedAt = Date.now();
     let result;
@@ -3405,6 +3471,20 @@ async function run(args) {
         return 1;
     }
     (0, streaming_js_1.notice)(`  execution: ${mode.mode} — ${mode.reason}`);
+    // A `shell:` stage runs an author-chosen command on this runner. Consent is
+    // the buyer's, checked before anything executes, and never available on the
+    // marketplace path where the server is the host.
+    const shellConsent = (0, execution_mode_js_1.checkShellConsent)({
+        mode: mode.mode,
+        pipelineName,
+        allowShell: inputs.allow_shell,
+        stages: spec.stages,
+        normalizeShell: pipeline_runtime_1.normalizeShellStage,
+    });
+    if ('error' in shellConsent) {
+        (0, streaming_js_1.error)(`✗ ${shellConsent.error}`);
+        return 1;
+    }
     // ---- Stage 3/4: run_pipeline ----
     timings.start('run_pipeline');
     if (mode.mode === 'server') {
@@ -67009,10 +67089,12 @@ function isOutputValidationMode(value) {
  * Useful for: running tests, linting, formatting, refactoring tools that
  * live on the local machine.
  *
- * **Server-side is REJECTED.** Cloudflare Workers cannot spawn child
- * processes. A pipeline with shell stages works only via `pipeline call
- * --local`. The server explicitly throws `ShellStageUnsupportedError` so
- * the user gets a clear 400 instead of a confusing 500.
+ * **Hosts that cannot spawn are REJECTED by their executor.** Cloudflare
+ * Workers have no child processes, so the server supplies a
+ * `ThrowingShellExecutor` whose reason says so. The runtime only asks
+ * whether an executor exists — whether it can actually run the command is the
+ * executor's own answer, which is what lets a sandboxed server work without a
+ * change here.
  *
  * **Execution model:**
  *   - `spawn(cmd, args, { shell: false })` — no shell interpretation, args
@@ -67649,11 +67731,12 @@ correctionHint) {
         throw new StageBadConfigError(`Stage '${stage.id}' requires one of: 'shell' (shell stage, CLI --local only), 'uses' (skill stage), 'model'+'prompt' (LLM stage), 'loop' (M6.2 iterative executor), or just 'prompt' with default model`);
     }
     if (hasShell) {
+        // Whether this environment can spawn processes is the executor's call, not
+        // the runtime's: only the executor knows if it lives behind a sandbox. A
+        // host with no shell capability supplies `ThrowingShellExecutor` and gets
+        // the same clear error with its own reason.
         if (!deps.shellExecutor) {
             throw new ShellStageUnsupportedError(stage.id, 'no shell executor is configured for this run');
-        }
-        if (!deps.isLocal) {
-            throw new ShellStageUnsupportedError(stage.id, 'shell stages require CLI invocation with --local; the server cannot spawn child processes');
         }
         const spec = normalizeShellStage(stage.shell);
         if (!spec) {
@@ -67689,6 +67772,13 @@ correctionHint) {
             }
             if (e instanceof ShellStageTimeoutError) {
                 throw new StageBadConfigError(`Stage '${stage.id}' ${e.message}`);
+            }
+            // The executor may not know which stage it was called for — it is handed
+            // a command, not a stage. The runtime does know, so the stage id is
+            // filled in here: an error that says "<unknown>" tells the reader
+            // nothing about which stage to look at.
+            if (e instanceof ShellStageUnsupportedError && e.stageId === '<unknown>') {
+                throw new ShellStageUnsupportedError(stage.id, e.reason);
             }
             throw e;
         }
@@ -68424,8 +68514,18 @@ function analyzeCapabilities(spec) {
         has_composition: deriveHasComposition(stages),
         has_when: deriveHasWhen(stages),
         has_retry: deriveHasRetry(stages),
-        capabilities_schema_version: 1,
+        has_shell: deriveHasShell(stages),
+        capabilities_schema_version: 2,
     };
+}
+/** A stage with a `shell:` runs a command — where it runs is the host's problem. */
+function deriveHasShell(stages) {
+    return stages.some((s) => {
+        const shell = s.shell;
+        if (typeof shell === 'string')
+            return shell.trim().length > 0;
+        return shell !== undefined && shell !== null;
+    });
 }
 function deriveNetwork(stages) {
     let hasLLM = false;
@@ -73830,7 +73930,7 @@ async function runPipeline(spec, inputs, opts) {
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"@agentsmarket/pipeline-action","version":"0.4.8","description":"GitHub Action that runs an agentsmarket pipeline.yaml inside a step. Streams stage outputs as GH log groups, sets action outputs on success.","license":"MIT","main":"./dist/index.js","files":["dist","action.yml","README.md","examples"],"scripts":{"build":"rm -rf dist && ncc build -t src/index.ts -o dist","build:check":"tsc --noEmit","test":"vitest run","lint":"tsc --noEmit","dev":"tsx src/run.ts","typecheck":"tsc --noEmit -p tsconfig.json"},"dependencies":{"@agentsmarket/pipeline-runtime":"workspace:^"},"devDependencies":{"@types/node":"^22.20.5","@vercel/ncc":"^0.45.0","tsx":"^4.23.15","typescript":"^5.6.0","vitest":"^4.1.12"},"engines":{"node":">=20"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"@agentsmarket/pipeline-action","version":"0.4.9","description":"GitHub Action that runs an agentsmarket pipeline.yaml inside a step. Streams stage outputs as GH log groups, sets action outputs on success.","license":"MIT","main":"./dist/index.js","files":["dist","action.yml","README.md","examples"],"scripts":{"build":"rm -rf dist && ncc build -t src/index.ts -o dist","build:check":"tsc --noEmit","test":"vitest run","lint":"tsc --noEmit","dev":"tsx src/run.ts","typecheck":"tsc --noEmit -p tsconfig.json"},"dependencies":{"@agentsmarket/pipeline-runtime":"workspace:^"},"devDependencies":{"@types/node":"^22.20.5","@vercel/ncc":"^0.45.0","tsx":"^4.23.15","typescript":"^5.6.0","vitest":"^4.1.12"},"engines":{"node":">=20"}}');
 
 /***/ })
 

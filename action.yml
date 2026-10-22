@@ -42,6 +42,10 @@ inputs:
     description: "How much code context the LLM sees beyond the PR diff. 'diff' = PR diff only (cost ~1x). 'imports' (default) = diff + imported types (~3x). 'related' = diff + files importing changed files (~10x). 'full' = diff + all .ts/.py files in repo (~100x). Actual fetching is pipeline-runtime's responsibility; this input only declares the wiring."
     required: false
     default: 'imports'
+  allow_shell:
+    description: "Allow a `shell:` stage in the pipeline to run a command on this runner. Default `false`: a shell stage executes an author-chosen command with this runner's tokens, secrets and network, so the pipeline author gets no say — only you do. Read the `shell:` lines of pipeline.yaml, then set this to `true` if you trust them. Never has an effect in server mode (marketplace key set): the server does not run commands and always refuses such a pipeline."
+    required: false
+    default: 'false'
   use_dedup_reviews:
     description: 'v0.3.3+ — When true (default), the bundled `postReview()` helper posts a single PR Review per commit and edits it on subsequent runs via the PR Review API (anchored to a session marker). When false, falls back to the v0.3.1 behaviour of posting a new issue-style comment per pipeline run (no dedup). Set to false if a consumer wants the legacy behaviour for any reason.'
     required: false
