@@ -1,5 +1,22 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## v0.4.11 (2026-10-28) — the dry run works on a real spec
+
+> **Patch release.** Found the same way the three defects of v0.4.10 were
+> found: by running the published bundle against a spec that names its
+> provider.
+
+### Fixed
+
+- **A mock run died on every real spec.** Every published spec names its
+  provider in every stage, and a stage that names a provider is looked up in
+  the registry — where a mock run registers only `mock`. So the mock run died
+  with `Provider 'minimax' is not registered. Available providers: mock`.
+  The dry run, the one thing a consumer runs before spending money, was the
+  one thing that could not run. The run is now told it is a mock run, and
+  the mock answers whatever the stage declares — the same move the CLI
+  makes for its `--mock`.
+
 ## v0.4.10 (2026-10-28) — the declared defaults reach the stage, and the fallback stops killing it
 
 > **Patch release.** Three defects, found by running the published `dist` of

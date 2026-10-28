@@ -1179,6 +1179,12 @@ async function buildExecutorDeps(params) {
         provider,
         registry,
         pricing,
+        // A mock run calls the mock, whatever the stage declares. A stage that
+        // names a provider is resolved against the registry, and the registry
+        // holds only 'mock' — so a mock run of a real spec died with "Provider
+        // 'minimax' is not registered. Available providers: mock". The CLI does
+        // the same for its --mock.
+        forceMock: params.inputs.mock,
         modelResolver: (0, pipeline_runtime_1.createModelResolver)({ agentDefault: primaryModel }),
         fetchSkill: async () => null,
         getCurrentAgentId: () => '0xaction-runner',
@@ -57511,7 +57517,7 @@ async function runPipeline(spec, inputs, opts) {
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"@agentsmarket/pipeline-action","version":"0.4.10","description":"GitHub Action that runs an agentsmarket pipeline.yaml inside a step. Streams stage outputs as GH log groups, sets action outputs on success.","license":"MIT","main":"./dist/index.js","files":["dist","action.yml","README.md","examples"],"scripts":{"build":"rm -rf dist && ncc build -t src/index.ts -o dist","build:check":"tsc --noEmit","test":"vitest run","lint":"tsc --noEmit","dev":"tsx src/run.ts","typecheck":"tsc --noEmit -p tsconfig.json"},"dependencies":{"@agentsmarket/pipeline-runtime":"workspace:^"},"devDependencies":{"@types/node":"^22.20.5","@vercel/ncc":"^0.45.0","tsx":"^4.23.15","typescript":"^5.6.0","vitest":"^4.1.12"},"engines":{"node":">=20"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"@agentsmarket/pipeline-action","version":"0.4.11","description":"GitHub Action that runs an agentsmarket pipeline.yaml inside a step. Streams stage outputs as GH log groups, sets action outputs on success.","license":"MIT","main":"./dist/index.js","files":["dist","action.yml","README.md","examples"],"scripts":{"build":"rm -rf dist && ncc build -t src/index.ts -o dist","build:check":"tsc --noEmit","test":"vitest run","lint":"tsc --noEmit","dev":"tsx src/run.ts","typecheck":"tsc --noEmit -p tsconfig.json"},"dependencies":{"@agentsmarket/pipeline-runtime":"workspace:^"},"devDependencies":{"@types/node":"^22.20.5","@vercel/ncc":"^0.45.0","tsx":"^4.23.15","typescript":"^5.6.0","vitest":"^4.1.12"},"engines":{"node":">=20"}}');
 
 /***/ })
 
