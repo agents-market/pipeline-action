@@ -1,5 +1,49 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## v0.4.10 (2026-10-28) — the declared defaults reach the stage, and the fallback stops killing it
+
+> **Patch release.** Three defects, found by running the published `dist` of
+> v0.4.9 against the seven published specs — not by reading the code. Every
+> one of them killed a consumer's run, and two of them killed it with a
+> message that pointed away from the cause.
+
+### Fixed
+
+- **The Action did not merge the declared defaults of the inputs.** A spec
+  declares `inputs: { provider: { default: minimax }, model: { default:
+  MiniMax-M3 } }` and a stage reads `${input.provider}`. The CLI and the
+  server merged those defaults; the Action handed the runtime the consumer's
+  `inputs_json` as it was, so the reference stayed literal text and the run
+  died with `Provider '${input.provider}' is not registered`. That is the
+  exact rollback of 3.3.2 (22.10) — the one that killed the review of every
+  consumer with a single secret. The Action now merges the same way, and an
+  input the consumer DID pass is never overwritten by its default.
+- **An active fallback renamed the provider and broke every spec that names
+  one.** The wrapper called itself `fallback` and the registry was built from
+  that one wrapper, so a stage asking for its own provider (`provider:
+  ${input.provider}` = `openai`) found nothing and died with `Provider
+  'openai' is not registered. Available providers: fallback`. All seven
+  published specs name their provider in all 21 stages, so they died as soon
+  as a fallback was configured — and a fallback is configured by default. The
+  wrapper now answers to the primary provider's name (it IS the primary, with
+  a second chance attached), and the fallback is registered under its own
+  name, so both are found.
+- **A fallback that could not be built died in silence.** The error from
+  `pickProvider` was swallowed into `fallback = null`, so the run had no
+  fallback and no message about it — the configuration mistake was invisible.
+  The Action now says why the fallback is gone: `[fallback] disabled: …`.
+- **The list of models had two sources of truth.** The registry promised one
+  set of ids, the adapters enforced another, and they had drifted: the openai
+  adapter did not know `gpt-4o-mini` (the Action's own default fallback
+  model), the anthropic adapter knew three of the five ids the registry
+  promised, and the openrouter adapter listed six ids of which four do not
+  exist on OpenRouter — including the only real MiniMax id there
+  (`minimax/minimax-m3`), which made MiniMax through OpenRouter impossible.
+  The adapters now read the registry, so the promise the registry makes is the
+  promise the runtime keeps. The default model of the openrouter adapter is
+  `openai/gpt-4o` now: the old one (`MiniMax/MiniMax-M2.7`) does not exist on
+  OpenRouter, so a stage without an explicit model called a 404.
+
 ## v0.4.9 (2026-10-22) — a shell stage runs locally, and only if you say so
 
 > **Minor release.** The Action could not run a `shell:` stage at all: it built
@@ -501,7 +545,7 @@ The row-109 SHA bump from `@258891e` (v0.2.1) to `@de0dbbf` (v0.3.1) **fails** a
 - New action input `fail_on` (env var `INPUT_FAIL_ON`, default `'critical'`). Same self-contained env-var-read pattern as `severity_threshold`.
 - New action outputs `status` (passed/failed), `failed_count` (integer), `max_severity` (highest severity or empty).
 - Step-summary adds a `| Status |` row with ✅/❌ badge + failing count + max severity.
-- **Pipeline-action itself does NOT call the GitHub API.** Consumer workflows read these outputs and post the status check via `gh api` or `actions/github-script` — see `README.md` "PR-review consumer contract" + `examples/integrations/code-review-workflow.yml` for the canonical pattern.
+- **Pipeline-action itself does NOT call the GitHub API.** Consumer workflows read these outputs and post the status check via `gh api` or `actions/github-script` — see `README.md` "PR-review consumer contract" + `github-workflows/workflows/ai-code-review.yml` for the canonical pattern.
 
 ### Tests (152 passing, 1 skipped)
 - `tests/inputs.test.ts` — 8 new tests for `normalizeContextMode`.
