@@ -973,7 +973,7 @@ function resolveServerSlug(explicit, specName) {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.localRunSelected = localRunSelected;
 exports.buildExecutorDeps = buildExecutorDeps;
-const pipeline_runtime_1 = __nccwpck_require__(6650);
+const pipeline_runtime_1 = __nccwpck_require__(2424);
 const inputs_js_1 = __nccwpck_require__(1601);
 const execution_mode_js_1 = __nccwpck_require__(5002);
 const fallback_js_1 = __nccwpck_require__(4122);
@@ -985,21 +985,46 @@ class MockProvider {
     supports(model) {
         return this.models.includes(model);
     }
-    async generateText(prompt, _opts) {
+    async generateText(prompt, opts) {
+        // One mock answer for every path that runs a pipeline without a model
+        // (the runtime's `mockStageAnswer`): the schema first, then the fields,
+        // then a placeholder. The echo this replaced was never JSON, and every
+        // published spec answers in `structured_json` — so `mock: true` could
+        // not run a single one of them.
+        const o = opts;
+        const structured = (0, pipeline_runtime_1.mockStageAnswer)({
+            outputFormat: o?.outputFormat,
+            fields: o?.fields,
+            outputSchema: o?.outputSchema,
+        });
+        if (structured !== undefined) {
+            return {
+                text: structured,
+                usage: { inputTokens: prompt.length, outputTokens: 50 },
+            };
+        }
         return {
             text: `[mock pipeline-action] echo: ${prompt.slice(0, 180)}`,
             usage: { inputTokens: prompt.length, outputTokens: 50 },
         };
     }
     /**
-     * `generateText` always prefixes the echoed prompt, so its output is never
-     * parseable JSON — the mock can never satisfy a real schema, which is the
-     * point: a `structured_json` stage on a mock run must not silently invent a
-     * value that validates. Callers get the raw echo under `mock_response`.
+     * The answer comes from `generateText`, so it is the same answer the stage
+     * would have got from a model — a JSON object that satisfies the schema.
+     *
+     * The old mock always answered `{mock_response: …}`, on the grounds that a
+     * mock must not invent a value that validates: a dry run would then prove
+     * nothing. That is true of the *check*, not of the *answer* — the check
+     * still runs, and the mock answer satisfies the schema by construction.
      */
     async generateJson(prompt, _schema, opts) {
         const { text } = await this.generateText(prompt, opts);
-        return { mock_response: text };
+        try {
+            return JSON.parse(text);
+        }
+        catch {
+            return { mock_response: text };
+        }
     }
 }
 const zeroPricing = {
@@ -3400,7 +3425,7 @@ async function withRetry(fn, opts = {}) {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.ACTION_VERSION = void 0;
 exports.run = run;
-const pipeline_runtime_1 = __nccwpck_require__(6650);
+const pipeline_runtime_1 = __nccwpck_require__(2424);
 const streaming_js_1 = __nccwpck_require__(9834);
 const inputs_js_1 = __nccwpck_require__(1601);
 const retry_js_1 = __nccwpck_require__(7464);
@@ -3466,20 +3491,15 @@ async function run(args) {
     const pipelineName = spec.name ?? 'unnamed';
     const providerTag = `[provider=${inputs.provider} model=${inputs.model} context=${inputs.context_mode}]`;
     (0, streaming_js_1.notice)(`▶ pipeline-action v${version_js_1.ACTION_VERSION} — ${pipelineName} (${stageCount} stage${stageCount === 1 ? '' : 's'}) ${providerTag}`);
+    // The stage goes to the runtime WHOLE. The copy used to be a whitelist of
+    // fourteen fields, and everything it did not name was dropped: the
+    // `output_schema` (so the schema was never checked on the runner, while
+    // the marketplace checked it), `output_retry`, `when`, `loop`, `retry`,
+    // `maxTokens`, `model_params`, `depends_on`, `inputs`. A local run was
+    // therefore a different, laxer pipeline than the paid one — green here,
+    // OUTPUT_VALIDATION_FAILED there.
     const stagesForRuntime = spec.stages.map((s) => ({
-        id: s.id,
-        model: s.model,
-        system: s.system,
-        prompt: s.prompt,
-        uses: s.uses,
-        input: s.input,
-        output_format: s.output_format,
-        fields: s.fields,
-        mcp_servers: s.mcp_servers,
-        mcp_tools: s.mcp_tools,
-        working_dir: s.working_dir,
-        provider: s.provider,
-        shell: s.shell,
+        ...s,
     }));
     const startedAt = Date.now();
     let result;
@@ -20592,7 +20612,7 @@ function checkMemorySyncInterval(ms, option) {
 
 /***/ }),
 
-/***/ 6650:
+/***/ 2424:
 /***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
 
 "use strict";
@@ -20636,6 +20656,7 @@ __nccwpck_require__.d(__webpack_exports__, {
   MAX_VALIDATION_DEPTH: () => (/* reexport */ MAX_VALIDATION_DEPTH),
   MEMORY_SCHEMA_VERSION: () => (/* reexport */ MEMORY_SCHEMA_VERSION),
   MIN_OUTPUT_EXPIRES_IN: () => (/* reexport */ MIN_OUTPUT_EXPIRES_IN),
+  MOCK_STRUCTURED_JSON_EMPTY: () => (/* reexport */ MOCK_STRUCTURED_JSON_EMPTY),
   MiniMaxPricingResolver: () => (/* reexport */ MiniMaxPricingResolver),
   MiniMaxProvider: () => (/* reexport */ MiniMaxProvider),
   MissingEnvVarError: () => (/* reexport */ MissingEnvVarError),
@@ -20685,6 +20706,7 @@ __nccwpck_require__.d(__webpack_exports__, {
   assertMultimodalSupported: () => (/* reexport */ assertMultimodalSupported),
   buildCheckpoint: () => (/* reexport */ buildCheckpoint),
   buildMockProvider: () => (/* reexport */ buildMockProvider),
+  buildMockStructuredJson: () => (/* reexport */ buildMockStructuredJson),
   collectRuntimeWarnings: () => (/* reexport */ collectRuntimeWarnings),
   computeBackoffMs: () => (/* reexport */ computeBackoffMs),
   computeCoverage: () => (/* reexport */ computeCoverage),
@@ -20734,6 +20756,7 @@ __nccwpck_require__.d(__webpack_exports__, {
   makeWhenResolve: () => (/* reexport */ makeWhenResolve),
   mergeRuntimeConstraints: () => (/* reexport */ mergeRuntimeConstraints),
   migrateProviderField: () => (/* reexport */ migrateProviderField),
+  mockStageAnswer: () => (/* reexport */ mockStageAnswer),
   mockValueForField: () => (/* reexport */ mockValueForField),
   mockValueForSchema: () => (/* reexport */ mockValueForSchema),
   normalizeShellStage: () => (/* reexport */ normalizeShellStage),
@@ -57252,6 +57275,123 @@ async function runTestSuite(specs, opts = {}) {
     return results;
 }
 
+;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/mock-answer.js
+/**
+ * One mock answer for every path that runs a pipeline without a model.
+ *
+ * There were three mocks, and they answered differently:
+ *
+ *   - the runtime's schema mock (`pipeline test`) built an answer that
+ *     satisfies the stage's `output_schema`;
+ *   - the CLI's mock (`--mock`) built an answer from the stage's `fields`;
+ *   - the Action's mock (`mock: true`) echoed the prompt.
+ *
+ * So the same spec passed in one place and failed in another, and the
+ * failure looked like a defect in the spec. The Action's mock was the worst
+ * of the three: every published spec answers in `structured_json`, and an
+ * echo is not JSON, so `mock: true` could not run any of them — the dry run
+ * was the one thing that did not work.
+ *
+ * The answer is now built in one order, and every path uses it:
+ *
+ *   1. a schema, if the stage declares one — the answer satisfies it;
+ *   2. the field paths, if the stage declares them — the answer has them;
+ *   3. `structured_json` with neither — an empty placeholder;
+ *   4. anything else — the caller answers with its own prose (a mock is a
+ *      provider, and prose is the caller's business).
+ *
+ * The honest limit: a mock answer satisfies a schema **by construction**, so
+ * a mock run proves the spec is executable — it does not prove the model can
+ * satisfy the schema. That is what a dry run is for.
+ */
+
+/** The answer for a stage that asks for JSON but declares neither a schema nor fields. */
+const MOCK_STRUCTURED_JSON_EMPTY = '{"_mock":true,"output":"<replace with real LLM JSON>"}';
+/**
+ * A JSON object that has every field path the stage asks for.
+ *
+ * The paths are the ones the runtime's own check resolves — `name`,
+ * `name[0]`, `name[*]` — because a mock answer that the check cannot find is
+ * a mock answer that fails. The old builder answered dotted numeric paths
+ * (`findings.0.title`) as nested OBJECTS, and the check looks for an array
+ * index there, so the mock and the check disagreed about the same path.
+ */
+function buildMockStructuredJson(fields) {
+    const root = { _mock: true };
+    for (const field of fields) {
+        const steps = parseFieldSteps(field);
+        if (steps.length === 0)
+            continue;
+        setSteps(root, steps, 'mock');
+    }
+    return JSON.stringify(root);
+}
+/** The steps of a field path, or [] for a path the runtime's check cannot resolve either. */
+function parseFieldSteps(field) {
+    const steps = [];
+    for (const raw of field.replace(/^\$\.?/, '').split('.')) {
+        if (!raw)
+            continue;
+        const m = raw.match(/^([A-Za-z_][A-Za-z0-9_]*)((?:\[\d+\]|\[\*\])*)$/);
+        if (!m)
+            return [];
+        steps.push({ kind: 'key', key: m[1] });
+        for (const im of (m[2] ?? '').matchAll(/\[(\d+|\*)\]/g)) {
+            steps.push({ kind: 'index', index: im[1] === '*' ? 0 : Number(im[1]) });
+        }
+    }
+    return steps;
+}
+function setSteps(root, steps, value) {
+    let cur = root;
+    for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        const last = i === steps.length - 1;
+        if (step.kind === 'key') {
+            const holder = cur;
+            if (last) {
+                holder[step.key] = value;
+                return;
+            }
+            // The next step decides what the container is: an index needs an array.
+            const nextIsIndex = steps[i + 1].kind === 'index';
+            if (typeof holder[step.key] !== 'object' || holder[step.key] === null) {
+                holder[step.key] = nextIsIndex ? [] : {};
+            }
+            cur = holder[step.key];
+            continue;
+        }
+        if (!Array.isArray(cur))
+            return;
+        while (cur.length <= step.index)
+            cur.push({});
+        if (last) {
+            cur[step.index] = value;
+            return;
+        }
+        if (typeof cur[step.index] !== 'object' || cur[step.index] === null)
+            cur[step.index] = {};
+        cur = cur[step.index];
+    }
+}
+/**
+ * The mock's answer to a stage, or `undefined` when the stage does not ask
+ * for JSON (the caller answers with prose then).
+ */
+function mockStageAnswer(opts) {
+    const { outputFormat, fields, outputSchema } = opts;
+    if (outputSchema) {
+        return JSON.stringify(mockValueForSchema(outputSchema));
+    }
+    if (Array.isArray(fields) && fields.length > 0) {
+        return buildMockStructuredJson(fields);
+    }
+    if (outputFormat === 'structured_json') {
+        return MOCK_STRUCTURED_JSON_EMPTY;
+    }
+    return undefined;
+}
+
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/testing/reporters/text.js
 function colorize(s, code) {
     if (process.env.NO_COLOR === '1')
@@ -57427,6 +57567,7 @@ async function runConformanceDir(dir, opts = {}) {
 
 
 
+
 ;// CONCATENATED MODULE: ../pipeline-runtime/dist/index.js
 /**
  * @agentsmarket/pipeline-runtime — multi-stage AI workflow executor.
@@ -57517,7 +57658,7 @@ async function runPipeline(spec, inputs, opts) {
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"@agentsmarket/pipeline-action","version":"0.4.11","description":"GitHub Action that runs an agentsmarket pipeline.yaml inside a step. Streams stage outputs as GH log groups, sets action outputs on success.","license":"MIT","main":"./dist/index.js","files":["dist","action.yml","README.md","examples"],"scripts":{"build":"rm -rf dist && ncc build -t src/index.ts -o dist","build:check":"tsc --noEmit","test":"vitest run","lint":"tsc --noEmit","dev":"tsx src/run.ts","typecheck":"tsc --noEmit -p tsconfig.json"},"dependencies":{"@agentsmarket/pipeline-runtime":"workspace:^"},"devDependencies":{"@types/node":"^22.20.5","@vercel/ncc":"^0.45.0","tsx":"^4.23.15","typescript":"^5.6.0","vitest":"^4.1.12"},"engines":{"node":">=20"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"@agentsmarket/pipeline-action","version":"0.4.12","description":"GitHub Action that runs an agentsmarket pipeline.yaml inside a step. Streams stage outputs as GH log groups, sets action outputs on success.","license":"MIT","main":"./dist/index.js","files":["dist","action.yml","README.md","examples"],"scripts":{"build":"rm -rf dist && ncc build -t src/index.ts -o dist","build:check":"tsc --noEmit","test":"vitest run","lint":"tsc --noEmit","dev":"tsx src/run.ts","typecheck":"tsc --noEmit -p tsconfig.json"},"dependencies":{"@agentsmarket/pipeline-runtime":"workspace:^"},"devDependencies":{"@types/node":"^22.20.5","@vercel/ncc":"^0.45.0","tsx":"^4.23.15","typescript":"^5.6.0","vitest":"^4.1.12"},"engines":{"node":">=20"}}');
 
 /***/ })
 

@@ -1,5 +1,36 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## v0.4.12 (2026-10-28) — the mock run answers the schema, and the local run is the paid run
+
+> **Patch release.** The mock fix of v0.4.11 was half a fix: it made the mock
+> reach the stage, and then the stage refused the answer. Found by running the
+> published bundle against the seven published specs.
+
+### Fixed
+
+- **A mock run could not pass a `structured_json` stage.** The mock echoed
+  the prompt, and an echo is not JSON: `LLM output is not valid JSON:
+  Unexpected token 'm', "[mock pipel"... is not valid JSON`. Every published
+  spec answers in `structured_json`, so `mock: true` — the dry run a consumer
+  does before spending money — could not run a single one of them. The mock
+  now answers the way the runtime's own schema mock does: by the schema the
+  stage declares, then by the field paths, then by a placeholder. One
+  implementation, shared with the CLI (`mockStageAnswer` in
+  `pipeline-runtime`).
+- **A local run was a laxer pipeline than the paid one.** The stage was
+  copied into the runtime by a whitelist of fourteen fields, and everything
+  it did not name was dropped: `output_schema` (so the schema was never
+  checked on the runner, while the marketplace checked it), `output_retry`,
+  `when`, `loop`, `retry`, `maxTokens`, `model_params`, `depends_on`,
+  `inputs`, `needs`, `requires`, `uses_version`. A spec could be green
+  locally and fail on the marketplace with `OUTPUT_VALIDATION_FAILED`. The
+  stage now reaches the runtime whole.
+
+The honest limit of a mock: the answer satisfies a schema **by
+construction**, so a dry run proves the spec is executable — it does not
+prove the model can satisfy the schema. A pattern cannot be guessed, so the
+check still fires.
+
 ## v0.4.11 (2026-10-28) — the dry run works on a real spec
 
 > **Patch release.** Found the same way the three defects of v0.4.10 were
