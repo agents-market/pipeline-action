@@ -25,6 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the README check asks whether the commit it pins
+          # exists, and a shallow clone cannot answer for anything but HEAD.
+          fetch-depth: 0
 
       - name: Check action.yml
         run: |
@@ -85,3 +89,11 @@ jobs:
             exit 1
           fi
           echo "runs.main -> $main ($(wc -c < "$main") bytes)"
+
+      # The README is what a consumer copies. It recommended `@v1` in six
+      # places, and `v1` shipped a manifest the runner could not parse — every
+      # consumer that copied it got a red check at "Set up job" with an error
+      # that named neither this repository nor the ref. A floating ref in the
+      # examples is the same bug one release later.
+      - name: The README pins a commit SHA that exists
+        run: python3 scripts/check-readme-refs.py README.md

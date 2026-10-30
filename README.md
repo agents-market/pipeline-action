@@ -12,6 +12,28 @@ GitHub Action that runs an agentsmarket `pipeline.yaml` inside a step. Streams e
 
 ## Usage
 
+### Which ref to use
+
+Pin the full commit SHA of the release you tested:
+
+```yaml
+- uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
+```
+
+A SHA is the only ref that cannot change under you, and this repository has
+shipped a ref that did: `v1` pointed at a commit whose `action.yml` the runner
+could not parse (`description` was an unquoted scalar containing `": "`), so
+every consumer that copied `@v1` from this README got a red check at
+"Set up job" with an error that named neither this repository nor the ref.
+The tag has been repaired, but it floats, and it floats over releases that
+predate the fix that hands a stage to the runtime whole — before v0.4.12 a
+stage lost `output_schema` and `output_retry` on the way to the runner, so a
+local run was a laxer pipeline than the paid one.
+
+The README used to say `@v1` in six places, and that is how the broken ref
+reached consumers. `scripts/check-readme-refs` in this repository's CI fails
+on a floating ref, so the next one cannot be published by accident.
+
 ```yaml
 # .github/workflows/my-pipeline.yml
 name: my-pipeline
@@ -22,7 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: agents-market/pipeline-action@v1
+      - uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
         with:
           api_key: ${{ secrets.MINIMAX_API_KEY }}
           pipeline_yaml: |
@@ -72,7 +94,7 @@ keys already say, and it would eventually disagree with them.
 **Neither set → the action stops and tells you** which keys to pass.
 
 ```yaml
-- uses: web3eco/agents-market-pipeline-action@v1
+- uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
   with:
     pipeline_file: .agentsmarket/pipelines/code-review@1.0.1/pipeline.yaml
     pipeline: code-review          # optional; defaults to the spec's `name:`
@@ -120,7 +142,7 @@ The API key resolves from the `api_key` input first, then from the provider-spec
 | `openrouter` | `OPENROUTER_API_KEY` | `openai/gpt-4o`, `anthropic/claude-3.5-sonnet`, … |
 
 ```yaml
-- uses: agents-market/pipeline-action@v1
+- uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
   with:
     provider: openai
     model: gpt-4-turbo
@@ -203,7 +225,7 @@ Webhooks are self-authenticated: Slack/Discord/Teams embed the signing token in 
 3. Wire it into the step:
 
 ```yaml
-- uses: agents-market/pipeline-action@v0.3.4
+- uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
   with:
     pipeline_file: .github/pipelines/ai-review.yaml
     webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
@@ -229,7 +251,7 @@ PR: <https://github.com/acme/widget/pull/7|acme/widget#7>
 3. Wire it into the step:
 
 ```yaml
-- uses: agents-market/pipeline-action@v0.3.4
+- uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
   with:
     pipeline_file: .github/pipelines/ai-review.yaml
     webhook_url: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -245,7 +267,7 @@ The channel receives a Discord embed with a red side bar (critical findings) and
 3. Wire it into the step:
 
 ```yaml
-- uses: agents-market/pipeline-action@v0.3.4
+- uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
   with:
     pipeline_file: .github/pipelines/ai-review.yaml
     webhook_url: ${{ secrets.TEAMS_WEBHOOK_URL }}
@@ -264,7 +286,7 @@ Use `webhook_status` in a downstream step if you want to branch on the outcome (
 
 ```yaml
 - id: notify
-  uses: agents-market/pipeline-action@v0.3.4
+  uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
   with:
     webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
 
@@ -347,7 +369,7 @@ LLM providers occasionally have outages, rate-limit spikes, or capacity issues. 
 ### Example: primary MiniMax + fallback OpenAI
 
 ```yaml
-- uses: agents-market/pipeline-action@v1
+- uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
   with:
     provider: minimax                          # primary
     primary_model: MiniMax-M3
@@ -534,7 +556,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: agents-market/pipeline-action@v1
+      - uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
         id: review
         with:
           api_key: ${{ secrets.MINIMAX_API_KEY }}
@@ -564,7 +586,7 @@ The `category` input disambiguates alerts from this action from any other Code S
 Controls how much code context the LLM sees beyond the PR diff. Default `imports`. Cost ratios are heuristic guidance — actual fetching is `pipeline-runtime`'s responsibility, so the action simply declares the mode on the executor deps.
 
 ```yaml
-- uses: agents-market/pipeline-action@v1
+- uses: agents-market/pipeline-action@0ab99cfca4566494f6d84d4e0b08fd11a3bf6c21 # v0.4.12
   with:
     provider: openai
     model: gpt-4-turbo
