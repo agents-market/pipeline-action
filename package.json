@@ -19,7 +19,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@agentsmarket/pipeline-runtime": "^0.5.11"
+    "@agentsmarket/pipeline-runtime": "^0.5.13"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
