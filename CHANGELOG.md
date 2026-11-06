@@ -1,5 +1,12 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## [0.4.13](https://github.com/agents-market/main/compare/pipeline-action-v0.4.12...pipeline-action-v0.4.13) (2026-11-06)
+
+
+### Bug Fixes
+
+* **sync:** the README the standalone receives must name a commit that exists ([9e3d98f](https://github.com/agents-market/main/commit/9e3d98f62c8719d113f2a8514ffaf8b73bea1444))
+
 ## v0.4.12 (2026-10-28) — the mock run answers the schema, and the local run is the paid run
 
 > **Patch release.** The mock fix of v0.4.11 was half a fix: it made the mock
