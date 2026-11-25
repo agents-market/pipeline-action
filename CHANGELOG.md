@@ -1,5 +1,12 @@
 # Changelog — `@agentsmarket/pipeline-action`
 
+## [0.4.14](https://github.com/agents-market/main/compare/pipeline-action-v0.4.13...pipeline-action-v0.4.14) (2026-11-25)
+
+
+### Bug Fixes
+
+* **гейт:** тесты pipeline-action не умирают по таймауту под нагрузкой ([a9e3ae8](https://github.com/agents-market/main/commit/a9e3ae8207b0560569c96378883eec4a3f1a34ef))
+
 ## [0.4.13](https://github.com/agents-market/main/compare/pipeline-action-v0.4.12...pipeline-action-v0.4.13) (2026-11-06)
 
 
